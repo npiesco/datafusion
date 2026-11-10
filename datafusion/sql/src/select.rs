@@ -952,6 +952,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     schema_stack.as_slice(),
                     &[using_columns],
                 )?;
+                drop(schema_stack);
+                drop(outer_schemas);
 
                 Ok(LogicalPlan::Filter(Filter::try_new(
                     filter_expr,
