@@ -443,6 +443,7 @@ impl PhysicalExtensionCodec for ForeignPhysicalExtensionCodec {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema};
@@ -606,7 +607,8 @@ pub(crate) mod tests {
     fn create_test_exec() -> Arc<dyn ExecutionPlan> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, false)]));
-        Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>
     }
 
     #[test]

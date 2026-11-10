@@ -2461,6 +2461,7 @@ impl RecordBatchStream for PerPartitionStream {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::collections::HashSet;
 
     use super::*;
@@ -2999,7 +3000,7 @@ mod tests {
             Field::new("payload", DataType::UInt32, false),
         ]));
         let repartition = Arc::new(RepartitionExec::try_new(
-            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
             range_partitioning_on_columns(&schema, &["id"], vec![vec![10]])?,
         )?);
 
@@ -3032,7 +3033,7 @@ mod tests {
             Field::new("payload", DataType::UInt32, false),
         ]));
         let repartition = Arc::new(RepartitionExec::try_new(
-            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
             range_partitioning_on_columns(&schema, &["id"], vec![vec![10]])?,
         )?);
         let projection =
@@ -3050,7 +3051,7 @@ mod tests {
             Field::new("c", DataType::UInt32, false),
         ]));
         let repartition = Arc::new(RepartitionExec::try_new(
-            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
             range_partitioning_on_columns(&schema, &["a", "b"], vec![vec![10, 1]])?,
         )?);
         let projection =

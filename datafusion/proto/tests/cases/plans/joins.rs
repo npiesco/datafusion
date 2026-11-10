@@ -31,6 +31,7 @@ use datafusion::physical_plan::joins::{
     StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion::prelude::SessionContext;
+use datafusion_common::funding::Funding;
 use datafusion_common::{JoinSide, NullEquality, Result};
 use datafusion_proto::physical_plan::{
     DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
@@ -62,8 +63,12 @@ fn roundtrip_hash_join() -> Result<()> {
     ] {
         for partition_mode in &[PartitionMode::Partitioned, PartitionMode::CollectLeft] {
             roundtrip_test(Arc::new(HashJoinExec::try_new(
-                Arc::new(EmptyExec::new(schema_left.clone())),
-                Arc::new(EmptyExec::new(schema_right.clone())),
+                Arc::new(
+                    EmptyExec::new(schema_left.clone(), &Funding::default()).unwrap(),
+                ),
+                Arc::new(
+                    EmptyExec::new(schema_right.clone(), &Funding::default()).unwrap(),
+                ),
                 on.clone(),
                 None,
                 join_type,
@@ -96,8 +101,8 @@ fn roundtrip_nested_loop_join() -> Result<()> {
         JoinType::RightSemi,
     ] {
         roundtrip_test(Arc::new(NestedLoopJoinExec::try_new(
-            Arc::new(EmptyExec::new(schema_left.clone())),
-            Arc::new(EmptyExec::new(schema_right.clone())),
+            Arc::new(EmptyExec::new(schema_left.clone(), &Funding::default()).unwrap()),
+            Arc::new(EmptyExec::new(schema_right.clone(), &Funding::default()).unwrap()),
             None,
             join_type,
             Some(vec![0]),
@@ -125,8 +130,8 @@ fn roundtrip_hash_join_projection_states() -> Result<()> {
 
     for projection in [None, Some(vec![]), Some(vec![0]), Some(vec![1])] {
         roundtrip_test(Arc::new(HashJoinExec::try_new(
-            Arc::new(EmptyExec::new(schema_left.clone())),
-            Arc::new(EmptyExec::new(schema_right.clone())),
+            Arc::new(EmptyExec::new(schema_left.clone(), &Funding::default()).unwrap()),
+            Arc::new(EmptyExec::new(schema_right.clone(), &Funding::default()).unwrap()),
             on.clone(),
             None,
             &JoinType::Inner,
@@ -169,8 +174,12 @@ fn roundtrip_hash_join_fetch() -> Result<()> {
     // 32-bit target and so is not exercised by this test on a 64-bit host.
     for fetch in [None, Some(7), Some(u32::MAX as usize), Some(usize::MAX)] {
         let join = HashJoinExec::try_new(
-            Arc::new(EmptyExec::new(Arc::clone(&schema_left))),
-            Arc::new(EmptyExec::new(Arc::clone(&schema_right))),
+            Arc::new(
+                EmptyExec::new(Arc::clone(&schema_left), &Funding::default()).unwrap(),
+            ),
+            Arc::new(
+                EmptyExec::new(Arc::clone(&schema_right), &Funding::default()).unwrap(),
+            ),
             on.clone(),
             None,
             &JoinType::Inner,
@@ -213,8 +222,8 @@ fn roundtrip_nested_loop_join_projection_states() -> Result<()> {
 
     for projection in [None, Some(vec![]), Some(vec![0]), Some(vec![1])] {
         roundtrip_test(Arc::new(NestedLoopJoinExec::try_new(
-            Arc::new(EmptyExec::new(schema_left.clone())),
-            Arc::new(EmptyExec::new(schema_right.clone())),
+            Arc::new(EmptyExec::new(schema_left.clone(), &Funding::default()).unwrap()),
+            Arc::new(EmptyExec::new(schema_right.clone(), &Funding::default()).unwrap()),
             None,
             &JoinType::Inner,
             projection,
@@ -308,8 +317,20 @@ fn roundtrip_sym_hash_join() -> Result<()> {
                     for (left_order, right_order) in &ordering_cases {
                         let result = roundtrip_test_and_return(
                             Arc::new(SymmetricHashJoinExec::try_new(
-                                Arc::new(EmptyExec::new(schema_left.clone())),
-                                Arc::new(EmptyExec::new(schema_right.clone())),
+                                Arc::new(
+                                    EmptyExec::new(
+                                        schema_left.clone(),
+                                        &Funding::default(),
+                                    )
+                                    .unwrap(),
+                                ),
+                                Arc::new(
+                                    EmptyExec::new(
+                                        schema_right.clone(),
+                                        &Funding::default(),
+                                    )
+                                    .unwrap(),
+                                ),
                                 on.clone(),
                                 filter.clone(),
                                 &join_type,
@@ -405,8 +426,14 @@ fn roundtrip_sort_merge_join() -> Result<()> {
             ] {
                 let result = roundtrip_test_and_return(
                     Arc::new(SortMergeJoinExec::try_new(
-                        Arc::new(EmptyExec::new(schema_left.clone())),
-                        Arc::new(EmptyExec::new(schema_right.clone())),
+                        Arc::new(
+                            EmptyExec::new(schema_left.clone(), &Funding::default())
+                                .unwrap(),
+                        ),
+                        Arc::new(
+                            EmptyExec::new(schema_right.clone(), &Funding::default())
+                                .unwrap(),
+                        ),
                         on.clone(),
                         filter.clone(),
                         join_type,

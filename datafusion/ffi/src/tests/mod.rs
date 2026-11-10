@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, record_batch};
@@ -178,22 +179,29 @@ extern "C" fn construct_table_provider_factory(
 pub(crate) extern "C" fn create_empty_exec() -> FFI_ExecutionPlan {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, false)]));
 
-    let plan = Arc::new(EmptyExec::new(schema));
+    let plan = Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap());
     FFI_ExecutionPlan::new(plan, None)
 }
 
 pub(crate) extern "C" fn create_exec_with_expressions() -> FFI_ExecutionPlan {
     let schema = Arc::new(Schema::empty());
     let expression: Arc<dyn PhysicalExpr> = create_dynamic_filter();
-    let plan = Arc::new(EmptyExec::new(schema).with_expressions(vec![expression]));
+    let plan = Arc::new(
+        EmptyExec::new(schema, &Funding::default())
+            .unwrap()
+            .with_expressions(vec![expression]),
+    );
     FFI_ExecutionPlan::new(plan, None)
 }
 
 pub(crate) extern "C" fn create_exec_with_dynamic_expressions() -> FFI_ExecutionPlan {
     let schema = Arc::new(Schema::empty());
     let expression: Arc<dyn PhysicalExpr> = create_dynamic_filter();
-    let plan =
-        Arc::new(EmptyExec::new(schema).with_dynamic_expressions(vec![expression]));
+    let plan = Arc::new(
+        EmptyExec::new(schema, &Funding::default())
+            .unwrap()
+            .with_dynamic_expressions(vec![expression]),
+    );
     FFI_ExecutionPlan::new(plan, None)
 }
 
@@ -227,7 +235,11 @@ pub fn make_test_statistics() -> Statistics {
 
 pub(crate) extern "C" fn create_exec_with_statistics() -> FFI_ExecutionPlan {
     let schema = create_test_schema();
-    let plan = Arc::new(EmptyExec::new(schema).with_statistics(make_test_statistics()));
+    let plan = Arc::new(
+        EmptyExec::new(schema, &Funding::default())
+            .unwrap()
+            .with_statistics(make_test_statistics()),
+    );
     FFI_ExecutionPlan::new(plan, None)
 }
 

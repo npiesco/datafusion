@@ -34,6 +34,7 @@ use arrow::error::ArrowError;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{SortOptions, TimeUnit};
 use datafusion::{assert_batches_eq, dataframe};
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_functions_aggregate::count::{count_all, count_all_window};
 use datafusion_functions_aggregate::expr_fn::{
@@ -7386,7 +7387,8 @@ async fn test_duplicate_state_fields_for_dfschema_construct() -> Result<()> {
     let ticker = col("ticker");
     let date = col("date");
 
-    let mock_exec = Arc::new(EmptyExec::new(file_schema.clone()));
+    let mock_exec =
+        Arc::new(EmptyExec::new(file_schema.clone(), &Funding::default()).unwrap());
 
     // Build first_value aggregate
     let first_value = Arc::new(

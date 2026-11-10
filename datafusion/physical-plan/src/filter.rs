@@ -1416,6 +1416,7 @@ mod tests {
     use crate::test;
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
+    use datafusion_common::funding::Funding;
 
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {
@@ -2199,7 +2200,7 @@ mod tests {
                 binary(col("c1", &schema)?, Operator::LtEq, lit(4i32), &schema)?,
                 &schema,
             )?,
-            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
         )?;
 
         StatisticsContext::new()
@@ -2218,7 +2219,8 @@ mod tests {
             Field::new("c", DataType::Int32, false),
         ]));
 
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         // Create a filter predicate: a > 10
         let predicate = Arc::new(BinaryExpr::new(
@@ -2253,7 +2255,8 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
 
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let predicate = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
@@ -2281,7 +2284,8 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
 
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let predicate = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
@@ -2436,7 +2440,8 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
 
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         // Create a predicate that doesn't return boolean (returns Int32)
         let invalid_predicate = Arc::new(Column::new("a", 0));
@@ -2464,7 +2469,8 @@ mod tests {
             Field::new("d", DataType::Int32, false),
         ]));
 
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         // Create a filter predicate: a > 10
         let predicate = Arc::new(BinaryExpr::new(
@@ -2501,7 +2507,8 @@ mod tests {
             Field::new("b", DataType::Int32, false),
         ]));
 
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let predicate = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
@@ -2535,7 +2542,9 @@ mod tests {
             Field::new("b", DataType::Utf8, false),
             Field::new("c", DataType::Float64, false),
         ]));
-        let input = Arc::new(EmptyExec::new(Arc::clone(&input_schema)));
+        let input = Arc::new(
+            EmptyExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap(),
+        );
 
         // FilterExec: a > 0, projection=[c@2]
         let predicate = Arc::new(BinaryExpr::new(
@@ -3685,7 +3694,8 @@ mod tests {
             Field::new("tokens", DataType::Int64, false),
             Field::new("svc", DataType::Utf8, false),
         ]));
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         // FilterExec: ts > 0, projection=[ts@0, tokens@1, svc@2] (all 3 cols)
         let predicate = Arc::new(BinaryExpr::new(

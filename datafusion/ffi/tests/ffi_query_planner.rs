@@ -19,6 +19,7 @@ mod utils;
 
 #[cfg(feature = "integration-tests")]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::{Arc, OnceLock, Weak};
 
     use arrow::datatypes::SchemaRef;
@@ -168,7 +169,9 @@ mod tests {
             if buf != b"library-b-empty-exec" || !inputs.is_empty() {
                 return exec_err!("unexpected library B execution plan payload");
             }
-            Ok(Arc::new(EmptyExec::new(create_test_schema())))
+            Ok(Arc::new(
+                EmptyExec::new(create_test_schema(), &Funding::default()).unwrap(),
+            ))
         }
 
         fn try_encode(

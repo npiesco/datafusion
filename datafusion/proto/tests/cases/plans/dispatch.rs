@@ -31,6 +31,7 @@ use datafusion::physical_plan::{
     PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream,
 };
 use datafusion::prelude::SessionContext;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, exec_datafusion_err};
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
@@ -119,7 +120,7 @@ impl ExecutionPlan for DowncastDelegatingExec {
 #[test]
 fn serialize_uses_downcast_delegate() -> Result<()> {
     let inner: Arc<dyn ExecutionPlan> =
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap());
     let plan: Arc<dyn ExecutionPlan> = Arc::new(DowncastDelegatingExec::new(inner));
     let codec = DefaultPhysicalExtensionCodec {};
 
@@ -139,7 +140,8 @@ fn serialize_uses_downcast_delegate() -> Result<()> {
 #[test]
 fn serialize_uses_downcast_delegate_for_self_serializing_plan() -> Result<()> {
     let schema = Schema::new(vec![Field::new("a", DataType::Int64, false)]);
-    let input = Arc::new(EmptyExec::new(Arc::new(schema.clone())));
+    let input =
+        Arc::new(EmptyExec::new(Arc::new(schema.clone()), &Funding::default()).unwrap());
     let inner: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![ProjectionExpr {
             expr: col("a", &schema)?,
@@ -306,7 +308,10 @@ fn custom_proto_converter_intercepts() -> Result<()> {
     ]
     .into();
 
-    let exec_plan = Arc::new(SortExec::new(sort_exprs, Arc::new(EmptyExec::new(schema))));
+    let exec_plan = Arc::new(SortExec::new(
+        sort_exprs,
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+    ));
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};

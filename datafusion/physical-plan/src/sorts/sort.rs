@@ -1715,6 +1715,7 @@ impl SortExec {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -3240,7 +3241,8 @@ mod tests {
     #[test]
     fn test_with_dynamic_filter() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let sort = SortExec::new(
             LexOrdering::new(vec![PhysicalSortExpr {
@@ -3411,7 +3413,8 @@ mod tests {
     #[test]
     fn test_with_dynamic_filter_rejects_invalid_columns() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let sort = SortExec::new(
             LexOrdering::new(vec![PhysicalSortExpr {
@@ -3563,7 +3566,7 @@ mod tests {
 
     fn make_sort_exec_with_fetch(fetch: Option<usize>) -> SortExec {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let input = Arc::new(EmptyExec::new(schema));
+        let input = Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap());
         SortExec::new(
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into(),
             input,

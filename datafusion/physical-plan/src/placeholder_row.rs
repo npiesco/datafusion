@@ -30,6 +30,7 @@ use crate::{
 
 use arrow::array::{ArrayRef, NullArray, RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, assert_or_internal_err};
 use datafusion_execution::TaskContext;
@@ -50,24 +51,39 @@ pub struct PlaceholderRowExec {
 }
 
 impl PlaceholderRowExec {
-    /// Create a new PlaceholderRowExec
-    pub fn new(schema: SchemaRef) -> Self {
+    /// Create a new PlaceholderRowExec, its properties' block charged to `funding`
+    /// first
+    pub fn new(schema: SchemaRef, funding: &Funding) -> Result<Self> {
         let partitions = 1;
         let cache = Self::compute_properties(Arc::clone(&schema), partitions);
-        PlaceholderRowExec {
+        Ok(PlaceholderRowExec {
             schema,
             partitions,
-            cache: Arc::new(cache),
-        }
+            cache: funding.arc(cache)?,
+        })
     }
 
-    /// Create a new PlaceholderRowExecPlaceholderRowExec with specified partition number
-    pub fn with_partitions(mut self, partitions: usize) -> Self {
+    /// Create a new PlaceholderRowExec with specified partition number: properties
+    /// shared with a clone are made anew, their block charged to `funding` first
+    pub fn with_partitions(
+        mut self,
+        partitions: usize,
+        funding: &Funding,
+    ) -> Result<Self> {
         self.partitions = partitions;
         // Update output partitioning when updating partitions:
-        let output_partitioning = Self::output_partitioning_helper(self.partitions);
-        Arc::make_mut(&mut self.cache).partitioning = output_partitioning;
-        self
+        match Arc::get_mut(&mut self.cache) {
+            Some(cache) => {
+                cache.partitioning = Self::output_partitioning_helper(partitions)
+            }
+            None => {
+                self.cache = funding.arc(Self::compute_properties(
+                    Arc::clone(&self.schema),
+                    partitions,
+                ))?
+            }
+        }
+        Ok(self)
     }
 
     fn data(&self) -> Result<Vec<RecordBatch>> {
@@ -254,7 +270,8 @@ impl PlaceholderRowExec {
         // field existed, which always meant a single partition.
         let partitions = placeholder.partitions.max(1) as usize;
         Ok(Arc::new(
-            PlaceholderRowExec::new(schema).with_partitions(partitions),
+            PlaceholderRowExec::new(schema, &Funding::default())?
+                .with_partitions(partitions, &Funding::default())?,
         ))
     }
 }
@@ -263,12 +280,14 @@ impl PlaceholderRowExec {
 mod tests {
     use super::*;
     use crate::{execution_plan::replace_children_if_necessary, test};
+    use datafusion_common::funding::Funding;
 
     #[test]
     fn replace_children() -> Result<()> {
         let schema = test::aggr_test_schema();
 
-        let placeholder = Arc::new(PlaceholderRowExec::new(schema));
+        let placeholder =
+            Arc::new(PlaceholderRowExec::new(schema, &Funding::default()).unwrap());
 
         let placeholder_2 = replace_children_if_necessary(
             Arc::clone(&placeholder) as Arc<dyn ExecutionPlan>,
@@ -288,7 +307,7 @@ mod tests {
     async fn invalid_execute() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = test::aggr_test_schema();
-        let placeholder = PlaceholderRowExec::new(schema);
+        let placeholder = PlaceholderRowExec::new(schema, &Funding::default()).unwrap();
 
         // Ask for the wrong partition
         assert!(placeholder.execute(1, Arc::clone(&task_ctx)).is_err());
@@ -300,7 +319,7 @@ mod tests {
     async fn produce_one_row() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = test::aggr_test_schema();
-        let placeholder = PlaceholderRowExec::new(schema);
+        let placeholder = PlaceholderRowExec::new(schema, &Funding::default()).unwrap();
 
         let iter = placeholder.execute(0, task_ctx)?;
         let batches = common::collect(iter).await?;
@@ -316,7 +335,10 @@ mod tests {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = test::aggr_test_schema();
         let partitions = 3;
-        let placeholder = PlaceholderRowExec::new(schema).with_partitions(partitions);
+        let placeholder = PlaceholderRowExec::new(schema, &Funding::default())
+            .unwrap()
+            .with_partitions(partitions, &Funding::default())
+            .unwrap();
 
         for n in 0..partitions {
             let iter = placeholder.execute(n, Arc::clone(&task_ctx))?;

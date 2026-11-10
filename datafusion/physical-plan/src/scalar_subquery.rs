@@ -413,6 +413,7 @@ mod tests {
         execution_plan::reset_plan_states,
         projection::{ProjectionExec, ProjectionExpr},
     };
+    use datafusion_common::funding::Funding;
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -521,9 +522,13 @@ mod tests {
     }
 
     fn placeholder_input() -> Arc<dyn ExecutionPlan> {
-        Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
-            test::aggr_test_schema(),
-        ))
+        Arc::new(
+            crate::placeholder_row::PlaceholderRowExec::new(
+                test::aggr_test_schema(),
+                &Funding::default(),
+            )
+            .unwrap(),
+        )
     }
 
     fn single_subquery_exec(

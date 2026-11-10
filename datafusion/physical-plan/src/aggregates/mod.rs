@@ -3136,6 +3136,7 @@ pub fn evaluate_group_by(
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::task::{Context, Poll};
 
     use super::*;
@@ -6044,7 +6045,8 @@ mod tests {
         assert_eq!(stats_zero.total_byte_size, Precision::Absent);
 
         let single_input =
-            Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap())
+                as Arc<dyn ExecutionPlan>;
         let single_agg_zero = AggregateExec::try_new(
             AggregateMode::Single,
             PhysicalGroupBy::default(),
@@ -6701,7 +6703,8 @@ mod tests {
             PhysicalGroupBy::new(vec![], vec![], vec![vec![], vec![]], true);
 
         let single_input =
-            Arc::new(EmptyExec::new(Arc::clone(&schema))) as Arc<dyn ExecutionPlan>;
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap())
+                as Arc<dyn ExecutionPlan>;
         let single_agg = AggregateExec::try_new(
             AggregateMode::Single,
             duplicate_empty_grouping_sets.clone(),
@@ -6717,9 +6720,12 @@ mod tests {
             Precision::Exact(2)
         );
 
-        let partial_input =
-            Arc::new(EmptyExec::new(Arc::clone(&schema)).with_partitions(2))
-                as Arc<dyn ExecutionPlan>;
+        let partial_input = Arc::new(
+            EmptyExec::new(Arc::clone(&schema), &Funding::default())
+                .unwrap()
+                .with_partitions(2, &Funding::default())
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
         let partial_agg = Arc::new(AggregateExec::try_new(
             AggregateMode::Partial,
             duplicate_empty_grouping_sets,
@@ -7835,7 +7841,8 @@ mod tests {
     #[test]
     fn test_with_dynamic_filter() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         // Partial min aggregate supports dynamic filtering
         let agg = AggregateExec::try_new(
@@ -7890,7 +7897,8 @@ mod tests {
     #[test]
     fn test_plan_contains_expression_id_recurses_plans_and_expressions() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let empty: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
             vec![col("a", &schema)?],
             lit(true),
@@ -7926,7 +7934,8 @@ mod tests {
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, false),
         ]));
-        let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         // Final mode with a group-by does not support dynamic filters.
         let agg = AggregateExec::try_new(
@@ -7956,7 +7965,8 @@ mod tests {
     #[test]
     fn test_with_dynamic_filter_error_column_mismatch() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let agg = AggregateExec::try_new(
             AggregateMode::Partial,

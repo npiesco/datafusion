@@ -97,7 +97,7 @@ pub enum DisplayFormatType {
 /// # use datafusion_physical_plan::empty::EmptyExec;
 /// # use datafusion_physical_plan::filter::FilterExec;
 /// # let schema = Schema::new(vec![Field::new("i", DataType::Int32, false)]);
-/// # let plan = EmptyExec::new(Arc::new(schema));
+/// # let plan = EmptyExec::new(Arc::new(schema), &datafusion_common::funding::Funding::default()).unwrap();
 /// # let i = col("i", &plan.schema()).unwrap();
 /// # let predicate = binary(i, Operator::Eq, lit(1), &plan.schema()).unwrap();
 /// # let plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, Arc::new(plan)).unwrap());
@@ -1690,6 +1690,7 @@ mod tests {
     }
 
     mod pgjson {
+        use datafusion_common::funding::Funding;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -1709,7 +1710,9 @@ mod tests {
                 Field::new("a", DataType::Int32, false),
                 Field::new("b", DataType::Int32, false),
             ]));
-            let empty = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+            let empty = Arc::new(
+                EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap(),
+            );
             let predicate = binary(
                 col("a", &schema).unwrap(),
                 datafusion_expr::Operator::Gt,

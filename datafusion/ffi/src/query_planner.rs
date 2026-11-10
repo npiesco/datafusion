@@ -355,6 +355,7 @@ impl QueryPlanner for ForeignQueryPlanner {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -380,7 +381,10 @@ mod tests {
             session.config_options().funding.held_future(async move {
                 let schema =
                     Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-                Ok(Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>)
+                Ok(
+                    Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap())
+                        as Arc<dyn ExecutionPlan>,
+                )
             })
         }
     }

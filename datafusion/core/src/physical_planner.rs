@@ -786,11 +786,14 @@ impl DefaultPhysicalPlanner {
             LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
                 schema,
-            }) => Arc::new(EmptyExec::new(Arc::clone(schema.inner()))),
+            }) => funding.arc(EmptyExec::new(Arc::clone(schema.inner()), funding)?)?,
             LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: true,
                 schema,
-            }) => Arc::new(PlaceholderRowExec::new(Arc::clone(schema.inner()))),
+            }) => funding.arc(PlaceholderRowExec::new(
+                Arc::clone(schema.inner()),
+                funding,
+            )?)?,
             LogicalPlan::DescribeTable(DescribeTable {
                 schema,
                 output_schema,
@@ -3433,6 +3436,7 @@ impl<'n> TreeNodeVisitor<'n> for InvariantChecker {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::cmp::Ordering;
     use std::fmt::{self, Debug};
     use std::mem::size_of_val;
@@ -3671,7 +3675,9 @@ mod tests {
             _filters: &[Expr],
             _limit: Option<usize>,
         ) -> Result<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+            Ok(Arc::new(
+                EmptyExec::new(Arc::clone(&self.schema), &Funding::default()).unwrap(),
+            ))
         }
 
         async fn merge_into(
@@ -5883,9 +5889,13 @@ digraph {
             _planning_ctx: &PhysicalPlanningContext,
         ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
             if scan.source.is::<MockTableSource>() {
-                Ok(Some(Arc::new(EmptyExec::new(Arc::clone(
-                    scan.projected_schema.inner(),
-                )))))
+                Ok(Some(Arc::new(
+                    EmptyExec::new(
+                        Arc::clone(scan.projected_schema.inner()),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                )))
             } else {
                 Ok(None)
             }

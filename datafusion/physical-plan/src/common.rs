@@ -309,6 +309,7 @@ mod tests {
     use super::*;
     use crate::empty::EmptyExec;
     use crate::projection::ProjectionExec;
+    use datafusion_common::funding::Funding;
 
     use crate::stream::RecordBatchStreamAdapter;
     use futures::stream;
@@ -321,7 +322,9 @@ mod tests {
     };
 
     fn empty_exec(fields: Vec<Field>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(EmptyExec::new(Arc::new(Schema::new(fields))))
+        Arc::new(
+            EmptyExec::new(Arc::new(Schema::new(fields)), &Funding::default()).unwrap(),
+        )
     }
 
     #[test]
@@ -430,7 +433,8 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let result = project_plan_to_schema(Arc::clone(&input), &schema)?;
 
@@ -473,7 +477,8 @@ mod tests {
             ],
             schema_metadata.clone(),
         ));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(input_schema, &Funding::default()).unwrap());
         let expected_schema = Arc::new(Schema::new_with_metadata(
             vec![
                 Field::new("expected", DataType::Int32, false)
@@ -560,7 +565,8 @@ mod tests {
             vec![Field::new("a", DataType::Int32, false)],
             HashMap::from([("source".to_string(), "input".to_string())]),
         ));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(input_schema, &Funding::default()).unwrap());
         let expected_schema = Arc::new(Schema::new_with_metadata(
             vec![Field::new("renamed", DataType::Int32, false)],
             HashMap::from([("source".to_string(), "expected".to_string())]),

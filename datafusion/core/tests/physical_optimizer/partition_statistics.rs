@@ -17,6 +17,7 @@
 
 #[cfg(test)]
 mod test {
+    use datafusion_common::funding::Funding;
     use insta::assert_snapshot;
     use std::sync::Arc;
 
@@ -979,8 +980,12 @@ mod test {
         .await?;
 
         // select id, 1+id, count(*) from empty_table group by id, 1+id
-        let empty_table =
-            Arc::new(EmptyExec::new(scan_schema.clone()).with_partitions(2));
+        let empty_table = Arc::new(
+            EmptyExec::new(scan_schema.clone(), &Funding::default())
+                .unwrap()
+                .with_partitions(2, &Funding::default())
+                .unwrap(),
+        );
 
         let agg_partial = Arc::new(AggregateExec::try_new(
             AggregateMode::Partial,
@@ -1166,8 +1171,12 @@ mod test {
     async fn test_statistic_by_partition_of_placeholder_rows() -> Result<()> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let plan = Arc::new(PlaceholderRowExec::new(schema).with_partitions(2))
-            as Arc<dyn ExecutionPlan>;
+        let plan = Arc::new(
+            PlaceholderRowExec::new(schema, &Funding::default())
+                .unwrap()
+                .with_partitions(2, &Funding::default())
+                .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
         let schema = plan.schema();
 
         let ctx = TaskContext::default();
@@ -1291,7 +1300,7 @@ mod test {
 
         // Create a repartition with 0 partitions
         let repartition = Arc::new(RepartitionExec::try_new(
-            Arc::new(EmptyExec::new(scan_schema.clone())),
+            Arc::new(EmptyExec::new(scan_schema.clone(), &Funding::default()).unwrap()),
             Partitioning::RoundRobinBatch(0),
         )?);
 
@@ -1485,7 +1494,8 @@ mod test {
         ]));
 
         // Try to test with single partition
-        let empty_single = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let empty_single =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let stats = StatisticsContext::new().compute(
             empty_single.as_ref(),
@@ -1513,8 +1523,12 @@ mod test {
             .await?;
 
         // Test with multiple partitions
-        let empty_multi: Arc<dyn ExecutionPlan> =
-            Arc::new(EmptyExec::new(Arc::clone(&schema)).with_partitions(3));
+        let empty_multi: Arc<dyn ExecutionPlan> = Arc::new(
+            EmptyExec::new(Arc::clone(&schema), &Funding::default())
+                .unwrap()
+                .with_partitions(3, &Funding::default())
+                .unwrap(),
+        );
 
         let statistics = (0..empty_multi.output_partitioning().partition_count())
             .map(|idx| {

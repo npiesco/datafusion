@@ -35,6 +35,7 @@ use datafusion::physical_plan::windows::{
 };
 use datafusion::scalar::ScalarValue;
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_expr::{WindowFrame, WindowFrameBound};
 use datafusion_functions_aggregate::average::avg_udaf;
 use std::sync::Arc;
@@ -63,7 +64,7 @@ fn roundtrip_udwf() -> Result<()> {
         Arc::new(WindowFrame::new(None)),
     ));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     roundtrip_test(Arc::new(BoundedWindowAggExec::try_new(
         vec![udwf_expr],
@@ -142,7 +143,7 @@ fn roundtrip_window() -> Result<()> {
         None,
     ));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     roundtrip_test(Arc::new(WindowAggExec::try_new(
         vec![plain_aggr_window_expr, sliding_aggr_window_expr, udwf_expr],
@@ -195,7 +196,7 @@ fn roundtrip_window_distinct() -> Result<()> {
         None,
     ));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     roundtrip_test(Arc::new(WindowAggExec::try_new(
         vec![distinct_count_expr, distinct_sum_expr],
@@ -250,7 +251,7 @@ fn test_distinct_window_serialization_end_to_end() -> Result<()> {
         None,
     ));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let window_exec = Arc::new(WindowAggExec::try_new(
         vec![distinct_count_ignore_nulls, distinct_sum],
@@ -297,7 +298,7 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
         Arc::new(WindowFrame::new(None)),
     ));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     roundtrip_test(Arc::new(BoundedWindowAggExec::try_new(
         vec![udwf_expr],

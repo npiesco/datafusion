@@ -42,6 +42,7 @@ use datafusion_common::Result;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::file_options::csv_writer::CsvWriterOptions;
 use datafusion_common::file_options::json_writer::JsonWriterOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_expr::dml::InsertOp;
 use datafusion_proto::physical_plan::{
@@ -117,7 +118,9 @@ fn data_sink_exec_delegates_to_sink_proto_hook() -> Result<()> {
         DataType::Int64,
         false,
     )]));
-    let input = Arc::new(PlaceholderRowExec::new(Arc::clone(&input_schema)));
+    let input = Arc::new(
+        PlaceholderRowExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap(),
+    );
     let sink = Arc::new(ProtoHookSink {
         schema: Arc::clone(&input_schema),
     });
@@ -202,7 +205,8 @@ fn roundtrip_json_sink() -> Result<()> {
     let field_a = Field::new("plan_type", DataType::Utf8, false);
     let field_b = Field::new("plan", DataType::Utf8, false);
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
-    let input = Arc::new(PlaceholderRowExec::new(schema.clone()));
+    let input =
+        Arc::new(PlaceholderRowExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let file_sink_config = FileSinkConfig {
         original_url: String::default(),
@@ -241,7 +245,8 @@ fn roundtrip_csv_sink() -> Result<()> {
     let field_a = Field::new("plan_type", DataType::Utf8, false);
     let field_b = Field::new("plan", DataType::Utf8, false);
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
-    let input = Arc::new(PlaceholderRowExec::new(schema.clone()));
+    let input =
+        Arc::new(PlaceholderRowExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let file_sink_config = FileSinkConfig {
         original_url: String::default(),
@@ -294,7 +299,8 @@ fn roundtrip_parquet_sink() -> Result<()> {
     let field_a = Field::new("plan_type", DataType::Utf8, false);
     let field_b = Field::new("plan", DataType::Utf8, false);
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
-    let input = Arc::new(PlaceholderRowExec::new(schema.clone()));
+    let input =
+        Arc::new(PlaceholderRowExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let file_sink_config = FileSinkConfig {
         original_url: String::default(),

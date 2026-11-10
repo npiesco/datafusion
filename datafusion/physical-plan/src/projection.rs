@@ -109,7 +109,7 @@ impl ProjectionExec {
     /// # }
     /// #
     /// # fn input() -> Arc<dyn ExecutionPlan> {
-    /// #  Arc::new(EmptyExec::new(schema()))
+    /// #  Arc::new(EmptyExec::new(schema(), &datafusion_common::funding::Funding::default()).unwrap())
     /// # }
     /// #
     /// # fn main() {
@@ -1497,6 +1497,7 @@ fn new_columns_for_join_on(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     use crate::common::collect;
     use crate::empty::EmptyExec;
@@ -1526,7 +1527,8 @@ mod tests {
             DataType::Int32,
             false,
         )]));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(input_schema));
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(input_schema, &Funding::default()).unwrap());
         let field_metadata =
             HashMap::from([("field-key".to_string(), "field-value".to_string())]);
         let schema_metadata =
@@ -1630,7 +1632,7 @@ mod tests {
             Field::new("i", DataType::Int32, true).with_metadata(field_metadata),
         ]));
         let replacement: Arc<dyn ExecutionPlan> =
-            Arc::new(EmptyExec::new(replacement_schema));
+            Arc::new(EmptyExec::new(replacement_schema, &Funding::default()).unwrap());
         let replaced = projection.replace_children(
             vec![replacement],
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
@@ -1820,15 +1822,18 @@ mod tests {
     fn test_try_pushdown_through_join_validates_column_indices() -> Result<()> {
         let child_schema =
             Arc::new(Schema::new(vec![Field::new("i", DataType::Int32, false)]));
-        let left: Arc<dyn ExecutionPlan> =
-            Arc::new(EmptyExec::new(Arc::clone(&child_schema)));
-        let right: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(child_schema));
+        let left: Arc<dyn ExecutionPlan> = Arc::new(
+            EmptyExec::new(Arc::clone(&child_schema), &Funding::default()).unwrap(),
+        );
+        let right: Arc<dyn ExecutionPlan> =
+            Arc::new(EmptyExec::new(child_schema, &Funding::default()).unwrap());
         let join_schema = Arc::new(Schema::new(vec![
             Field::new("left_i", DataType::Int32, false),
             Field::new("right_i", DataType::Int32, false),
         ]));
-        let join: Arc<dyn ExecutionPlan> =
-            Arc::new(EmptyExec::new(Arc::clone(&join_schema)));
+        let join: Arc<dyn ExecutionPlan> = Arc::new(
+            EmptyExec::new(Arc::clone(&join_schema), &Funding::default()).unwrap(),
+        );
         let projection = ProjectionExec::try_new(
             vec![ProjectionExpr {
                 expr: Arc::new(Column::new("left_i", 0)),
@@ -1885,7 +1890,7 @@ mod tests {
             Field::new("extra", DataType::Int32, false),
         ]));
         let wider_join: Arc<dyn ExecutionPlan> =
-            Arc::new(EmptyExec::new(wider_join_schema));
+            Arc::new(EmptyExec::new(wider_join_schema, &Funding::default()).unwrap());
         let out_of_mapping_projection = ProjectionExec::try_new(
             vec![ProjectionExpr {
                 expr: Arc::new(Column::new("extra", 2)),

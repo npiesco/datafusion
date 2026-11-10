@@ -88,7 +88,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 // input can be entirely removed
                 Ok(Arc::new(ProjectionExec::try_new(
                     projections,
-                    Arc::new(PlaceholderRowExec::new(plan.schema())),
+                    Arc::new(PlaceholderRowExec::new(plan.schema(), &config.funding)?),
                 )?))
             } else {
                 plan.map_children(|child| {

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
@@ -86,7 +87,7 @@ fn repartition_exec(
 }
 
 fn empty_exec(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
-    Arc::new(EmptyExec::new(schema))
+    Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap())
 }
 
 fn nested_loop_join_exec(

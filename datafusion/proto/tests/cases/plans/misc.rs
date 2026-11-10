@@ -41,6 +41,7 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::display::{PlanType, StringifiedPlan};
 use datafusion_common::format::ExplainFormat;
+use datafusion_common::funding::Funding;
 use datafusion_common::{DataFusionError, Result, UnnestOptions};
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
 use datafusion_proto::physical_plan::{
@@ -59,7 +60,9 @@ fn roundtrip_analyze() -> Result<()> {
         Field::new("plan_type", DataType::Utf8, false),
         Field::new("plan", DataType::Utf8, false),
     ]));
-    let input = Arc::new(PlaceholderRowExec::new(Arc::clone(&schema)));
+    let input = Arc::new(
+        PlaceholderRowExec::new(Arc::clone(&schema), &Funding::default()).unwrap(),
+    );
     let metric_categories = vec![MetricCategory::Rows, MetricCategory::Timing];
     let analyze = Arc::new(
         AnalyzeExec::builder(true, true, input, Arc::clone(&schema))
@@ -168,8 +171,8 @@ fn roundtrip_union() -> Result<()> {
     let field_a = Field::new("col", DataType::Int64, false);
     let schema_left = Schema::new(vec![field_a.clone()]);
     let schema_right = Schema::new(vec![field_a]);
-    let left = EmptyExec::new(Arc::new(schema_left));
-    let right = EmptyExec::new(Arc::new(schema_right));
+    let left = EmptyExec::new(Arc::new(schema_left), &Funding::default()).unwrap();
+    let right = EmptyExec::new(Arc::new(schema_right), &Funding::default()).unwrap();
     let inputs: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::new(left), Arc::new(right)];
     let union = UnionExec::try_new(inputs)?;
     roundtrip_test(union)
@@ -190,7 +193,10 @@ async fn roundtrip_union_with_mismatched_nullability_executes() -> Result<()> {
                 expr: lit(value),
                 alias: "a".to_string(),
             }],
-            Arc::new(PlaceholderRowExec::new(Arc::new(Schema::empty()))),
+            Arc::new(
+                PlaceholderRowExec::new(Arc::new(Schema::empty()), &Funding::default())
+                    .unwrap(),
+            ),
         )?))
     };
     let non_nullable_leg = literal_leg(ScalarValue::Int64(Some(1)))?;
@@ -240,9 +246,12 @@ fn roundtrip_repartition_preserve_order() -> Result<()> {
     // a sorted input with 2 partitions.
     let source1 = SortExec::new(
         sort_exprs.clone(),
-        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
     );
-    let source2 = SortExec::new(sort_exprs, Arc::new(EmptyExec::new(schema)));
+    let source2 = SortExec::new(
+        sort_exprs,
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+    );
     let union = UnionExec::try_new(vec![
         Arc::new(source1) as Arc<dyn ExecutionPlan>,
         Arc::new(source2) as Arc<dyn ExecutionPlan>,
@@ -258,7 +267,8 @@ fn roundtrip_repartition_preserve_order() -> Result<()> {
 #[test]
 fn roundtrip_range_partitioning() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-    let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let input =
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
     let range_partitioning = Partitioning::Range(RangePartitioning::new(
         [PhysicalSortExpr::new_default(col("a", &schema)?)].into(),
         vec![SplitPoint::new(vec![ScalarValue::Int64(Some(10))])],
@@ -360,11 +370,11 @@ fn roundtrip_interleave() -> Result<()> {
     let schema_right = Schema::new(vec![field_a]);
     let partition = Partitioning::Hash(vec![], 3);
     let left = RepartitionExec::try_new(
-        Arc::new(EmptyExec::new(Arc::new(schema_left))),
+        Arc::new(EmptyExec::new(Arc::new(schema_left), &Funding::default()).unwrap()),
         partition.clone(),
     )?;
     let right = RepartitionExec::try_new(
-        Arc::new(EmptyExec::new(Arc::new(schema_right))),
+        Arc::new(EmptyExec::new(Arc::new(schema_right), &Funding::default()).unwrap()),
         partition,
     )?;
     let inputs: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::new(left), Arc::new(right)];
@@ -383,7 +393,10 @@ async fn roundtrip_interleave_with_mismatched_nullability_executes() -> Result<(
                 expr: lit(value),
                 alias: "a".to_string(),
             }],
-            Arc::new(PlaceholderRowExec::new(Arc::new(Schema::empty()))),
+            Arc::new(
+                PlaceholderRowExec::new(Arc::new(Schema::empty()), &Funding::default())
+                    .unwrap(),
+            ),
         )?;
         Ok(Arc::new(RepartitionExec::try_new(
             Arc::new(projection),
@@ -446,7 +459,7 @@ fn roundtrip_unnest() -> Result<()> {
     let input_schema = Arc::new(Schema::new(vec![fa.clone(), fb, fc, fd, fe]));
     let output_schema =
         Arc::new(Schema::new(vec![fa, fb0, fc1, fc2, fd0, fe1, fe2, fe3]));
-    let input = Arc::new(EmptyExec::new(input_schema));
+    let input = Arc::new(EmptyExec::new(input_schema, &Funding::default()).unwrap());
     let options = UnnestOptions {
         null_handling: datafusion_common::NullHandling::Drop,
         recursions: vec![datafusion_common::RecursionUnnestOption {

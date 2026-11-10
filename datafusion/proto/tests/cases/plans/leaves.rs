@@ -24,6 +24,7 @@ use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
 };
@@ -33,7 +34,9 @@ use std::sync::Arc;
 
 #[test]
 fn roundtrip_empty() -> Result<()> {
-    roundtrip_test(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))))
+    roundtrip_test(Arc::new(
+        EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap(),
+    ))
 }
 
 #[test]
@@ -41,7 +44,12 @@ fn roundtrip_empty_with_partitions() -> Result<()> {
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
     let proto_converter = DefaultPhysicalProtoConverter {};
-    let plan = Arc::new(EmptyExec::new(Arc::new(Schema::empty())).with_partitions(4));
+    let plan = Arc::new(
+        EmptyExec::new(Arc::new(Schema::empty()), &Funding::default())
+            .unwrap()
+            .with_partitions(4, &Funding::default())
+            .unwrap(),
+    );
     let plan = roundtrip_test_and_return(plan, &ctx, &codec, &proto_converter)?;
     assert_eq!(plan.output_partitioning().partition_count(), 4);
     Ok(())
@@ -52,8 +60,12 @@ fn roundtrip_placeholder_row_with_partitions() -> Result<()> {
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
     let proto_converter = DefaultPhysicalProtoConverter {};
-    let plan =
-        Arc::new(PlaceholderRowExec::new(Arc::new(Schema::empty())).with_partitions(4));
+    let plan = Arc::new(
+        PlaceholderRowExec::new(Arc::new(Schema::empty()), &Funding::default())
+            .unwrap()
+            .with_partitions(4, &Funding::default())
+            .unwrap(),
+    );
     let plan = roundtrip_test_and_return(plan, &ctx, &codec, &proto_converter)?;
     assert_eq!(plan.output_partitioning().partition_count(), 4);
     Ok(())

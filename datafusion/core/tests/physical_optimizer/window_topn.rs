@@ -17,6 +17,7 @@
 
 //! Tests for the WindowTopN physical optimizer rule.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
@@ -72,7 +73,8 @@ fn build_window_topn_plan(
     op: Operator,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let s = schema();
-    let input: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap());
 
     // ROW_NUMBER() OVER (PARTITION BY pk ORDER BY val)
     let partition_by = vec![col("pk", &s)?];
@@ -116,7 +118,8 @@ fn build_window_topn_plan(
 /// Build a plan with no partition-by: ROW_NUMBER() OVER (ORDER BY val)
 fn build_window_topn_no_partition(limit_value: i64) -> Result<Arc<dyn ExecutionPlan>> {
     let s = schema();
-    let input: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap());
 
     // Sort by val ASC only (no partition key)
     let ordering =
@@ -165,7 +168,8 @@ fn build_window_topn_no_partition(limit_value: i64) -> Result<Arc<dyn ExecutionP
 /// Build a plan where filter is on a data column (not window output)
 fn build_non_window_filter_plan() -> Result<Arc<dyn ExecutionPlan>> {
     let s = schema();
-    let input: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap());
 
     let ordering = LexOrdering::new(vec![
         PhysicalSortExpr::new_default(col("pk", &s)?).asc(),
@@ -241,8 +245,9 @@ fn rn_lt_3_becomes_fetch_2() -> Result<()> {
 fn flipped_3_gteq_rn() -> Result<()> {
     let plan = {
         let s = schema();
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap(),
+        );
 
         let partition_by = vec![col("pk", &s)?];
         let order_by = vec![PhysicalSortExpr::new_default(col("val", &s)?).asc()];
@@ -333,7 +338,8 @@ fn no_partition_by_no_change() -> Result<()> {
 #[test]
 fn with_projection_between() -> Result<()> {
     let s = schema();
-    let input: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap());
 
     let partition_by = vec![col("pk", &s)?];
     let order_by = vec![PhysicalSortExpr::new_default(col("val", &s)?).asc()];
@@ -417,7 +423,8 @@ fn build_ranking_topn_plan(
     op: Operator,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let s = schema();
-    let input: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap());
 
     let partition_by = vec![col("pk", &s)?];
     let order_by = vec![PhysicalSortExpr::new_default(col("val", &s)?).asc()];
@@ -457,7 +464,8 @@ fn build_ranking_topn_plan(
 /// Build a RANK plan with NO ORDER BY: every row ties at rank 1 — degenerate.
 fn build_rank_no_order_by_plan(limit_value: i64) -> Result<Arc<dyn ExecutionPlan>> {
     let s = schema();
-    let input: Arc<dyn ExecutionPlan> = Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+    let input: Arc<dyn ExecutionPlan> =
+        Arc::new(PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap());
 
     let ordering =
         LexOrdering::new(vec![PhysicalSortExpr::new_default(col("pk", &s)?).asc()])

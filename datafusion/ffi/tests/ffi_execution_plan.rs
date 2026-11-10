@@ -21,6 +21,7 @@ mod tests {
     use arrow::datatypes::Schema;
     use arrow_schema::DataType;
     use datafusion_common::DataFusionError;
+    use datafusion_common::funding::Funding;
     use datafusion_common::tree_node::TreeNodeRecursion;
     use datafusion_ffi::execution_plan::{
         ExecutionPlanPrivateData, FFI_ExecutionPlan, ForeignExecutionPlan,
@@ -127,7 +128,7 @@ mod tests {
             let schema =
                 Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, false)]));
 
-            Arc::new(EmptyExec::new(schema))
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap())
         }
 
         let child_plan = (module.create_empty_exec)();

@@ -34,6 +34,7 @@
 //! `PhysicalProtoConverterExtension`, where physical-expression
 //! serialization and deserialization route through converter hooks.
 
+use datafusion_common::funding::Funding;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
@@ -95,7 +96,10 @@ pub fn expression_deduplication() -> Result<()> {
     // Step 2: Create a filter plan with this expression
     println!("Step 2: Creating physical plan with the expression...");
 
-    let input = Arc::new(PlaceholderRowExec::new(Arc::clone(&schema)));
+    let input = Arc::new(PlaceholderRowExec::new(
+        Arc::clone(&schema),
+        &Funding::default(),
+    )?);
     let filter_plan: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(combined_expr, input)?);
 

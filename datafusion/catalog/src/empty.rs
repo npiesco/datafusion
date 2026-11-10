@@ -65,15 +65,17 @@ impl TableProvider for EmptyTable {
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // even though there is no data, projections apply
         let projected_schema = project_schema(&self.schema, projection)?;
-        Ok(Arc::new(
-            EmptyExec::new(projected_schema).with_partitions(self.partitions),
-        ))
+        let funding = &state.config_options().funding;
+        Ok(funding.arc(
+            EmptyExec::new(projected_schema, funding)?
+                .with_partitions(self.partitions, funding)?,
+        )?)
     }
 }

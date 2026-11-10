@@ -36,6 +36,7 @@ use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{
     Accumulator, AccumulatorFactoryFunction, AggregateUDF, Signature, SimpleAggregateUDF,
@@ -94,7 +95,7 @@ fn roundtrip_aggregate() -> Result<()> {
             PhysicalGroupBy::new_single(groups.clone()),
             aggregates,
             vec![None],
-            Arc::new(EmptyExec::new(schema.clone())),
+            Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
             schema,
         )?))?;
     }
@@ -113,7 +114,7 @@ fn roundtrip_aggregate_preserves_optimizer_schema_and_reversed_state() -> Result
     .expect("single sort expression should form an ordering");
     let input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(
         input_ordering,
-        Arc::new(EmptyExec::new(Arc::clone(&input_schema))),
+        Arc::new(EmptyExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap()),
     ));
     let original_name = "first_value(b) ORDER BY [b ASC NULLS LAST]";
     let aggregate_expr = Arc::new(
@@ -177,7 +178,7 @@ fn decode_aggregate_without_output_schema() -> Result<()> {
         PhysicalGroupBy::new(vec![], vec![], vec![], false),
         vec![aggregate_expr],
         vec![None],
-        Arc::new(EmptyExec::new(Arc::clone(&input_schema))),
+        Arc::new(EmptyExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap()),
         input_schema,
     )?);
 
@@ -218,7 +219,7 @@ fn roundtrip_aggregate_with_limit() -> Result<()> {
         PhysicalGroupBy::new_single(groups.clone()),
         aggregates,
         vec![None],
-        Arc::new(EmptyExec::new(schema.clone())),
+        Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         schema,
     )?;
     let agg = agg.with_limit_options(Some(LimitOptions::new_with_order(12, false)));
@@ -250,7 +251,7 @@ fn roundtrip_aggregate_with_approx_pencentile_cont() -> Result<()> {
         PhysicalGroupBy::new_single(groups.clone()),
         aggregates,
         vec![None],
-        Arc::new(EmptyExec::new(schema.clone())),
+        Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         schema,
     )?;
     roundtrip_test(Arc::new(agg))
@@ -286,7 +287,7 @@ fn roundtrip_aggregate_with_sort() -> Result<()> {
         PhysicalGroupBy::new_single(groups.clone()),
         aggregates,
         vec![None],
-        Arc::new(EmptyExec::new(schema.clone())),
+        Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         schema,
     )?;
     roundtrip_test(Arc::new(agg))
@@ -353,7 +354,7 @@ fn roundtrip_aggregate_udaf() -> Result<()> {
             PhysicalGroupBy::new_single(groups.clone()),
             aggregates,
             vec![None],
-            Arc::new(EmptyExec::new(schema.clone())),
+            Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
             schema,
         )?),
         &ctx,

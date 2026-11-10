@@ -265,6 +265,7 @@ fn bound_to_usize(bound: &WindowFrameBound) -> Option<usize> {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_expr::WindowFrame;
     use datafusion_functions_window::row_number::row_number_udwf;
     use datafusion_physical_expr::expressions::col;
@@ -290,8 +291,9 @@ mod tests {
         use_local_limit: bool,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let s = schema();
-        let input: Arc<dyn ExecutionPlan> =
-            Arc::new(PlaceholderRowExec::new(Arc::clone(&s)));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(
+            PlaceholderRowExec::new(Arc::clone(&s), &Funding::default()).unwrap(),
+        );
 
         let ordering =
             LexOrdering::new(vec![PhysicalSortExpr::new_default(col("a", &s)?).asc()])

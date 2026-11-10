@@ -47,6 +47,7 @@ use datafusion::physical_plan::{ExecutionPlan, InputOrderMode, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, internal_datafusion_err, not_impl_err};
 use datafusion_expr::async_udf::{AsyncScalarUDF, AsyncScalarUDFImpl};
 use datafusion_expr::{
@@ -69,7 +70,7 @@ fn roundtrip_scalar_udf() -> Result<()> {
     let field_b = Field::new("b", DataType::Int64, false);
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let scalar_fn = Arc::new(|args: &[ColumnarValue]| {
         let ColumnarValue::Array(array) = &args[0] else {
@@ -256,7 +257,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
     let field_published = Field::new("published", DataType::Boolean, false);
     let field_author = Field::new("author", DataType::Utf8, false);
     let schema = Arc::new(Schema::new(vec![field_text, field_published, field_author]));
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let udf_expr = Arc::new(ScalarFunctionExpr::new(
         "regex_udf",
@@ -318,7 +319,7 @@ fn roundtrip_higher_order_udf() -> Result<()> {
     );
     let schema = Arc::new(Schema::new(vec![list_field]));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let hof = Arc::new(HigherOrderUDF::new_from_impl(MyHigherOrderUDF::new(
         "payload".to_string(),
@@ -360,7 +361,7 @@ fn roundtrip_higher_order_udf_extension_codec() -> Result<()> {
         false,
     );
     let schema = Arc::new(Schema::new(vec![list_field]));
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let lambda_body = Arc::new(LambdaVariable::new(1, Arc::clone(&element_field)));
     let lambda_expr = lambda(["v"], lambda_body)?;
@@ -428,7 +429,7 @@ fn roundtrip_udwf_extension_codec() -> Result<()> {
         Arc::new(window_frame),
     ));
 
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
     let window = Arc::new(BoundedWindowAggExec::try_new(
         vec![udwf_expr],
         input,
@@ -448,7 +449,7 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
     let field_published = Field::new("published", DataType::Boolean, false);
     let field_author = Field::new("author", DataType::Utf8, false);
     let schema = Arc::new(Schema::new(vec![field_text, field_published, field_author]));
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let udf_expr = Arc::new(ScalarFunctionExpr::new(
         "regex_udf",

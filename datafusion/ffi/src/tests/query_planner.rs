@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -84,7 +85,9 @@ impl TestQueryPlanner {
         }
 
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        Ok(Arc::new(EmptyExec::new(schema)))
+        Ok(Arc::new(
+            EmptyExec::new(schema, &Funding::default()).unwrap(),
+        ))
     }
 }
 

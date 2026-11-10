@@ -27,6 +27,7 @@ use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_proto::physical_plan::{
     DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
 };
@@ -52,7 +53,7 @@ fn roundtrip_filter_with_not_and_in_list() -> Result<()> {
     let and = binary(not, Operator::And, in_list, &schema)?;
     roundtrip_test(Arc::new(FilterExec::try_new(
         and,
-        Arc::new(EmptyExec::new(schema.clone())),
+        Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
     )?))
 }
 
@@ -62,9 +63,12 @@ fn roundtrip_filter_with_fetch() -> Result<()> {
     let field_b = Field::new("b", DataType::Int64, false);
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
     let predicate = col("a", &schema)?;
-    let filter = FilterExecBuilder::new(predicate, Arc::new(EmptyExec::new(schema)))
-        .with_fetch(Some(10))
-        .build()?;
+    let filter = FilterExecBuilder::new(
+        predicate,
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+    )
+    .with_fetch(Some(10))
+    .build()?;
     assert_eq!(filter.fetch(), Some(10));
     roundtrip_test(Arc::new(filter))
 }
@@ -82,7 +86,7 @@ fn roundtrip_filter_projection_states() -> Result<()> {
     for projection in [None, Some(vec![]), Some(vec![0])] {
         let filter = FilterExecBuilder::new(
             col("a", &schema)?,
-            Arc::new(EmptyExec::new(Arc::clone(&schema))),
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
         )
         .apply_projection(projection.clone())?
         .with_default_selectivity(37)

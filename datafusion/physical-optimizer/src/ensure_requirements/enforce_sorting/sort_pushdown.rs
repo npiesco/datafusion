@@ -1105,6 +1105,7 @@ fn handle_projection_pushdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1135,7 +1136,8 @@ mod tests {
     /// b@1 as value]` — i.e. it *reorders* (`c` moves index 2 -> 1) and renames.
     fn reordering_projection() -> Arc<ProjectionExec> {
         let schema = child_schema();
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         Arc::new(
             ProjectionExec::try_new(
                 vec![
@@ -1153,7 +1155,8 @@ mod tests {
     /// so output column index 1 maps to a *computed* (non-`Column`) expression.
     fn computed_projection() -> Arc<ProjectionExec> {
         let schema = child_schema();
-        let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let input =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let b_plus_c = Arc::new(BinaryExpr::new(
             col("b", &schema).unwrap(),
             Operator::Plus,

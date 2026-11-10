@@ -37,6 +37,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
     PhysicalProtoConverterExtension,
@@ -56,7 +57,8 @@ fn roundtrip_date_time_interval() -> Result<()> {
             false,
         ),
     ]);
-    let input = Arc::new(EmptyExec::new(Arc::new(schema.clone())));
+    let input =
+        Arc::new(EmptyExec::new(Arc::new(schema.clone()), &Funding::default()).unwrap());
     let date_expr = col("some_date", &schema)?;
     let literal_expr = col("some_interval", &schema)?;
     let date_time_interval_expr =
@@ -77,7 +79,8 @@ fn roundtrip_like() -> Result<()> {
         Field::new("a", DataType::Utf8, false),
         Field::new("b", DataType::Utf8, false),
     ]);
-    let input = Arc::new(EmptyExec::new(Arc::new(schema.clone())));
+    let input =
+        Arc::new(EmptyExec::new(Arc::new(schema.clone()), &Funding::default()).unwrap());
     let like_expr = like(
         false,
         false,
@@ -107,7 +110,7 @@ fn roundtrip_hash_table_lookup_expr_to_lit() -> Result<()> {
 
     // Create a simple schema and input plan
     let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int64, false)]));
-    let input = Arc::new(EmptyExec::new(schema.clone()));
+    let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     // Create a HashTableLookupExpr - it will be replaced with lit(true) during serialization
     let hash_map = Arc::new(Map::HashMap(Box::new(JoinHashMapU32::with_capacity(0))));
@@ -167,7 +170,7 @@ fn roundtrip_hash_expr() -> Result<()> {
     let filter_expr = binary(hash_expr, Operator::Gt, lit(0u64), &schema)?;
     let filter = Arc::new(FilterExec::try_new(
         filter_expr,
-        Arc::new(EmptyExec::new(schema)),
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
     )?);
 
     // Confirm that the debug string contains the random state seeds
@@ -205,7 +208,7 @@ fn roundtrip_range_expr() -> Result<()> {
     let filter_expr = binary(range_expr, Operator::Eq, lit(0u64), &schema)?;
     let plan = Arc::new(FilterExec::try_new(
         filter_expr,
-        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
     )?);
 
     let ctx = SessionContext::new();
@@ -239,7 +242,8 @@ fn roundtrip_call_null_scalar_struct_dict() -> Result<()> {
     )]));
 
     let schema = Arc::new(Schema::new(vec![Field::new("a", data_type.clone(), true)]));
-    let scan = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let scan =
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
     let scalar = lit(ScalarValue::try_from(data_type)?);
     let filter = Arc::new(FilterExec::try_new(
         Arc::new(BinaryExpr::new(scalar, Operator::Eq, col("a", &schema)?)),
@@ -266,7 +270,7 @@ fn roundtrip_binary_expr_chain_same_op() -> Result<()> {
     let abc = binary(ab, Operator::And, col("c", &schema)?, &schema)?;
     roundtrip_test(Arc::new(FilterExec::try_new(
         abc,
-        Arc::new(EmptyExec::new(schema)),
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
     )?))
 }
 
@@ -288,7 +292,7 @@ fn roundtrip_binary_expr_mixed_ops() -> Result<()> {
     let expr = binary(a_and_b, Operator::Or, col("c", &schema)?, &schema)?;
     roundtrip_test(Arc::new(FilterExec::try_new(
         expr,
-        Arc::new(EmptyExec::new(schema)),
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
     )?))
 }
 
@@ -308,7 +312,7 @@ fn roundtrip_binary_expr_deeply_nested_and_chain() -> Result<()> {
 
     roundtrip_test(Arc::new(FilterExec::try_new(
         expr,
-        Arc::new(EmptyExec::new(schema)),
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
     )?))
 }
 
@@ -326,7 +330,7 @@ fn roundtrip_binary_expr_deeply_nested_or_chain() -> Result<()> {
 
     roundtrip_test(Arc::new(FilterExec::try_new(
         expr,
-        Arc::new(EmptyExec::new(schema)),
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
     )?))
 }
 
@@ -357,7 +361,7 @@ fn roundtrip_binary_expr_alternating_and_or() -> Result<()> {
 
     roundtrip_test(Arc::new(FilterExec::try_new(
         expr,
-        Arc::new(EmptyExec::new(schema)),
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
     )?))
 }
 

@@ -42,6 +42,7 @@ use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::prelude::SessionContext;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_proto::physical_plan::{
     DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
 };
@@ -51,7 +52,7 @@ use std::vec;
 #[test]
 fn roundtrip_local_limit() -> Result<()> {
     roundtrip_test(Arc::new(LocalLimitExec::new(
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap()),
         25,
     )))
 }
@@ -59,7 +60,7 @@ fn roundtrip_local_limit() -> Result<()> {
 #[test]
 fn roundtrip_global_limit() -> Result<()> {
     roundtrip_test(Arc::new(GlobalLimitExec::new(
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap()),
         0,
         Some(25),
     )))
@@ -68,7 +69,7 @@ fn roundtrip_global_limit() -> Result<()> {
 #[test]
 fn roundtrip_global_skip_no_limit() -> Result<()> {
     roundtrip_test(Arc::new(GlobalLimitExec::new(
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap()),
         10,
         None, // no limit
     )))
@@ -103,8 +104,11 @@ fn roundtrip_limit_with_required_ordering() -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
     let proto_converter = DefaultPhysicalProtoConverter {};
 
-    let mut global =
-        GlobalLimitExec::new(Arc::new(EmptyExec::new(Arc::clone(&schema))), 3, Some(25));
+    let mut global = GlobalLimitExec::new(
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
+        3,
+        Some(25),
+    );
     global.set_required_ordering(required_ordering.clone());
     let decoded =
         roundtrip_test_and_return(Arc::new(global), &ctx, &codec, &proto_converter)?;
@@ -113,7 +117,10 @@ fn roundtrip_limit_with_required_ordering() -> Result<()> {
         .expect("expected GlobalLimitExec");
     assert_eq!(decoded.required_ordering(), &required_ordering);
 
-    let mut local = LocalLimitExec::new(Arc::new(EmptyExec::new(schema)), 25);
+    let mut local = LocalLimitExec::new(
+        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+        25,
+    );
     local.set_required_ordering(required_ordering.clone());
     let decoded =
         roundtrip_test_and_return(Arc::new(local), &ctx, &codec, &proto_converter)?;
@@ -187,14 +194,17 @@ fn roundtrip_coalesce_batches_with_fetch() -> Result<()> {
 
     #[expect(deprecated)]
     roundtrip_test(Arc::new(CoalesceBatchesExec::new(
-        Arc::new(EmptyExec::new(schema.clone())),
+        Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         8096,
     )))?;
 
     #[expect(deprecated)]
     roundtrip_test(Arc::new(
-        CoalesceBatchesExec::new(Arc::new(EmptyExec::new(schema)), 8096)
-            .with_fetch(Some(10)),
+        CoalesceBatchesExec::new(
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            8096,
+        )
+        .with_fetch(Some(10)),
     ))
 }
 
@@ -205,21 +215,23 @@ fn roundtrip_coalesce_partitions_with_fetch() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
 
     roundtrip_test(Arc::new(CoalescePartitionsExec::new(Arc::new(
-        EmptyExec::new(schema.clone()),
+        EmptyExec::new(schema.clone(), &Funding::default()).unwrap(),
     ))))?;
 
     roundtrip_test(Arc::new(
-        CoalescePartitionsExec::new(Arc::new(EmptyExec::new(schema)))
-            .with_fetch(Some(10)),
+        CoalescePartitionsExec::new(Arc::new(
+            EmptyExec::new(schema, &Funding::default()).unwrap(),
+        ))
+        .with_fetch(Some(10)),
     ))
 }
 
 #[test]
 fn roundtrip_cooperative() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
-    roundtrip_test(Arc::new(CooperativeExec::new(Arc::new(EmptyExec::new(
-        schema,
-    )))))
+    roundtrip_test(Arc::new(CooperativeExec::new(Arc::new(
+        EmptyExec::new(schema, &Funding::default()).unwrap(),
+    ))))
 }
 
 #[test]
@@ -229,7 +241,10 @@ fn roundtrip_buffer() -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
     let proto_converter = DefaultPhysicalProtoConverter {};
     let result = roundtrip_test_and_return(
-        Arc::new(BufferExec::new(Arc::new(EmptyExec::new(schema)), 4096)),
+        Arc::new(BufferExec::new(
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            4096,
+        )),
         &ctx,
         &codec,
         &proto_converter,

@@ -52,6 +52,7 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion_common::config::{ConfigOptions, TableParquetOptions};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{NullEquality, Result, internal_datafusion_err, internal_err};
 use datafusion_datasource::file::FileSource;
@@ -401,7 +402,8 @@ fn datasource_for_dynamic_filter_pushdown(
 fn test_hash_join_with_dynamic_filter_roundtrip() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Int64, false)]));
 
-    let left_child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let left_child =
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
     let (right_child, config) = datasource_for_dynamic_filter_pushdown(&schema);
 
     let on: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> = vec![(
@@ -611,7 +613,8 @@ fn test_aggregate_with_dynamic_filter_roundtrip() -> Result<()> {
 fn test_aggregate_without_dynamic_filter_roundtrip() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
     let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-    let child = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let child =
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
     let aggregate = Arc::new(AggregateExec::try_new(
         AggregateMode::Partial,
         PhysicalGroupBy::new_single(vec![]),
@@ -890,7 +893,8 @@ fn test_custom_node_with_dynamic_filter_dedup_roundtrip() -> Result<()> {
     ));
     let dynamic_filter_expr: Arc<dyn PhysicalExpr> = dynamic_filter;
 
-    let empty = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let empty =
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
     let custom_exec = Arc::new(CustomExecWithExprs::new(
         vec![Arc::clone(&dynamic_filter_expr)],
         empty,

@@ -29,6 +29,7 @@ use datafusion::physical_plan::aggregates::{
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::expressions::{PhysicalSortExpr, col};
 use datafusion::prelude::SessionContext;
+use datafusion_common::funding::Funding;
 use datafusion_common::{DataFusionError, Result};
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
@@ -243,7 +244,7 @@ fn roundtrip_first_value_aggregate(
         PhysicalGroupBy::new(vec![], vec![], vec![], false),
         vec![agg_expr],
         vec![None],
-        Arc::new(EmptyExec::new(Arc::clone(&schema))),
+        Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
         schema,
     )?);
 

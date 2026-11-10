@@ -522,11 +522,14 @@ mod tests {
     use super::*;
     use crate::empty::EmptyExec;
     use crate::projection::ProjectionExec;
+    use datafusion_common::funding::Funding;
 
     use arrow::datatypes::{DataType, Field, Schema};
 
     fn empty_exec(fields: Vec<Field>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(EmptyExec::new(Arc::new(Schema::new(fields))))
+        Arc::new(
+            EmptyExec::new(Arc::new(Schema::new(fields)), &Funding::default()).unwrap(),
+        )
     }
 
     #[test]

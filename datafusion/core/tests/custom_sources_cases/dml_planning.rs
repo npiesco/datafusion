@@ -17,6 +17,7 @@
 
 //! Tests for DELETE, UPDATE, and TRUNCATE planning to verify filter and assignment extraction.
 
+use datafusion_common::funding::Funding;
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -105,7 +106,9 @@ impl TableProvider for CaptureDeleteProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        Ok(Arc::new(
+            EmptyExec::new(Arc::clone(&self.schema), &Funding::default()).unwrap(),
+        ))
     }
 
     async fn delete_from(
@@ -114,9 +117,17 @@ impl TableProvider for CaptureDeleteProvider {
         filters: Vec<Expr>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         *self.received_filters.lock().unwrap() = Some(filters);
-        Ok(Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
-            Field::new("count", DataType::UInt64, false),
-        ])))))
+        Ok(Arc::new(
+            EmptyExec::new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::UInt64,
+                    false,
+                )])),
+                &Funding::default(),
+            )
+            .unwrap(),
+        ))
     }
 
     fn supports_filters_pushdown(
@@ -201,7 +212,9 @@ impl TableProvider for CaptureUpdateProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        Ok(Arc::new(
+            EmptyExec::new(Arc::clone(&self.schema), &Funding::default()).unwrap(),
+        ))
     }
 
     async fn update(
@@ -212,9 +225,17 @@ impl TableProvider for CaptureUpdateProvider {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         *self.received_filters.lock().unwrap() = Some(filters);
         *self.received_assignments.lock().unwrap() = Some(assignments);
-        Ok(Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
-            Field::new("count", DataType::UInt64, false),
-        ])))))
+        Ok(Arc::new(
+            EmptyExec::new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::UInt64,
+                    false,
+                )])),
+                &Funding::default(),
+            )
+            .unwrap(),
+        ))
     }
 
     fn supports_filters_pushdown(
@@ -275,15 +296,25 @@ impl TableProvider for CaptureTruncateProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(EmptyExec::new(Arc::clone(&self.schema))))
+        Ok(Arc::new(
+            EmptyExec::new(Arc::clone(&self.schema), &Funding::default()).unwrap(),
+        ))
     }
 
     async fn truncate(&self, _state: &dyn Session) -> Result<Arc<dyn ExecutionPlan>> {
         *self.truncate_called.lock().unwrap() = true;
 
-        Ok(Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
-            Field::new("count", DataType::UInt64, false),
-        ])))))
+        Ok(Arc::new(
+            EmptyExec::new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "count",
+                    DataType::UInt64,
+                    false,
+                )])),
+                &Funding::default(),
+            )
+            .unwrap(),
+        ))
     }
 }
 

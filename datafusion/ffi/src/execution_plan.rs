@@ -557,6 +557,7 @@ impl ExecutionPlan for ForeignExecutionPlan {
 
 #[cfg(any(test, feature = "integration-tests"))]
 pub mod tests {
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
     use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion_physical_plan::{Partitioning, PhysicalExpr};
@@ -709,7 +710,8 @@ pub mod tests {
             arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Float32, false),
         ]));
 
-        let original_plan = Arc::new(EmptyExec::new(schema));
+        let original_plan =
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap());
         let original_name = original_plan.name().to_string();
 
         let mut local_plan = FFI_ExecutionPlan::new(original_plan, None);
@@ -740,8 +742,11 @@ pub mod tests {
             .expression_id()
             .expect("dynamic filters always have an expression ID");
         let expression: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
-        let original_plan =
-            Arc::new(EmptyExec::new(schema).with_expressions(vec![expression]));
+        let original_plan = Arc::new(
+            EmptyExec::new(schema, &Funding::default())
+                .unwrap()
+                .with_expressions(vec![expression]),
+        );
 
         let mut ffi_plan = FFI_ExecutionPlan::new(original_plan, None);
         ffi_plan.library_marker_id = crate::mock_foreign_marker_id;
@@ -769,8 +774,11 @@ pub mod tests {
             .expression_id()
             .expect("dynamic filters always have an expression ID");
         let expression: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
-        let original_plan =
-            Arc::new(EmptyExec::new(schema).with_dynamic_expressions(vec![expression]));
+        let original_plan = Arc::new(
+            EmptyExec::new(schema, &Funding::default())
+                .unwrap()
+                .with_dynamic_expressions(vec![expression]),
+        );
 
         let mut ffi_plan = FFI_ExecutionPlan::new(original_plan, None);
         ffi_plan.library_marker_id = crate::mock_foreign_marker_id;
@@ -794,12 +802,14 @@ pub mod tests {
         ]));
 
         // Version 1: Adding child to the foreign plan
-        let child_plan = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child_plan =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let mut child_local = FFI_ExecutionPlan::new(child_plan, None);
         child_local.library_marker_id = crate::mock_foreign_marker_id;
         let child_foreign = <Arc<dyn ExecutionPlan>>::try_from(&child_local)?;
 
-        let parent_plan = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let parent_plan =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let mut parent_local = FFI_ExecutionPlan::new(parent_plan, None);
         parent_local.library_marker_id = crate::mock_foreign_marker_id;
         let parent_foreign = <Arc<dyn ExecutionPlan>>::try_from(&parent_local)?;
@@ -814,12 +824,14 @@ pub mod tests {
         assert_eq!(parent_foreign.children().len(), 1);
 
         // Version 2: Adding child to the local plan
-        let child_plan = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let child_plan =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let mut child_local = FFI_ExecutionPlan::new(child_plan, None);
         child_local.library_marker_id = crate::mock_foreign_marker_id;
         let child_foreign = <Arc<dyn ExecutionPlan>>::try_from(&child_local)?;
 
-        let parent_plan = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let parent_plan =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let parent_plan = parent_plan.replace_children(
             vec![child_foreign],
             ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
@@ -842,7 +854,8 @@ pub mod tests {
         ]));
 
         // Plans without metrics still return None across the boundary.
-        let bare_plan = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let bare_plan =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
         let mut bare_local = FFI_ExecutionPlan::new(bare_plan, None);
         bare_local.library_marker_id = crate::mock_foreign_marker_id;
         let bare_foreign: Arc<dyn ExecutionPlan> = (&bare_local).try_into()?;
@@ -859,7 +872,11 @@ pub mod tests {
         original_metrics
             .push(Arc::new(Metric::new(MetricValue::OutputRows(c1), Some(1))));
 
-        let metric_plan = Arc::new(EmptyExec::new(schema).with_metrics(original_metrics));
+        let metric_plan = Arc::new(
+            EmptyExec::new(schema, &Funding::default())
+                .unwrap()
+                .with_metrics(original_metrics),
+        );
         let mut metric_local = FFI_ExecutionPlan::new(metric_plan, None);
         metric_local.library_marker_id = crate::mock_foreign_marker_id;
         let metric_foreign: Arc<dyn ExecutionPlan> = (&metric_local).try_into()?;
@@ -877,7 +894,7 @@ pub mod tests {
         schema: &arrow::datatypes::SchemaRef,
         statistics: Option<Statistics>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut plan = EmptyExec::new(Arc::clone(schema));
+        let mut plan = EmptyExec::new(Arc::clone(schema), &Funding::default()).unwrap();
         if let Some(statistics) = statistics {
             plan = plan.with_statistics(statistics);
         }
@@ -985,7 +1002,7 @@ pub mod tests {
             arrow::datatypes::Field::new("a", arrow::datatypes::DataType::Float32, false),
         ]));
 
-        let plan = Arc::new(EmptyExec::new(schema));
+        let plan = Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap());
 
         let mut ffi_plan = FFI_ExecutionPlan::new(plan, None);
 

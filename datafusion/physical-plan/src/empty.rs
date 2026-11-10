@@ -31,6 +31,7 @@ use crate::{
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{ColumnStatistics, Result, ScalarValue, assert_or_internal_err};
@@ -52,23 +53,37 @@ pub struct EmptyExec {
 }
 
 impl EmptyExec {
-    /// Create a new EmptyExec
-    pub fn new(schema: SchemaRef) -> Self {
+    /// Create a new EmptyExec, its properties' block charged to `funding` first
+    pub fn new(schema: SchemaRef, funding: &Funding) -> Result<Self> {
         let cache = Self::compute_properties(Arc::clone(&schema), 1);
-        EmptyExec {
+        Ok(EmptyExec {
             schema,
             partitions: 1,
-            cache: Arc::new(cache),
-        }
+            cache: funding.arc(cache)?,
+        })
     }
 
-    /// Create a new EmptyExec with specified partition number
-    pub fn with_partitions(mut self, partitions: usize) -> Self {
+    /// Create a new EmptyExec with specified partition number: properties shared
+    /// with a clone are made anew, their block charged to `funding` first
+    pub fn with_partitions(
+        mut self,
+        partitions: usize,
+        funding: &Funding,
+    ) -> Result<Self> {
         self.partitions = partitions;
         // Changing partitions may invalidate output partitioning, so update it:
-        let output_partitioning = Self::output_partitioning_helper(self.partitions);
-        Arc::make_mut(&mut self.cache).partitioning = output_partitioning;
-        self
+        match Arc::get_mut(&mut self.cache) {
+            Some(cache) => {
+                cache.partitioning = Self::output_partitioning_helper(partitions)
+            }
+            None => {
+                self.cache = funding.arc(Self::compute_properties(
+                    Arc::clone(&self.schema),
+                    partitions,
+                ))?
+            }
+        }
+        Ok(self)
     }
 
     fn data(&self) -> Result<Vec<RecordBatch>> {
@@ -253,7 +268,10 @@ impl EmptyExec {
         // A zero (absent) partition count comes from a plan encoded before the
         // field existed, which always meant a single partition.
         let partitions = empty.partitions.max(1) as usize;
-        Ok(Arc::new(EmptyExec::new(schema).with_partitions(partitions)))
+        Ok(Arc::new(
+            EmptyExec::new(schema, &Funding::default())?
+                .with_partitions(partitions, &Funding::default())?,
+        ))
     }
 }
 
@@ -263,13 +281,14 @@ mod tests {
     use crate::common;
     use crate::execution_plan::replace_children_if_necessary;
     use crate::test;
+    use datafusion_common::funding::Funding;
 
     #[tokio::test]
     async fn empty() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = test::aggr_test_schema();
 
-        let empty = EmptyExec::new(Arc::clone(&schema));
+        let empty = EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap();
         assert_eq!(empty.schema(), schema);
 
         // We should have no results
@@ -283,7 +302,8 @@ mod tests {
     #[test]
     fn with_new_children() -> Result<()> {
         let schema = test::aggr_test_schema();
-        let empty = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let empty =
+            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap());
 
         let empty2 = replace_children_if_necessary(
             Arc::clone(&empty) as Arc<dyn ExecutionPlan>,
@@ -303,7 +323,7 @@ mod tests {
     async fn invalid_execute() -> Result<()> {
         let task_ctx = Arc::new(TaskContext::default());
         let schema = test::aggr_test_schema();
-        let empty = EmptyExec::new(schema);
+        let empty = EmptyExec::new(schema, &Funding::default()).unwrap();
 
         // ask for the wrong partition
         assert!(empty.execute(1, Arc::clone(&task_ctx)).is_err());

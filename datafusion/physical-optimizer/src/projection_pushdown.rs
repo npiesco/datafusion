@@ -432,6 +432,7 @@ impl<'a> JoinFilterRewriter<'a> {
 mod test {
     use super::*;
     use arrow::datatypes::{DataType, Field, FieldRef, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_expr_common::operator::Operator;
     use datafusion_functions::math::random;
     use datafusion_physical_expr::ScalarFunctionExpr;
@@ -631,8 +632,12 @@ mod test {
         filter_expr_builder: impl FnOnce(&Schema) -> Result<Arc<dyn PhysicalExpr>>,
         join_type: JoinType,
     ) -> Result<String> {
-        let left = Arc::new(EmptyExec::new(Arc::new(left_schema.clone())));
-        let right = Arc::new(EmptyExec::new(Arc::new(right_schema.clone())));
+        let left = Arc::new(
+            EmptyExec::new(Arc::new(left_schema.clone()), &Funding::default()).unwrap(),
+        );
+        let right = Arc::new(
+            EmptyExec::new(Arc::new(right_schema.clone()), &Funding::default()).unwrap(),
+        );
 
         let join_fields: Vec<_> = column_indices
             .iter()
