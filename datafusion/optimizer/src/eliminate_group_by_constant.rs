@@ -106,11 +106,16 @@ impl OptimizerRule for EliminateGroupByConstant {
                     funding.to_vec(&aggregate.aggr_expr)?,
                 )?);
 
-                let projection_expr =
-                    aggregate.group_expr.into_iter().chain(aggregate.aggr_expr);
-
-                let projection =
-                    project(simplified_aggregate, projection_expr, &funding)?;
+                let (mut group_expr, mut aggr_expr) =
+                    (aggregate.group_expr, aggregate.aggr_expr);
+                let projection = project(
+                    simplified_aggregate,
+                    group_expr.drain(..).chain(aggr_expr.drain(..)),
+                    &funding,
+                )?;
+                // The lists the expressions were moved out of are given back.
+                funding.released(group_expr);
+                funding.released(aggr_expr);
 
                 Ok(Transformed::yes(projection))
             }
