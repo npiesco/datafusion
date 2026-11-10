@@ -38,13 +38,13 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, Field};
 use datafusion_common::cloned::CloneBytes;
 use datafusion_common::funding::{Funding, arc_bytes};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    Column, DataFusionError, RecursionUnnestOption, Result, ScalarValue, Spans,
-    internal_err,
+    Column, DFSchema, DFSchemaRef, DataFusionError, RecursionUnnestOption, Result,
+    ScalarValue, Spans, TableReference, internal_err,
 };
 use datafusion_expr::dml::CopyTo;
 use datafusion_expr::expr::{
@@ -55,10 +55,10 @@ use datafusion_expr::expr::{
 };
 use datafusion_expr::logical_plan::{
     Aggregate, Analyze, ColumnUnnestList, CreateMemoryTable, CreateView, DdlStatement,
-    Distinct, DistinctOn, DmlStatement, Execute, Explain, Extension, Filter, Join, Limit,
-    LogicalPlan, MergeIntoAction, Partitioning, Prepare, Projection, RecursiveQuery,
-    Repartition, Sort as SortPlan, Statement, Subquery, SubqueryAlias, TableScan, Union,
-    Unnest, Values, Window,
+    Distinct, DistinctOn, DmlStatement, EmptyRelation, Execute, Explain, Extension,
+    Filter, Join, Limit, LogicalPlan, MergeIntoAction, Partitioning, Prepare, Projection,
+    RecursiveQuery, Repartition, Sort as SortPlan, Statement, Subquery, SubqueryAlias,
+    TableScan, Union, Unnest, Values, Window,
 };
 use datafusion_expr::{Expr, WindowFrame, WindowFrameBound, WriteOp};
 
@@ -464,6 +464,101 @@ impl<T> Drop for Released<T> {
         drop(self.value.take());
         self.funding.discharge(self.bytes);
     }
+}
+
+/// A column of `name` under `qualifier`, its name charged before it is copied.
+pub(crate) fn column_expr(
+    funding: &Funding,
+    qualifier: Option<&TableReference>,
+    name: &str,
+) -> Result<Expr> {
+    funding.charge(sum([qualifier.cloned().clone_bytes(), name.len()]))?;
+    Ok(Expr::Column(Column::new(qualifier.cloned(), name)))
+}
+
+/// A column for each of `schema`'s fields, in a list of their number: the list and each
+/// name charged before they are made.
+pub(crate) fn schema_columns(funding: &Funding, schema: &DFSchema) -> Result<Vec<Expr>> {
+    let mut exprs = funding.vec_with_capacity(schema.fields().len())?;
+    for (qualifier, field) in schema.iter() {
+        exprs.push(column_expr(funding, qualifier, field.name())?);
+    }
+    Ok(exprs)
+}
+
+/// A projection of `schema`'s columns over `input`, its list charged before it is made.
+pub(crate) fn schema_projection(
+    funding: &Funding,
+    input: Arc<LogicalPlan>,
+    schema: DFSchemaRef,
+) -> Result<LogicalPlan> {
+    let expr = schema_columns(funding, &schema)?;
+    Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+        expr, input, schema,
+    )?))
+}
+
+/// `expr` cast to `data_type` (a nullable field of it), its box and field charged first.
+pub(crate) fn nullable_cast(
+    funding: &Funding,
+    expr: Expr,
+    data_type: &DataType,
+) -> Result<Expr> {
+    funding.charge(sum([
+        arc_bytes::<Field>(),
+        data_type.clone_bytes(),
+        size_of::<Expr>(),
+    ]))?;
+    Ok(Expr::Cast(Cast::new(Box::new(expr), data_type.clone())))
+}
+
+/// `expr` named `name` under `relation`, its box and name charged first.
+pub(crate) fn aliased(
+    funding: &Funding,
+    expr: Expr,
+    relation: Option<&TableReference>,
+    name: &str,
+) -> Result<Expr> {
+    funding.charge(sum([
+        size_of::<Expr>(),
+        relation.cloned().clone_bytes(),
+        name.len(),
+    ]))?;
+    Ok(Expr::Alias(Alias {
+        expr: Box::new(expr),
+        relation: relation.cloned(),
+        name: name.to_owned(),
+        metadata: None,
+    }))
+}
+
+/// An empty relation of `schema`'s rows, `plan` (what it replaces) freed and given back.
+pub(crate) fn emptied(
+    funding: &Funding,
+    plan: LogicalPlan,
+    schema: DFSchemaRef,
+) -> LogicalPlan {
+    freed(funding, plan);
+    LogicalPlan::EmptyRelation(EmptyRelation {
+        produce_one_row: false,
+        schema,
+    })
+}
+
+/// The one input of `plan`, if it has exactly one, found without listing its inputs.
+pub(crate) fn only_input(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+    let mut only = None;
+    let mut count = 0usize;
+    let _ = apply_inputs(plan, &mut |input| {
+        count += 1;
+        only = Some(input);
+        Ok(if count > 1 {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    });
+    if count == 1 { only } else { None }
 }
 
 /// `e` with `context` added, unless it is a refusal: a refusal is passed on as it is,
