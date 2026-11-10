@@ -41,9 +41,12 @@
 
 use std::alloc::Layout;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use crate::error::{DataFusionError, Result};
 
@@ -444,6 +447,23 @@ impl Funding {
         self.discharge(bytes);
     }
 
+    /// `future` in a block of its own, to be awaited behind a pointer (a recursive or
+    /// dynamically dispatched planning step): the block charged before it is allocated, and
+    /// given back as it is freed, once the future has finished or is dropped unfinished.
+    pub fn held_future<'a, F>(&self, future: F) -> Result<HeldFuture<'a, F::Output>>
+    where
+        F: Future + Send + 'a,
+    {
+        let block = size_of::<F>();
+        let boxed: Pin<Box<dyn Future<Output = F::Output> + Send + 'a>> =
+            Box::into_pin(self.boxed(future)?);
+        Ok(HeldFuture {
+            future: Some(boxed),
+            block,
+            funding: self.clone(),
+        })
+    }
+
     /// An empty buffer, allocating nothing until it grows, given back as it is freed unless
     /// it is kept by what is made of it ([`Held::keep`]).
     pub fn held<B: Buffer>(&self) -> Held<B> {
@@ -514,6 +534,46 @@ impl<B: Buffer> Drop for Held<B> {
     fn drop(&mut self) {
         let buffer = std::mem::take(&mut self.buffer);
         self.funding.released(buffer);
+    }
+}
+
+/// A future planning boxed ([`Funding::held_future`]): its block, charged before it was
+/// allocated, is given back as it is freed, as soon as the future finishes or once it is
+/// dropped unfinished.
+pub struct HeldFuture<'a, T> {
+    future: Option<Pin<Box<dyn Future<Output = T> + Send + 'a>>>,
+    block: usize,
+    funding: Funding,
+}
+
+impl<T> HeldFuture<'_, T> {
+    fn release(&mut self) {
+        if let Some(future) = self.future.take() {
+            drop(future);
+            self.funding.discharge(self.block);
+        }
+    }
+}
+
+impl<T> Future for HeldFuture<'_, T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let this = self.get_mut();
+        let Some(future) = this.future.as_mut() else {
+            panic!("a held planning future polled after it finished");
+        };
+        let polled = future.as_mut().poll(cx);
+        if polled.is_ready() {
+            this.release();
+        }
+        polled
+    }
+}
+
+impl<T> Drop for HeldFuture<'_, T> {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -673,6 +733,44 @@ mod tests {
         assert_eq!(held(&source), arc_slice_bytes::<u64>(4).unwrap());
         drop(made);
         funding.discharge(arc_slice_bytes::<u64>(4).unwrap());
+        assert_eq!(held(&source), 0);
+    }
+
+    /// A boxed future is charged its block before it is boxed, refused without boxing it,
+    /// and gives its block back as soon as it finishes, or as it is dropped unfinished.
+    #[test]
+    fn a_held_future_gives_back_its_block_once_finished_or_dropped() {
+        let payload = [7u8; 48];
+        let future = async move { payload.iter().map(|b| *b as usize).sum::<usize>() };
+        let block = size_of_val(&future);
+        assert!(block >= 48);
+
+        let (source, funding) = limited(block - 1);
+        match funding.held_future(future) {
+            Err(DataFusionError::Refused { needed }) => assert_eq!(needed, block),
+            Err(other) => panic!("refused, not {other:?}"),
+            Ok(_) => panic!("refused, not boxed"),
+        }
+        assert_eq!(held(&source), 0);
+
+        let (source, funding) = limited(block);
+        let future = async move { payload.iter().map(|b| *b as usize).sum::<usize>() };
+        let mut held_future = funding.held_future(future).unwrap();
+        assert_eq!(held(&source), block);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert_eq!(
+            Pin::new(&mut held_future).poll(&mut cx),
+            Poll::Ready(7 * 48)
+        );
+        assert_eq!(held(&source), 0);
+        drop(held_future);
+        assert_eq!(held(&source), 0);
+        assert_eq!(funding.outstanding(), 0);
+
+        let future = async move { payload.iter().map(|b| *b as usize).sum::<usize>() };
+        let unfinished = funding.held_future(future).unwrap();
+        assert_eq!(held(&source), block);
+        drop(unfinished);
         assert_eq!(held(&source), 0);
     }
 }
