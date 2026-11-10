@@ -119,14 +119,20 @@ fn analyze_internal(
 ) -> Result<Transformed<LogicalPlan>> {
     // get schema representing all available input fields. This is used for data type
     // resolution only, so order does not matter here
-    let mut schema = merge_schema(&plan.inputs());
+    let mut schema = merge_schema(
+        &plan.inputs(),
+        &datafusion_common::funding::Funding::default(),
+    )?;
 
     if let LogicalPlan::TableScan(ts) = &plan {
         let source_schema = DFSchema::try_from_qualified_schema(
             ts.table_name.clone(),
             &ts.source.schema(),
         )?;
-        schema.merge(&source_schema);
+        schema = schema.merge(
+            &source_schema,
+            &datafusion_common::funding::Funding::default(),
+        )?;
     }
 
     // MERGE expressions (ON / WHEN clauses) reference the target table, which
@@ -141,13 +147,19 @@ fn analyze_internal(
     {
         let target_schema =
             DFSchema::try_from_qualified_schema(table_name.clone(), &target.schema())?;
-        schema.merge(&target_schema);
+        schema = schema.merge(
+            &target_schema,
+            &datafusion_common::funding::Funding::default(),
+        )?;
     }
 
     // merge the outer schema for correlated subqueries
     // like case:
     // select t2.c2 from t1 where t1.c1 in (select t2.c1 from t2 where t2.c2=t1.c3)
-    schema.merge(external_schema);
+    schema = schema.merge(
+        external_schema,
+        &datafusion_common::funding::Funding::default(),
+    )?;
 
     // Coerce filter predicates to boolean (handles `WHERE NULL`)
     let plan = if let LogicalPlan::Filter(mut filter) = plan {
@@ -1388,7 +1400,11 @@ fn coerce_union_schema_with_schema(
     })
     .collect::<Vec<_>>();
 
-    DFSchema::new_with_metadata(union_qualified_fields, metadata)
+    DFSchema::new_with_metadata(
+        &union_qualified_fields,
+        metadata,
+        &datafusion_common::funding::Funding::default(),
+    )
 }
 
 /// See `<https://github.com/apache/datafusion/pull/2108>`

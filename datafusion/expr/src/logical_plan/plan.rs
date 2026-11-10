@@ -2258,7 +2258,10 @@ impl LogicalPlan {
     /// [`LambdaVariable`]: crate::expr::LambdaVariable
     pub fn resolve_lambda_variables(self) -> Result<Transformed<LogicalPlan>> {
         self.transform_with_subqueries(|plan| {
-            let schema = merge_schema(&plan.inputs());
+            let schema = merge_schema(
+                &plan.inputs(),
+                &datafusion_common::funding::Funding::default(),
+            )?;
 
             plan.map_expressions(|expr| expr.resolve_lambda_variables(&schema))
         })
@@ -2414,8 +2417,12 @@ fn recursive_query_output_schema(
         })
         .collect::<Vec<_>>();
 
-    DFSchema::new_with_metadata(fields, static_schema.metadata().clone())
-        .map(DFSchemaRef::new)
+    DFSchema::new_with_metadata(
+        &fields,
+        static_schema.metadata().clone(),
+        &datafusion_common::funding::Funding::default(),
+    )
+    .map(DFSchemaRef::new)
 }
 
 /// Values expression. See
@@ -2530,11 +2537,12 @@ pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSc
     let metadata = input.schema().metadata().clone();
 
     // Convert expressions to fields with Field properties determined by `Expr::to_field`
-    let schema =
-        DFSchema::new_with_metadata(exprlist_to_fields(exprs, input)?, metadata)?
-            .with_functional_dependencies(calc_func_dependencies_for_project(
-                exprs, input,
-            )?)?;
+    let schema = DFSchema::new_with_metadata(
+        &exprlist_to_fields(exprs, input)?,
+        metadata,
+        &datafusion_common::funding::Funding::default(),
+    )?
+    .with_functional_dependencies(calc_func_dependencies_for_project(exprs, input)?)?;
 
     Ok(Arc::new(schema))
 }
@@ -2867,8 +2875,12 @@ impl Window {
             window_expr,
             input,
             Arc::new(
-                DFSchema::new_with_metadata(window_fields, metadata)?
-                    .with_functional_dependencies(window_func_dependencies)?,
+                DFSchema::new_with_metadata(
+                    &window_fields,
+                    metadata,
+                    &datafusion_common::funding::Funding::default(),
+                )?
+                .with_functional_dependencies(window_func_dependencies)?,
             ),
         )
     }
@@ -3121,12 +3133,13 @@ impl TableScanBuilder {
                     func_dependencies.project_functional_dependencies(p, p.len());
 
                 let df_schema = DFSchema::new_with_metadata(
-                    p.iter()
+                    &p.iter()
                         .map(|i| {
                             (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
                         })
                         .collect(),
                     schema.metadata.clone(),
+                    &datafusion_common::funding::Funding::default(),
                 )?;
                 df_schema.with_functional_dependencies(projected_func_dependencies)
             })
@@ -3330,7 +3343,11 @@ impl Union {
         );
 
         // Functional Dependencies are not preserved after UNION operation
-        let schema = DFSchema::new_with_metadata(union_fields, union_schema_metadata)?;
+        let schema = DFSchema::new_with_metadata(
+            &union_fields,
+            union_schema_metadata,
+            &datafusion_common::funding::Funding::default(),
+        )?;
         let schema = Arc::new(schema);
 
         Ok(schema)
@@ -3408,7 +3425,11 @@ impl Union {
         );
 
         // Functional Dependencies are not preserved after UNION operation
-        let schema = DFSchema::new_with_metadata(union_fields, union_schema_metadata)?;
+        let schema = DFSchema::new_with_metadata(
+            &union_fields,
+            union_schema_metadata,
+            &datafusion_common::funding::Funding::default(),
+        )?;
         let schema = Arc::new(schema);
 
         Ok(schema)
@@ -3791,8 +3812,9 @@ impl DistinctOn {
             .collect();
 
         let dfschema = DFSchema::new_with_metadata(
-            qualified_fields,
+            &qualified_fields,
             input.schema().metadata().clone(),
+            &datafusion_common::funding::Funding::default(),
         )?;
 
         let mut distinct_on = DistinctOn {
@@ -3939,8 +3961,9 @@ impl Aggregate {
         qualified_fields.extend(exprlist_to_fields(aggr_expr.as_slice(), &input)?);
 
         let schema = DFSchema::new_with_metadata(
-            qualified_fields,
+            &qualified_fields,
             input.schema().metadata().clone(),
+            &datafusion_common::funding::Funding::default(),
         )?;
 
         Self::try_new_with_schema(input, group_expr, aggr_expr, Arc::new(schema))
@@ -4808,7 +4831,11 @@ impl Unnest {
             .collect::<Vec<_>>();
 
         let metadata = input_schema.metadata().clone();
-        let df_schema = DFSchema::new_with_metadata(fields, metadata)?;
+        let df_schema = DFSchema::new_with_metadata(
+            &fields,
+            metadata,
+            &datafusion_common::funding::Funding::default(),
+        )?;
         // We can use the existing functional dependencies:
         let deps = input_schema.functional_dependencies().clone();
         let schema = Arc::new(df_schema.with_functional_dependencies(deps)?);

@@ -65,7 +65,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 self.apply_table_alias(cte_plan, cte.alias)?
             };
             // Export the CTE to the outer query
-            planner_context.insert_cte(cte_name, final_plan);
+            planner_context.insert_cte(&cte_name, final_plan, self.funding())?;
         }
         Ok(())
     }
@@ -175,7 +175,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // with the temporary relation we created above by temporarily registering
         // it as a CTE. This temporary relation in the planning context will be
         // replaced by the actual CTE plan once we're done with the planning.
-        planner_context.insert_cte(cte_name.to_string(), work_table_plan);
+        planner_context.insert_cte(cte_name, work_table_plan, self.funding())?;
 
         // ---------- Step 3: Compile the recursive term ------------------
         // this uses the named_relation we inserted above to resolve the

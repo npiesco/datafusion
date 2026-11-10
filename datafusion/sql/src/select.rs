@@ -180,8 +180,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // Place the fields of the base plan at the front so that when there are references
         // with the same name, the fields of the base plan will be searched first.
         // See https://github.com/apache/datafusion/issues/9162
-        let mut combined_schema = base_plan.schema().as_ref().clone();
-        combined_schema.merge(projected_plan.schema());
+        let combined_schema = base_plan
+            .schema()
+            .merge(projected_plan.schema(), self.funding())?;
 
         // Order-by expressions prioritize referencing columns from the select list,
         // then from the FROM clause.
@@ -212,8 +213,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Some(Distinct::On(exprs)) => std::mem::take(exprs),
             _ => Vec::new(),
         };
-        let mut on_expr_schema = projected_plan.schema().as_ref().clone();
-        on_expr_schema.merge(base_plan.schema());
+        let on_expr_schema = projected_plan
+            .schema()
+            .merge(base_plan.schema(), self.funding())?;
         let on_exprs_pre_aggr: Vec<Expr> = on_exprs_sql
             .into_iter()
             .map(|e| {

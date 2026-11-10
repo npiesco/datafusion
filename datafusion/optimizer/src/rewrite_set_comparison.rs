@@ -44,7 +44,10 @@ impl RewriteSetComparison {
     }
 
     fn rewrite_plan(&self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-        let mut schema = merge_schema(&plan.inputs());
+        let mut schema = merge_schema(
+            &plan.inputs(),
+            &datafusion_common::funding::Funding::default(),
+        )?;
         if let LogicalPlan::Dml(DmlStatement {
             op: WriteOp::MergeInto(_),
             table_name,
@@ -52,10 +55,13 @@ impl RewriteSetComparison {
             ..
         }) = &plan
         {
-            schema.merge(&DFSchema::try_from_qualified_schema(
-                table_name.clone(),
-                &target.schema(),
-            )?);
+            schema = schema.merge(
+                &DFSchema::try_from_qualified_schema(
+                    table_name.clone(),
+                    &target.schema(),
+                )?,
+                &datafusion_common::funding::Funding::default(),
+            )?;
         }
         plan.map_expressions(|expr| {
             expr.transform_up(|expr| rewrite_set_comparison(expr, &schema))

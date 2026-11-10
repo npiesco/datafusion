@@ -84,14 +84,23 @@ impl SimplifyExpressions {
             ..
         }) = &plan
         {
-            let mut schema = merge_schema(&plan.inputs());
-            schema.merge(&DFSchema::try_from_qualified_schema(
-                table_name.clone(),
-                &target.schema(),
-            )?);
+            let schema = merge_schema(
+                &plan.inputs(),
+                &datafusion_common::funding::Funding::default(),
+            )?;
+            let schema = schema.merge(
+                &DFSchema::try_from_qualified_schema(
+                    table_name.clone(),
+                    &target.schema(),
+                )?,
+                &datafusion_common::funding::Funding::default(),
+            )?;
             DFSchemaRef::new(schema)
         } else if !plan.inputs().is_empty() {
-            DFSchemaRef::new(merge_schema(&plan.inputs()))
+            DFSchemaRef::new(merge_schema(
+                &plan.inputs(),
+                &datafusion_common::funding::Funding::default(),
+            )?)
         } else if let LogicalPlan::TableScan(scan) = &plan {
             // When predicates are pushed into a table scan, there is no input
             // schema to resolve predicates against, so it must be handled specially

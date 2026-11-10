@@ -1866,7 +1866,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                vec![
+                &vec![
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1880,7 +1880,8 @@ mod tests {
                         Arc::new(Field::new("c1", DataType::UInt32, true))
                     ),
                 ],
-                HashMap::new()
+                HashMap::new(),
+                &datafusion_common::funding::Funding::default()
             )?,
         );
 
@@ -1921,7 +1922,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                vec![
+                &vec![
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1935,7 +1936,8 @@ mod tests {
                         Arc::new(Field::new("c1", DataType::UInt32, true))
                     ),
                 ],
-                HashMap::new()
+                HashMap::new(),
+                &datafusion_common::funding::Funding::default()
             )?,
         );
 
@@ -1974,7 +1976,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                vec![
+                &vec![
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1988,7 +1990,8 @@ mod tests {
                         Arc::new(Field::new("a", DataType::UInt32, true))
                     ),
                 ],
-                HashMap::new()
+                HashMap::new(),
+                &datafusion_common::funding::Funding::default()
             )?,
         );
 
