@@ -3801,7 +3801,7 @@ async fn roundtrip_join_null_equality() -> Result<()> {
         JoinType::Inner,
         JoinConstraint::On,
         NullEquality::NullEqualsNull,
-        false,
+        false, &datafusion_common::funding::Funding::default(),
     )?);
 
     let bytes = logical_plan_to_bytes(&join)?;

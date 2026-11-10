@@ -373,7 +373,7 @@ fn find_inner_join(
             let join_schema = Arc::new(build_join_schema(
                 left_input.schema(),
                 right_input.schema(),
-                &JoinType::Inner,
+                &JoinType::Inner, &datafusion_common::funding::Funding::default(),
             )?);
 
             return Ok(LogicalPlan::Join(Join {
@@ -396,7 +396,7 @@ fn find_inner_join(
     let join_schema = Arc::new(build_join_schema(
         left_input.schema(),
         right.schema(),
-        &JoinType::Inner,
+        &JoinType::Inner, &datafusion_common::funding::Funding::default(),
     )?);
 
     Ok(LogicalPlan::Join(Join {
@@ -1401,7 +1401,7 @@ mod tests {
         let join_schema = Arc::new(build_join_schema(
             t1.schema(),
             t2.schema(),
-            &JoinType::Inner,
+            &JoinType::Inner, &datafusion_common::funding::Funding::default(),
         )?);
 
         let inner_join = LogicalPlan::Join(Join {

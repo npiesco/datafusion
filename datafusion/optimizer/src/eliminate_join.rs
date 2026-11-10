@@ -476,7 +476,7 @@ fn rewrite_join(
             rewritten_join_type,
             join.join_constraint,
             join.null_equality,
-            join.null_aware,
+            join.null_aware, &datafusion_common::funding::Funding::default(),
         )?)))
     } else {
         // Nothing changed; reassemble the join reusing its existing schema rather

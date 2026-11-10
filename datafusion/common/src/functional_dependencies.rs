@@ -344,58 +344,66 @@ impl FunctionalDependencies {
         other: &FunctionalDependencies,
         join_type: &JoinType,
         left_cols_len: usize,
-    ) -> FunctionalDependencies {
-        // Get mutable copies of left and right side dependencies:
-        let mut right_func_dependencies = other.clone();
-        let mut left_func_dependencies = self.clone();
-
+        funding: &Funding,
+    ) -> Result<FunctionalDependencies> {
         match join_type {
             JoinType::Inner | JoinType::Left | JoinType::Right => {
-                // Add offset to right schema:
-                right_func_dependencies.add_offset(left_cols_len);
-
-                // Result may have multiple values, update the dependency mode:
-                left_func_dependencies =
-                    left_func_dependencies.with_dependency(Dependency::Multi);
-                right_func_dependencies =
-                    right_func_dependencies.with_dependency(Dependency::Multi);
-
-                if *join_type == JoinType::Left {
-                    // Downgrade the right side, since it may have additional NULL values:
-                    right_func_dependencies.downgrade_dependencies();
-                } else if *join_type == JoinType::Right {
-                    // Downgrade the left side, since it may have additional NULL values:
-                    left_func_dependencies.downgrade_dependencies();
+                // The result may have multiple values for a key, and the side that may
+                // gain NULL values is downgraded: a new NULL invalidates a UNIQUE
+                // (nullable) dependency, and turns a PRIMARY KEY into a UNIQUE one.
+                let left_kept = |dep: &&FunctionalDependence| {
+                    *join_type != JoinType::Right || !dep.nullable
+                };
+                let right_kept = |dep: &&FunctionalDependence| {
+                    *join_type != JoinType::Left || !dep.nullable
+                };
+                let mut deps = funding.vec_with_capacity(
+                    self.deps
+                        .iter()
+                        .filter(left_kept)
+                        .count()
+                        .saturating_add(other.deps.iter().filter(right_kept).count()),
+                )?;
+                for dep in self.deps.iter().filter(left_kept) {
+                    deps.push(FunctionalDependence {
+                        source_indices: offset_indices(&dep.source_indices, 0, funding)?,
+                        target_indices: offset_indices(&dep.target_indices, 0, funding)?,
+                        nullable: dep.nullable || *join_type == JoinType::Right,
+                        mode: Dependency::Multi,
+                    });
                 }
-                // Combine left and right functional dependencies:
-                left_func_dependencies.extend(right_func_dependencies);
-                left_func_dependencies
+                // The right side's indices are offset past the left side's columns.
+                for dep in other.deps.iter().filter(right_kept) {
+                    deps.push(FunctionalDependence {
+                        source_indices: offset_indices(
+                            &dep.source_indices,
+                            left_cols_len,
+                            funding,
+                        )?,
+                        target_indices: offset_indices(
+                            &dep.target_indices,
+                            left_cols_len,
+                            funding,
+                        )?,
+                        nullable: dep.nullable || *join_type == JoinType::Left,
+                        mode: Dependency::Multi,
+                    });
+                }
+                Ok(Self::new(deps))
             }
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
                 // These joins preserve functional dependencies of the left side:
-                left_func_dependencies
+                funding.cloned(self)
             }
             JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
                 // These joins preserve functional dependencies of the right side:
-                right_func_dependencies
+                funding.cloned(other)
             }
             JoinType::Full => {
                 // All of the functional dependencies are lost in a FULL join:
-                FunctionalDependencies::empty()
+                Ok(FunctionalDependencies::empty())
             }
         }
-    }
-
-    /// This function downgrades a functional dependency when nullability becomes
-    /// a possibility:
-    /// - If the dependency in question is UNIQUE (i.e. nullable), a new null value
-    ///   invalidates the dependency.
-    /// - If the dependency in question is PRIMARY KEY (i.e. not nullable), a new
-    ///   null value turns it into UNIQUE mode.
-    fn downgrade_dependencies(&mut self) {
-        // Delete nullable dependencies, since they are no longer valid:
-        self.deps.retain(|item| !item.nullable);
-        self.deps.iter_mut().for_each(|item| item.nullable = true);
     }
 
     /// This function ensures that functional dependencies involving uniquely
@@ -709,6 +717,17 @@ fn matching_indices(
 }
 
 /// Adds `offset` value to each entry inside `in_data`.
+/// `indices` each offset by `offset`, in a list charged to `funding` before it is made.
+fn offset_indices(
+    indices: &[usize],
+    offset: usize,
+    funding: &Funding,
+) -> Result<Vec<usize>> {
+    let mut offset_indices = funding.vec_with_capacity(indices.len())?;
+    offset_indices.extend(indices.iter().map(|&index| index + offset));
+    Ok(offset_indices)
+}
+
 fn add_offset_to_vec<T: Copy + std::ops::Add<Output = T>>(
     in_data: &[T],
     offset: T,
