@@ -598,8 +598,9 @@ pub fn create_physical_expr(
                             .collect();
 
                         let lambda_schema = DFSchema::new_with_metadata(
-                            new_fields,
+                            &new_fields,
                             input_dfschema.metadata().clone(),
+                            &datafusion_common::funding::Funding::default(),
                         )?;
 
                         let planning_ctx = planning_ctx

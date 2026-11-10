@@ -839,10 +839,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .collect::<Result<_>>()?;
 
                 // Create planner context with parameters
+                let mut param_data_types =
+                    self.funding().vec_with_capacity(fields.len())?;
+                param_data_types.extend(fields.iter().cloned().map(Some));
                 let mut planner_context = PlannerContext::new()
-                    .with_prepare_param_data_types(
-                        fields.iter().cloned().map(Some).collect(),
-                    );
+                    .with_prepare_param_data_types(param_data_types, self.funding())?;
 
                 // Build logical plan for inner statement of the prepare statement
                 let plan = self.sql_statement_to_plan_with_context_impl(
@@ -858,10 +859,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             map_types.get(&key).and_then(|opt| opt.clone())
                         })
                         .collect();
-                    fields.extend(param_types.iter().cloned());
-                    planner_context.with_prepare_param_data_types(
-                        param_types.into_iter().map(Some).collect(),
-                    );
+                    fields.extend(param_types);
                 }
 
                 Ok(LogicalPlan::Statement(PlanStatement::Prepare(Prepare {
@@ -1445,7 +1443,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             .into_iter()
                             .map(Some)
                             .collect(),
-                    );
+                        self.funding(),
+                    )?;
 
                 let function_body = match function_body {
                     Some(r) => Some(self.sql_to_expr(
@@ -2935,8 +2934,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         // Projection
-        let mut planner_context =
-            PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
+        let mut planner_context = PlannerContext::new()
+            .with_prepare_param_data_types(prepare_param_data_types, self.funding())?;
         planner_context.set_table_schema(Some(DFSchemaRef::new(
             DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
         )));

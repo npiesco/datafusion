@@ -655,7 +655,11 @@ pub(crate) mod tests {
             ),
         ];
 
-        let schema = Arc::new(DFSchema::new_with_metadata(fields, HashMap::default())?);
+        let schema = Arc::new(DFSchema::new_with_metadata(
+            &fields,
+            HashMap::default(),
+            &datafusion::common::funding::Funding::default(),
+        )?);
         let dfs_names = vec![
             "a".to_string(),
             "b".to_string(),

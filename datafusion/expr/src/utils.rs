@@ -1400,17 +1400,17 @@ pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
 ///
 /// This function merges schemas from multiple logical plan inputs using [`DFSchema::merge`].
 /// Refer to that documentation for details on precedence and metadata handling.
-pub fn merge_schema(inputs: &[&LogicalPlan]) -> DFSchema {
-    if inputs.len() == 1 {
-        inputs[0].schema().as_ref().clone()
-    } else {
-        inputs.iter().map(|input| input.schema()).fold(
-            DFSchema::empty(),
-            |mut lhs, rhs| {
-                lhs.merge(rhs);
-                lhs
-            },
-        )
+///
+/// What the merged schema allocates is charged to `funding`.
+pub fn merge_schema(
+    inputs: &[&LogicalPlan],
+    funding: &datafusion_common::funding::Funding,
+) -> Result<DFSchema> {
+    match inputs {
+        [input] => funding.cloned(input.schema().as_ref()),
+        _ => inputs.iter().try_fold(DFSchema::empty(), |lhs, rhs| {
+            lhs.merge(rhs.schema(), funding)
+        }),
     }
 }
 

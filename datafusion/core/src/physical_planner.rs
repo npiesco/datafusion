@@ -1541,8 +1541,9 @@ impl DefaultPhysicalPlanner {
                         // Construct intermediate schemas used for filtering data and
                         // convert logical expression to physical according to filter schema
                         let filter_df_schema = DFSchema::new_with_metadata(
-                            filter_df_fields,
+                            &filter_df_fields,
                             metadata.clone(),
+                            &datafusion_common::funding::Funding::default(),
                         )?;
                         let filter_schema =
                             Schema::new_with_metadata(filter_fields, metadata);

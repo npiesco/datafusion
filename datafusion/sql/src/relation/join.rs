@@ -36,7 +36,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
         let old_outer_from_schema = planner_context.outer_from_schema();
         for join in t.joins {
-            planner_context.extend_outer_from_schema(left.schema())?;
+            planner_context.extend_outer_from_schema(left.schema(), self.funding())?;
             left = self.parse_relation_join(left, join, planner_context)?;
         }
         planner_context.set_outer_from_schema(old_outer_from_schema);

@@ -952,8 +952,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .map(|(f, n): (FieldRef, &String)| f.renamed(n.as_str()));
 
         let mut planner_context = planner_context
-            .clone()
-            .with_lambda_parameters(lambda_parameters);
+            .try_clone(self.funding())?
+            .with_lambda_parameters(lambda_parameters, self.funding())?;
 
         Ok(Lambda {
             params,

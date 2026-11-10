@@ -2551,7 +2551,7 @@ fn roundtrip_schema() {
 #[test]
 fn roundtrip_dfschema() {
     let dfschema = DFSchema::new_with_metadata(
-        vec![
+        &vec![
             (None, Arc::new(Field::new("a", DataType::Int64, false))),
             (
                 Some("t".into()),
@@ -2566,6 +2566,7 @@ fn roundtrip_dfschema() {
             (String::from("k2"), String::from("v2")),
             (String::from("k3"), String::from("v3")),
         ]),
+        &datafusion_common::funding::Funding::default(),
     )
     .unwrap();
     let proto_dfschema: protobuf::DfSchema = (&dfschema).try_into().unwrap();

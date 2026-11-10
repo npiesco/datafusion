@@ -51,11 +51,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(vec![]);
         }
 
-        let mut combined_schema;
+        let combined_schema;
         let order_by_schema = match additional_schema {
             Some(schema) => {
-                combined_schema = input_schema.clone();
-                combined_schema.merge(schema);
+                combined_schema = input_schema.merge(schema, self.funding())?;
                 &combined_schema
             }
             None => input_schema,

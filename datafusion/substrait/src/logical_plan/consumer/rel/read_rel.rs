@@ -311,8 +311,9 @@ pub fn apply_masking(
                     .collect();
 
                 Ok(DFSchema::new_with_metadata(
-                    fields,
+                    &fields,
                     schema.metadata().clone(),
+                    &datafusion::common::funding::Funding::default(),
                 )?)
             }
             None => Ok(schema),
@@ -355,8 +356,9 @@ fn apply_projection(
                 .collect();
 
             scan.projected_schema = DFSchemaRef::new(DFSchema::new_with_metadata(
-                fields,
+                &fields,
                 df_schema.metadata().clone(),
+                &datafusion::common::funding::Funding::default(),
             )?);
             scan.projection = Some(column_indices);
 

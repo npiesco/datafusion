@@ -1772,7 +1772,11 @@ pub fn build_join_schema(
         .chain(schema2.metadata().clone())
         .collect();
 
-    let dfschema = DFSchema::new_with_metadata(qualified_fields, metadata)?;
+    let dfschema = DFSchema::new_with_metadata(
+        &qualified_fields,
+        metadata,
+        &datafusion_common::funding::Funding::default(),
+    )?;
     dfschema.with_functional_dependencies(func_dependencies)
 }
 
@@ -2945,12 +2949,14 @@ mod tests {
     #[test]
     fn test_join_metadata() -> Result<()> {
         let left_schema = DFSchema::new_with_metadata(
-            vec![(None, Arc::new(Field::new("a", DataType::Int32, false)))],
+            &vec![(None, Arc::new(Field::new("a", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "left".to_string())]),
+            &datafusion_common::funding::Funding::default(),
         )?;
         let right_schema = DFSchema::new_with_metadata(
-            vec![(None, Arc::new(Field::new("b", DataType::Int32, false)))],
+            &vec![(None, Arc::new(Field::new("b", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "right".to_string())]),
+            &datafusion_common::funding::Funding::default(),
         )?;
 
         let join_schema =

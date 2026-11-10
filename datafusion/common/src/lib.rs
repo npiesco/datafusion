@@ -48,6 +48,7 @@ pub mod error;
 pub mod extensions;
 pub mod file_options;
 pub mod format;
+pub mod funded_arrow;
 pub mod funding;
 pub mod hash_utils;
 pub mod heap_size;

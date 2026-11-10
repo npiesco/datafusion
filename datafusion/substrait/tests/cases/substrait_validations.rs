@@ -46,7 +46,11 @@ mod tests {
                 })
                 .collect();
 
-            let df_schema = DFSchema::new_with_metadata(fields, HashMap::default())?;
+            let df_schema = DFSchema::new_with_metadata(
+                &fields,
+                HashMap::default(),
+                &datafusion::common::funding::Funding::default(),
+            )?;
 
             let ctx = SessionContext::new();
             ctx.register_table(
