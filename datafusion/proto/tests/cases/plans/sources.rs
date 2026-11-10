@@ -51,6 +51,7 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use datafusion_common::config::TableParquetOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::Precision;
 use datafusion_common::{DataFusionError, Result, internal_datafusion_err, internal_err};
 use datafusion_datasource::{TableSchema, TableSchemaBuilder};
@@ -548,6 +549,7 @@ async fn roundtrip_projection_source() -> Result<()> {
         FilterExecBuilder::new(
             Arc::new(BinaryExpr::new(col("c", &schema)?, Operator::Eq, lit(1))),
             DataSourceExec::from_data_source(scan_config),
+            &Funding::default(),
         )
         .apply_projection(Some(vec![0, 1]))?
         .build()?,

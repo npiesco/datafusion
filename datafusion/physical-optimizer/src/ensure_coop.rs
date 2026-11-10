@@ -130,6 +130,7 @@ impl PhysicalOptimizerRule for EnsureCooperative {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
     use datafusion_physical_plan::{
         ChildrenPropertiesMode, ReplaceChildrenOptions, displayable,
         test::scan_partitioned,
@@ -216,7 +217,8 @@ mod tests {
 
         // Case 1: Filter -> Scan (middle node should not be wrapped)
         let scan = scan_partitioned(1);
-        let filter = Arc::new(FilterExec::try_new(lit(true), scan).unwrap());
+        let filter =
+            Arc::new(FilterExec::try_new(lit(true), scan, &Funding::default()).unwrap());
         let optimized = rule.optimize(filter, &config).unwrap();
         let display = displayable(optimized.as_ref()).indent(true).to_string();
 
@@ -226,7 +228,9 @@ mod tests {
         // Case 2: Filter -> CoopExec -> Scan (depth tracking prevents double wrap)
         let scan2 = scan_partitioned(1);
         let wrapped_scan = Arc::new(CooperativeExec::new(scan2));
-        let filter2 = Arc::new(FilterExec::try_new(lit(true), wrapped_scan).unwrap());
+        let filter2 = Arc::new(
+            FilterExec::try_new(lit(true), wrapped_scan, &Funding::default()).unwrap(),
+        );
         let optimized2 = rule.optimize(filter2, &config).unwrap();
         let display2 = displayable(optimized2.as_ref()).indent(true).to_string();
 

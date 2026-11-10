@@ -27,7 +27,7 @@ use crate::utils::collect_columns;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{Funding, arc_bytes};
 use datafusion_common::stats::{ColumnStatistics, Precision};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
@@ -1013,9 +1013,11 @@ pub type ProjectionRef = Arc<[usize]>;
 ///
 /// Returns an internal error if `p1` contains index that is greater than `p2` len.
 ///
+/// The combined projection is charged to `funding` before it is allocated.
 pub fn combine_projections(
     p1: Option<&ProjectionRef>,
     p2: Option<&ProjectionRef>,
+    funding: &Funding,
 ) -> Result<Option<ProjectionRef>> {
     let Some(p1) = p1 else {
         return Ok(None);
@@ -1024,20 +1026,20 @@ pub fn combine_projections(
         return Ok(Some(Arc::clone(p1)));
     };
 
-    Ok(Some(
-        p1.iter()
-            .map(|i| {
-                let idx = *i;
-                assert_or_internal_err!(
-                    idx < p2.len(),
-                    "unable to apply projection: index {} is greater than new projection len {}",
-                    idx,
-                    p2.len(),
-                );
-                Ok(p2[*i])
-            })
-            .collect::<Result<Arc<[usize]>>>()?,
-    ))
+    for idx in p1.iter() {
+        assert_or_internal_err!(
+            *idx < p2.len(),
+            "unable to apply projection: index {} is greater than new projection len {}",
+            idx,
+            p2.len(),
+        );
+    }
+    let mut combined = funding.held::<Vec<usize>>();
+    combined.reserve_exact(p1.len())?;
+    for idx in p1.iter() {
+        combined.push(p2[*idx])?;
+    }
+    Ok(Some(funding.arc_slice(&combined)?))
 }
 
 /// The function projects / unprojects an expression with respect to set of
@@ -1359,11 +1361,12 @@ fn funded_column(
     index: usize,
     funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    funding.charge(name.len())?;
-    match funding.arc(Column::new(name, index)) {
-        Ok(column) => Ok(column),
+    let block = arc_bytes::<Column>();
+    funding.charge(block)?;
+    match funding.string(name) {
+        Ok(name) => Ok(Arc::new(Column::new(name, index))),
         Err(refused) => {
-            funding.discharge(name.len());
+            funding.discharge(block);
             Err(refused)
         }
     }

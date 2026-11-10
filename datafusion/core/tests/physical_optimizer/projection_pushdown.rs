@@ -889,7 +889,7 @@ fn test_filter_after_projection() -> Result<()> {
             Arc::new(Column::new("a", 0)),
         )),
     ));
-    let filter = Arc::new(FilterExec::try_new(predicate, csv)?);
+    let filter = Arc::new(FilterExec::try_new(predicate, csv, &Funding::default())?);
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
             ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a_new"),
@@ -1804,7 +1804,7 @@ fn test_filter_with_embedded_projection_after_projection() -> Result<()> {
         Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
     ));
     let filter: Arc<dyn ExecutionPlan> = Arc::new(
-        FilterExecBuilder::new(predicate, csv)
+        FilterExecBuilder::new(predicate, csv, &Funding::default())
             .apply_projection(Some(vec![0, 1, 2]))?
             .build()?,
     );
@@ -1861,7 +1861,7 @@ fn test_filter_with_embedded_projection_after_renaming_projection() -> Result<()
         Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
     ));
     let filter: Arc<dyn ExecutionPlan> = Arc::new(
-        FilterExecBuilder::new(predicate, csv)
+        FilterExecBuilder::new(predicate, csv, &Funding::default())
             .apply_projection(Some(vec![0, 1, 2, 3]))?
             .build()?,
     );

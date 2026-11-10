@@ -17,6 +17,7 @@
 
 //! Helpers for writing parquet files and reading them back
 
+use datafusion_common::funding::Funding;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -188,7 +189,11 @@ impl TestParquetFile {
             let config = scan_config_builder.with_source(source).build();
             let parquet_exec = DataSourceExec::from_data_source(config);
 
-            let exec = Arc::new(FilterExec::try_new(physical_filter_expr, parquet_exec)?);
+            let exec = Arc::new(FilterExec::try_new(
+                physical_filter_expr,
+                parquet_exec,
+                &Funding::default(),
+            )?);
             Ok(exec)
         } else {
             let config = scan_config_builder.build();

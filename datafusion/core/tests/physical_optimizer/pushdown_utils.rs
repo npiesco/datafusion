@@ -560,6 +560,7 @@ impl ExecutionPlan for TestNode {
                     let new_child = FilterExec::try_new(
                         Arc::clone(&first_pushdown_result.predicate),
                         Arc::clone(&self.input),
+                        &Funding::default(),
                     )?;
                     let new_self =
                         TestNode::new(false, Arc::new(new_child), self.predicate.clone());

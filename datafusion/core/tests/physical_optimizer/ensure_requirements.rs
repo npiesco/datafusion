@@ -447,7 +447,9 @@ fn test_filter_over_multi_partition_sort_limit() {
 
     // Simple always-true filter
     let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
-    let filter = Arc::new(FilterExec::try_new(predicate, source as _).unwrap());
+    let filter = Arc::new(
+        FilterExec::try_new(predicate, source as _, &Funding::default()).unwrap(),
+    );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 

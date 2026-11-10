@@ -60,6 +60,7 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
     let filter = FilterExec::try_new(
         predicate,
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
+        &Funding::default(),
     )?;
 
     // Build a trivial subquery plan.
@@ -148,6 +149,7 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
     let inner_filter = Arc::new(FilterExec::try_new(
         inner_predicate,
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
+        &Funding::default(),
     )?);
     let inner_exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
         inner_filter,
@@ -169,7 +171,11 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
     ));
     let outer_predicate =
         binary(col("a", &schema)?, Operator::Eq, outer_sq_expr, &schema)?;
-    let outer_filter = Arc::new(FilterExec::try_new(outer_predicate, inner_exec)?);
+    let outer_filter = Arc::new(FilterExec::try_new(
+        outer_predicate,
+        inner_exec,
+        &Funding::default(),
+    )?);
     let outer_exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
         outer_filter,
         vec![ScalarSubqueryLink {

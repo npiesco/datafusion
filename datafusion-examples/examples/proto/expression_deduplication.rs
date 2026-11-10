@@ -100,8 +100,11 @@ pub fn expression_deduplication() -> Result<()> {
         Arc::clone(&schema),
         &Funding::default(),
     )?);
-    let filter_plan: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(combined_expr, input)?);
+    let filter_plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+        combined_expr,
+        input,
+        &Funding::default(),
+    )?);
 
     println!("  Created FilterExec with duplicate sub-expressions\n");
 

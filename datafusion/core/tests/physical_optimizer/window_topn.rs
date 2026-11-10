@@ -110,7 +110,7 @@ fn build_window_topn_plan(
     let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
     let predicate = Arc::new(BinaryExpr::new(rn_col, op, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, window)?);
+        Arc::new(FilterExec::try_new(predicate, window, &Funding::default())?);
 
     Ok(filter)
 }
@@ -160,7 +160,7 @@ fn build_window_topn_no_partition(limit_value: i64) -> Result<Arc<dyn ExecutionP
     let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
     let predicate = Arc::new(BinaryExpr::new(rn_col, Operator::LtEq, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, window)?);
+        Arc::new(FilterExec::try_new(predicate, window, &Funding::default())?);
 
     Ok(filter)
 }
@@ -212,7 +212,7 @@ fn build_non_window_filter_plan() -> Result<Arc<dyn ExecutionPlan>> {
     let limit_lit = lit(ScalarValue::Int64(Some(3)));
     let predicate = Arc::new(BinaryExpr::new(val_col, Operator::LtEq, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, window)?);
+        Arc::new(FilterExec::try_new(predicate, window, &Funding::default())?);
 
     Ok(filter)
 }
@@ -281,7 +281,7 @@ fn flipped_3_gteq_rn() -> Result<()> {
         let limit_lit = lit(ScalarValue::UInt64(Some(3)));
         let predicate = Arc::new(BinaryExpr::new(limit_lit, Operator::GtEq, rn_col));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, window)?);
+            Arc::new(FilterExec::try_new(predicate, window, &Funding::default())?);
         filter
     };
 
@@ -394,8 +394,11 @@ fn with_projection_between() -> Result<()> {
     let rn_col = Arc::new(Column::new("row_number", 2));
     let limit_lit = lit(ScalarValue::UInt64(Some(3)));
     let predicate = Arc::new(BinaryExpr::new(rn_col, Operator::LtEq, limit_lit));
-    let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, projection)?);
+    let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+        predicate,
+        projection,
+        &Funding::default(),
+    )?);
 
     let optimized = optimize(filter)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
@@ -459,7 +462,7 @@ fn build_ranking_topn_plan(
         _ => unreachable!("only </<=/>=/> are supported by the rule"),
     };
     let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, window)?);
+        Arc::new(FilterExec::try_new(predicate, window, &Funding::default())?);
 
     Ok(filter)
 }
@@ -501,7 +504,7 @@ fn build_rank_no_order_by_plan(limit_value: i64) -> Result<Arc<dyn ExecutionPlan
     let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
     let predicate = Arc::new(BinaryExpr::new(rk_col, Operator::LtEq, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, window)?);
+        Arc::new(FilterExec::try_new(predicate, window, &Funding::default())?);
 
     Ok(filter)
 }

@@ -326,7 +326,7 @@ pub fn filter_exec(
     predicate: Arc<dyn PhysicalExpr>,
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(FilterExec::try_new(predicate, input).unwrap())
+    Arc::new(FilterExec::try_new(predicate, input, &Funding::default()).unwrap())
 }
 
 pub fn sort_preserving_merge_exec(

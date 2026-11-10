@@ -54,6 +54,7 @@ fn roundtrip_filter_with_not_and_in_list() -> Result<()> {
     roundtrip_test(Arc::new(FilterExec::try_new(
         and,
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
+        &Funding::default(),
     )?))
 }
 
@@ -66,6 +67,7 @@ fn roundtrip_filter_with_fetch() -> Result<()> {
     let filter = FilterExecBuilder::new(
         predicate,
         Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+        &Funding::default(),
     )
     .with_fetch(Some(10))
     .build()?;
@@ -87,6 +89,7 @@ fn roundtrip_filter_projection_states() -> Result<()> {
         let filter = FilterExecBuilder::new(
             col("a", &schema)?,
             Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
+            &Funding::default(),
         )
         .apply_projection(projection.clone())?
         .with_default_selectivity(37)

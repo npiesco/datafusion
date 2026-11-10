@@ -402,7 +402,11 @@ async fn filter_yields(
         lit(i64::MIN),
         &inf.schema(),
     )?;
-    let filter = Arc::new(FilterExec::try_new(filter_expr, inf.clone())?);
+    let filter = Arc::new(FilterExec::try_new(
+        filter_expr,
+        inf.clone(),
+        &Funding::default(),
+    )?);
 
     query_yields(filter, session_ctx.task_ctx()).await
 }
@@ -424,7 +428,11 @@ async fn filter_reject_all_batches_yields(
         Gt,
         Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
     ));
-    let filtered = Arc::new(FilterExec::try_new(false_predicate, Arc::new(infinite))?);
+    let filtered = Arc::new(FilterExec::try_new(
+        false_predicate,
+        Arc::new(infinite),
+        &Funding::default(),
+    )?);
 
     query_yields(filtered, session_ctx.task_ctx()).await
 }
@@ -469,7 +477,11 @@ async fn interleave_then_filter_all_yields(
             lit(0i64),
             &inf.schema(),
         )?;
-        let filtered = Arc::new(FilterExec::try_new(filter_expr, Arc::new(inf))?);
+        let filtered = Arc::new(FilterExec::try_new(
+            filter_expr,
+            Arc::new(inf),
+            &Funding::default(),
+        )?);
 
         infinite_children.push(filtered as _);
     }
@@ -480,7 +492,11 @@ async fn interleave_then_filter_all_yields(
     // Wrap the InterleaveExec in a FilterExec that always returns false,
     // ensuring that no rows are ever emitted.
     let always_false = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
-    let filtered_interleave = Arc::new(FilterExec::try_new(always_false, interleave)?);
+    let filtered_interleave = Arc::new(FilterExec::try_new(
+        always_false,
+        interleave,
+        &Funding::default(),
+    )?);
 
     query_yields(filtered_interleave, session_ctx.task_ctx()).await
 }
@@ -525,7 +541,11 @@ async fn interleave_then_aggregate_yields(
             lit(0i64),
             &inf.schema(),
         )?;
-        let filtered = Arc::new(FilterExec::try_new(filter_expr, Arc::new(inf))?);
+        let filtered = Arc::new(FilterExec::try_new(
+            filter_expr,
+            Arc::new(inf),
+            &Funding::default(),
+        )?);
 
         infinite_children.push(filtered as _);
     }

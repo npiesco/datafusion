@@ -501,7 +501,7 @@ impl ExecutionPlan for UnionExec {
         &self,
         phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         // Pre phase: handle heterogeneous pushdown by wrapping individual
         // children with FilterExec and reporting all filters as handled.
@@ -526,30 +526,26 @@ impl ExecutionPlan for UnionExec {
         //       Child1                     Child1
         //       Child2(filter)           Child2(filter)
 
-        // Collect unsupported filters for each child
-        let mut unsupported_filters_per_child = vec![Vec::new(); self.inputs.len()];
-        for parent_filter_result in child_pushdown_result.parent_filters.iter() {
-            for (child_idx, &child_result) in
-                parent_filter_result.child_results.iter().enumerate()
-            {
-                if matches!(child_result, PushedDown::No) {
-                    unsupported_filters_per_child[child_idx]
-                        .push(Arc::clone(&parent_filter_result.filter));
+        // Wrap children that have unsupported filters with FilterExec
+        let funding = &config.funding;
+        let mut new_children = funding.held::<Vec<Arc<dyn ExecutionPlan>>>();
+        new_children.reserve_exact(self.inputs.len())?;
+        new_children.extend(self.inputs.iter().cloned());
+        for (child_idx, input) in self.inputs.iter().enumerate() {
+            let mut unsupported_filters = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+            for parent_filter_result in &child_pushdown_result.parent_filters {
+                if matches!(
+                    parent_filter_result.child_results.get(child_idx),
+                    Some(PushedDown::No)
+                ) {
+                    unsupported_filters.push(Arc::clone(&parent_filter_result.filter))?;
                 }
             }
-        }
-
-        // Wrap children that have unsupported filters with FilterExec
-        let mut new_children = self.inputs.clone();
-        for (child_idx, unsupported_filters) in
-            unsupported_filters_per_child.iter().enumerate()
-        {
             if !unsupported_filters.is_empty() {
-                let combined_filter = conjunction(unsupported_filters.clone());
-                new_children[child_idx] = Arc::new(FilterExec::try_new(
-                    combined_filter,
-                    Arc::clone(&self.inputs[child_idx]),
-                )?);
+                let combined_filter = conjunction(unsupported_filters.drain(..));
+                let filter =
+                    FilterExec::try_new(combined_filter, Arc::clone(input), funding)?;
+                new_children[child_idx] = funding.arc(filter)?;
             }
         }
 
@@ -562,7 +558,7 @@ impl ExecutionPlan for UnionExec {
         let all_filters_pushed =
             vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()];
         let propagation = if children_modified {
-            let updated_node = UnionExec::try_new(new_children)?;
+            let updated_node = UnionExec::try_new(new_children.keep())?;
             FilterPushdownPropagation::with_parent_pushdown_result(all_filters_pushed)
                 .with_updated_node(updated_node)
         } else {

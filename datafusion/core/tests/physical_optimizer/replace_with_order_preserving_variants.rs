@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
@@ -1118,7 +1119,7 @@ fn filter_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         &input_schema,
     )
     .unwrap();
-    Arc::new(FilterExec::try_new(predicate, input).unwrap())
+    Arc::new(FilterExec::try_new(predicate, input, &Funding::default()).unwrap())
 }
 
 fn hash_join_exec(

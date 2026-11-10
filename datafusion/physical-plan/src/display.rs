@@ -100,7 +100,7 @@ pub enum DisplayFormatType {
 /// # let plan = EmptyExec::new(Arc::new(schema), &datafusion_common::funding::Funding::default()).unwrap();
 /// # let i = col("i", &plan.schema()).unwrap();
 /// # let predicate = binary(i, Operator::Eq, lit(1), &plan.schema()).unwrap();
-/// # let plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, Arc::new(plan)).unwrap());
+/// # let plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, Arc::new(plan), &datafusion_common::funding::Funding::default()).unwrap());
 /// // Get a one line description (Displayable)
 /// let display_plan = displayable(plan.as_ref());
 ///
@@ -1720,7 +1720,9 @@ mod tests {
                 &schema,
             )
             .unwrap();
-            let filter = Arc::new(FilterExec::try_new(predicate, empty).unwrap());
+            let filter = Arc::new(
+                FilterExec::try_new(predicate, empty, &Funding::default()).unwrap(),
+            );
             let proj_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
                 vec![(col("a", &schema).unwrap(), "a".to_string())];
             let _ = Partitioning::UnknownPartitioning(1);

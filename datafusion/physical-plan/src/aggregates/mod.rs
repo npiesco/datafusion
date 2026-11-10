@@ -7918,8 +7918,9 @@ mod tests {
             Arc::<DynamicFilterPhysicalExpr>::clone(&dynamic_filter);
         let predicate: Arc<dyn PhysicalExpr> =
             Arc::new(NotExpr::new(dynamic_filter_expr));
-        let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExecBuilder::new(predicate, empty).build()?);
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExecBuilder::new(predicate, empty, &Funding::default()).build()?,
+        );
         let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
             [ProjectionExpr::new_from_expression(
                 col("a", &schema)?,

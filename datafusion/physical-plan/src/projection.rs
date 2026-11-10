@@ -20,7 +20,6 @@
 //! of a projection on table `t1` where the expressions `a`, `b`, and `a+b` are the
 //! projection expressions. `SELECT` without `FROM` will only evaluate expressions.
 
-use datafusion_common::funding::Funding;
 use super::expressions::Column;
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{
@@ -39,6 +38,7 @@ use crate::{
     ChildrenPropertiesMode, DisplayFormatType, ExecutionPlan, PhysicalExpr,
     ReplaceChildrenOptions, validate_child_count,
 };
+use datafusion_common::funding::Funding;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -597,7 +597,9 @@ impl ExecutionPlan for ProjectionExec {
                     // projected computations as they would have nothing to reference.
                     if let Some(child_col) = proj_expr.expr.downcast_ref::<Column>() {
                         // Replace with the child column
-                        Ok(Transformed::yes(funding.arc(funding.cloned(child_col)?)? as _))
+                        Ok(Transformed::yes(
+                            funding.arc(funding.cloned(child_col)?)? as _
+                        ))
                     } else {
                         // Projection involves computation, cannot push down
                         can_pushdown = false;
@@ -847,7 +849,8 @@ pub fn try_embed_projection<Exec: EmbeddedProjection + 'static>(
     // Old projection may contain some alias or expression such as `a + 1` and `CAST('true' AS BOOLEAN)`, but our projection_exprs in hash join just contain column, so we need to create the new projection to keep the original projection.
     let new_projection = Arc::new(ProjectionExec::try_new(
         new_projection_exprs,
-        Arc::clone(&new_execution_plan) as _, &Funding::default(),
+        Arc::clone(&new_execution_plan) as _,
+        &Funding::default(),
     )?);
     if is_projection_removable(&new_projection) {
         // Residual is identity — embedding fully absorbed the projection.
@@ -1117,7 +1120,8 @@ pub fn make_with_child(
     ProjectionExec::try_new_with_schema_metadata(
         projection.expr().to_vec(),
         Arc::clone(child),
-        projection.schema().as_ref(), &Funding::default(),
+        projection.schema().as_ref(),
+        &Funding::default(),
     )
     .map(|e| Arc::new(e) as _)
 }
@@ -1196,7 +1200,8 @@ pub fn new_join_children(
                 expr: Arc::new(Column::new(col.name(), col.index())) as _,
                 alias: alias.clone(),
             }),
-        Arc::clone(left_child), &Funding::default(),
+        Arc::clone(left_child),
+        &Funding::default(),
     )?;
     let left_size = left_child.schema().fields().len() as i32;
     let new_right = ProjectionExec::try_new(
@@ -1213,7 +1218,8 @@ pub fn new_join_children(
                     alias: alias.clone(),
                 }
             }),
-        Arc::clone(right_child), &Funding::default(),
+        Arc::clone(right_child),
+        &Funding::default(),
     )?;
 
     Ok((new_left, new_right))
@@ -1237,7 +1243,8 @@ fn new_join_children_from_groups(
                 expr: Arc::new(Column::new(col.name(), col.index())) as _,
                 alias: alias.clone(),
             }),
-            Arc::clone(child), &Funding::default(),
+            Arc::clone(child),
+            &Funding::default(),
         )
     };
 
@@ -1439,7 +1446,8 @@ fn try_collapse_projection_chain(
         Arc::new(ProjectionExec::try_new_with_schema_metadata(
             current_exprs,
             current_input,
-            outer.schema().as_ref(), &Funding::default(),
+            outer.schema().as_ref(),
+            &Funding::default(),
         )?);
     remove_unnecessary_projections(unified).data().map(Some)
 }
@@ -1609,7 +1617,8 @@ mod tests {
                 alias: "output".to_string(),
             }],
             input,
-            &metadata_schema, &Funding::default(),
+            &metadata_schema,
+            &Funding::default(),
         )?;
 
         let expected_schema = Arc::new(Schema::new_with_metadata(
@@ -1638,7 +1647,8 @@ mod tests {
                 alias: "i".to_string(),
             }],
             input,
-            &metadata_schema, &Funding::default(),
+            &metadata_schema,
+            &Funding::default(),
         )?))
     }
 
@@ -1750,7 +1760,8 @@ mod tests {
                 expr: Arc::new(arrow_metadata),
                 alias: "metadata".to_string(),
             }],
-            inner, &Funding::default(),
+            inner,
+            &Funding::default(),
         )?);
 
         let outer_projection = outer
@@ -1783,7 +1794,8 @@ mod tests {
                     alias: "j".to_string(),
                 },
             ],
-            test::scan_partitioned(1), &Funding::default(),
+            test::scan_partitioned(1),
+            &Funding::default(),
         )?);
         let arrow_metadata = Arc::new(ScalarFunctionExpr::new(
             "arrow_metadata",
@@ -1797,8 +1809,11 @@ mod tests {
             Arc::new(Field::new("arrow_metadata", DataType::Utf8, true)),
             Arc::new(ConfigOptions::default()),
         ));
-        let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(is_null(arrow_metadata)?, widened)?);
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            is_null(arrow_metadata)?,
+            widened,
+            &Funding::default(),
+        )?);
         let projection = identity_projection_with_metadata(
             filter,
             HashMap::from([("event_field".to_string(), "true".to_string())]),
@@ -1830,7 +1845,7 @@ mod tests {
             &scan.schema(),
         )?;
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, scan)?);
+            Arc::new(FilterExec::try_new(predicate, scan, &Funding::default())?);
         let projection = identity_projection_with_metadata(
             filter,
             HashMap::new(),
@@ -1901,7 +1916,8 @@ mod tests {
                 expr: Arc::new(Column::new("left_i", 0)),
                 alias: "left_i".to_string(),
             }],
-            join, &Funding::default(),
+            join,
+            &Funding::default(),
         )?;
 
         let Err(error) = try_pushdown_through_join_with_column_indices(
@@ -1958,7 +1974,8 @@ mod tests {
                 expr: Arc::new(Column::new("extra", 2)),
                 alias: "extra".to_string(),
             }],
-            wider_join, &Funding::default(),
+            wider_join,
+            &Funding::default(),
         )?;
         let valid_child_indices = [
             ColumnIndex {
@@ -2052,7 +2069,11 @@ mod tests {
         let exec = test::scan_partitioned(1);
         let expected = collect(exec.execute(0, Arc::clone(&task_ctx))?).await?;
 
-        let projection = ProjectionExec::try_new(vec![] as Vec<ProjectionExpr>, exec, &Funding::default())?;
+        let projection = ProjectionExec::try_new(
+            vec![] as Vec<ProjectionExpr>,
+            exec,
+            &Funding::default(),
+        )?;
         let stream = projection.execute(0, Arc::clone(&task_ctx))?;
         let output = collect(stream).await?;
         assert_eq!(output.len(), expected.len());
@@ -2071,7 +2092,8 @@ mod tests {
                 // to test old syntax
                 (expr, "c".to_string()),
             ],
-            exec, &Funding::default(),
+            exec,
+            &Funding::default(),
         )
         // expect this to succeed
         .unwrap();
@@ -2146,7 +2168,8 @@ mod tests {
             },
         ];
 
-        let projection = ProjectionExec::try_new(exprs, input, &Funding::default()).unwrap();
+        let projection =
+            ProjectionExec::try_new(exprs, input, &Funding::default()).unwrap();
 
         let stats = StatisticsContext::new()
             .compute(&projection, &StatisticsArgs::new())
@@ -2175,7 +2198,8 @@ mod tests {
                 expr: Arc::new(Column::new("a", 0)),
                 alias: "b".to_string(),
             }],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // filter "b > 5"
@@ -2237,7 +2261,8 @@ mod tests {
                     alias: "y".to_string(),
                 },
             ],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // filter "x > 5"
@@ -2317,7 +2342,8 @@ mod tests {
                     alias: "a".to_string(),
                 },
             ],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // filter "b > 5" (output column 0, which is "a" in input)
@@ -2383,7 +2409,8 @@ mod tests {
                     alias: "b".to_string(),
                 },
             ],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // filter "x > 5"
@@ -2443,7 +2470,8 @@ mod tests {
                 )),
                 alias: "z".to_string(),
             }],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // filter "z > 10"
@@ -2484,7 +2512,8 @@ mod tests {
                 expr: Arc::new(Column::new("a", 0)),
                 alias: "a".to_string(),
             }],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // filter "unknown_col > 5" - using a column name that doesn't exist in projection output
@@ -2540,7 +2569,8 @@ mod tests {
                 .unwrap(),
                 alias: "a".to_string(),
             }],
-            input, &Funding::default(),
+            input,
+            &Funding::default(),
         )?;
 
         // simulate projection's parent create a dynamic filter on "a"

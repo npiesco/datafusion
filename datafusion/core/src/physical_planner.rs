@@ -1204,10 +1204,14 @@ impl DefaultPhysicalPlanner {
                 let num_input_columns = physical_input_schema.fields().len();
 
                 for agg_func in &mut aggregates {
+                    let expressions = agg_func.expressions();
+                    let mut charged = funding.vec_with_capacity(expressions.len())?;
+                    charged.extend(expressions);
                     match self.try_plan_async_exprs(
                         num_input_columns,
-                        PlannedExprResult::Expr(agg_func.expressions()),
+                        PlannedExprResult::Expr(charged),
                         physical_input_schema.as_ref(),
+                        funding,
                     )? {
                         PlanAsyncExpr::Async(
                             async_map,
@@ -1229,8 +1233,8 @@ impl DefaultPhysicalPlanner {
                                 return internal_err!("Failed to plan async expression");
                             }
                         }
-                        PlanAsyncExpr::Sync(PlannedExprResult::Expr(_)) => {
-                            // Do nothing
+                        PlanAsyncExpr::Sync(PlannedExprResult::Expr(physical_exprs)) => {
+                            funding.released(physical_exprs);
                         }
                         _ => {
                             return internal_err!(
@@ -1310,16 +1314,20 @@ impl DefaultPhysicalPlanner {
                 let input_schema = input.schema();
                 let filter = match self.try_plan_async_exprs(
                     input_schema.fields().len(),
-                    PlannedExprResult::Expr(vec![runtime_expr]),
+                    PlannedExprResult::Expr(funding.vec_of([runtime_expr])?),
                     input_schema.as_arrow(),
+                    funding,
                 )? {
                     PlanAsyncExpr::Sync(PlannedExprResult::Expr(runtime_expr)) => {
-                        FilterExecBuilder::new(
+                        let filter = FilterExecBuilder::new(
                             Arc::clone(&runtime_expr[0]),
                             physical_input,
+                            funding,
                         )
                         .with_batch_size(session_state.config().batch_size())
-                        .build()?
+                        .build()?;
+                        funding.released(runtime_expr);
+                        filter
                     }
                     PlanAsyncExpr::Async(
                         async_map,
@@ -1329,17 +1337,22 @@ impl DefaultPhysicalPlanner {
                             async_map.async_exprs,
                             physical_input,
                         )?;
-                        FilterExecBuilder::new(
-                            Arc::clone(&runtime_expr[0]),
-                            Arc::new(async_exec),
-                        )
                         // project the output columns excluding the async functions
                         // The async functions are always appended to the end of the schema.
-                        .apply_projection(Some(
-                            (0..input.schema().fields().len()).collect::<Vec<_>>(),
-                        ))?
+                        let mut input_columns = funding.held::<Vec<usize>>();
+                        input_columns.reserve_exact(input.schema().fields().len())?;
+                        input_columns.extend(0..input.schema().fields().len());
+                        let input_columns = funding.arc_slice(&input_columns)?;
+                        let filter = FilterExecBuilder::new(
+                            Arc::clone(&runtime_expr[0]),
+                            funding.arc(async_exec)?,
+                            funding,
+                        )
+                        .apply_projection_by_ref(Some(&input_columns))?
                         .with_batch_size(session_state.config().batch_size())
-                        .build()?
+                        .build()?;
+                        funding.released(runtime_expr);
+                        filter
                     }
                     _ => {
                         return internal_err!(
@@ -1353,9 +1366,7 @@ impl DefaultPhysicalPlanner {
                     .options()
                     .optimizer
                     .default_filter_selectivity;
-                let filter_exec: Arc<dyn ExecutionPlan> =
-                    Arc::new(filter.with_default_selectivity(selectivity)?);
-                filter_exec
+                funding.arc(filter.with_default_selectivity(selectivity)?)?
             }
             LogicalPlan::Repartition(Repartition {
                 input,
@@ -3213,6 +3224,7 @@ impl DefaultPhysicalPlanner {
             num_input_columns,
             PlannedExprResult::ExprWithName(physical_exprs.keep()),
             input_physical_schema.as_ref(),
+            funding,
         )? {
             PlanAsyncExpr::Sync(PlannedExprResult::ExprWithName(mut physical_exprs)) => {
                 let projection = ProjectionExec::try_new_with_schema_metadata(
@@ -3247,11 +3259,15 @@ impl DefaultPhysicalPlanner {
         }
     }
 
+    /// `physical_expr` holds a list made through `funding`. When the expressions are
+    /// rewritten onto an [`AsyncFuncExec`], that list is given back and the rewritten
+    /// expressions are returned in a new one made through `funding`.
     fn try_plan_async_exprs(
         &self,
         num_input_columns: usize,
         physical_expr: PlannedExprResult,
         schema: &Schema,
+        funding: &Funding,
     ) -> Result<PlanAsyncExpr> {
         let mut async_map = AsyncMapper::new(num_input_columns);
         match &physical_expr {
@@ -3272,26 +3288,27 @@ impl DefaultPhysicalPlanner {
         }
 
         let new_exprs = match physical_expr {
-            PlannedExprResult::ExprWithName(exprs) => PlannedExprResult::ExprWithName(
-                exprs
-                    .iter()
-                    .map(|(expr, column_name)| {
-                        let new_expr = Arc::clone(expr)
-                            .transform_up(|e| Ok(async_map.map_expr(e)))?;
-                        Ok((new_expr.data, column_name.to_string()))
-                    })
-                    .collect::<Result<_>>()?,
-            ),
-            PlannedExprResult::Expr(exprs) => PlannedExprResult::Expr(
-                exprs
-                    .iter()
-                    .map(|expr| {
-                        let new_expr = Arc::clone(expr)
-                            .transform_up(|e| Ok(async_map.map_expr(e)))?;
-                        Ok(new_expr.data)
-                    })
-                    .collect::<Result<_>>()?,
-            ),
+            PlannedExprResult::ExprWithName(mut exprs) => {
+                let mut new_exprs =
+                    funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+                new_exprs.reserve_exact(exprs.len())?;
+                for (expr, column_name) in exprs.drain(..) {
+                    let new_expr = expr.transform_up(|e| Ok(async_map.map_expr(e)))?;
+                    new_exprs.push((new_expr.data, column_name))?;
+                }
+                funding.released(exprs);
+                PlannedExprResult::ExprWithName(new_exprs.keep())
+            }
+            PlannedExprResult::Expr(mut exprs) => {
+                let mut new_exprs = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+                new_exprs.reserve_exact(exprs.len())?;
+                for expr in exprs.drain(..) {
+                    let new_expr = expr.transform_up(|e| Ok(async_map.map_expr(e)))?;
+                    new_exprs.push(new_expr.data)?;
+                }
+                funding.released(exprs);
+                PlannedExprResult::Expr(new_exprs.keep())
+            }
         };
         // rewrite the projection's expressions in terms of the columns with the result of async evaluation
         Ok(PlanAsyncExpr::Async(async_map, new_exprs))

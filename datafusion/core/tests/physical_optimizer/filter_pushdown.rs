@@ -84,7 +84,8 @@ use object_store::memory::InMemory;
 fn test_pushdown_into_scan() {
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, scan).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap());
 
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
@@ -120,7 +121,8 @@ fn test_pushdown_volatile_functions_not_allowed() {
             .unwrap(),
         ),
     )) as Arc<dyn PhysicalExpr>;
-    let plan = Arc::new(FilterExec::try_new(predicate, scan).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap());
     // expect the filter to not be pushed down
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -142,7 +144,8 @@ fn test_pushdown_volatile_functions_not_allowed() {
 fn test_pushdown_into_scan_with_config_options() {
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, scan).unwrap()) as _;
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap()) as _;
 
     let mut cfg = ConfigOptions::default();
     insta::assert_snapshot!(
@@ -262,11 +265,15 @@ async fn test_static_filter_pushdown_through_hash_join() {
         col("d", &join_schema).unwrap(),
     )) as Arc<dyn PhysicalExpr>;
 
+    let filter = Arc::new(
+        FilterExec::try_new(left_filter, Arc::clone(&join) as _, &Funding::default())
+            .unwrap(),
+    );
     let filter =
-        Arc::new(FilterExec::try_new(left_filter, Arc::clone(&join) as _).unwrap());
-    let filter = Arc::new(FilterExec::try_new(right_filter, filter).unwrap());
-    let plan = Arc::new(FilterExec::try_new(cross_filter, filter).unwrap())
-        as Arc<dyn ExecutionPlan>;
+        Arc::new(FilterExec::try_new(right_filter, filter, &Funding::default()).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(cross_filter, filter, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
 
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
@@ -318,10 +325,13 @@ async fn test_static_filter_pushdown_through_hash_join() {
     let left_filter = col_lit_predicate("a", "aa", &join_schema);
     // Filter on probe side column (not preserved): should NOT be pushed down
     let right_filter = col_lit_predicate("e", "ba", &join_schema);
-    let filter =
-        Arc::new(FilterExec::try_new(left_filter, Arc::clone(&join) as _).unwrap());
-    let plan = Arc::new(FilterExec::try_new(right_filter, filter).unwrap())
-        as Arc<dyn ExecutionPlan>;
+    let filter = Arc::new(
+        FilterExec::try_new(left_filter, Arc::clone(&join) as _, &Funding::default())
+            .unwrap(),
+    );
+    let plan =
+        Arc::new(FilterExec::try_new(right_filter, filter, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -348,9 +358,11 @@ fn test_filter_collapse() {
     // filter should be pushed down into the parquet scan with two filters
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
     let predicate1 = col_lit_predicate("a", "foo", &schema());
-    let filter1 = Arc::new(FilterExec::try_new(predicate1, scan).unwrap());
+    let filter1 =
+        Arc::new(FilterExec::try_new(predicate1, scan, &Funding::default()).unwrap());
     let predicate2 = col_lit_predicate("b", "bar", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate2, filter1).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate2, filter1, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -373,7 +385,7 @@ fn test_filter_with_projection() {
     let projection = vec![1, 0];
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, Arc::clone(&scan))
+        FilterExecBuilder::new(predicate, Arc::clone(&scan), &Funding::default())
             .apply_projection(Some(projection))
             .unwrap()
             .build()
@@ -399,7 +411,7 @@ fn test_filter_with_projection() {
     let projection = vec![1];
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, scan)
+        FilterExecBuilder::new(predicate, scan, &Funding::default())
             .apply_projection(Some(projection))
             .unwrap()
             .build()
@@ -425,10 +437,11 @@ fn test_filter_collapse_outer_fetch_preserved() {
     // When the outer filter has fetch and inner does not, the merged filter should preserve fetch
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
     let predicate1 = col_lit_predicate("a", "foo", &schema());
-    let filter1 = Arc::new(FilterExec::try_new(predicate1, scan).unwrap());
+    let filter1 =
+        Arc::new(FilterExec::try_new(predicate1, scan, &Funding::default()).unwrap());
     let predicate2 = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate2, filter1)
+        FilterExecBuilder::new(predicate2, filter1, &Funding::default())
             .with_fetch(Some(10))
             .build()
             .unwrap(),
@@ -456,13 +469,14 @@ fn test_filter_collapse_inner_fetch_preserved() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
     let predicate1 = col_lit_predicate("a", "foo", &schema());
     let filter1 = Arc::new(
-        FilterExecBuilder::new(predicate1, scan)
+        FilterExecBuilder::new(predicate1, scan, &Funding::default())
             .with_fetch(Some(5))
             .build()
             .unwrap(),
     );
     let predicate2 = col_lit_predicate("b", "bar", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate2, filter1).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate2, filter1, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -487,14 +501,14 @@ fn test_filter_collapse_both_fetch_uses_minimum() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
     let predicate1 = col_lit_predicate("a", "foo", &schema());
     let filter1 = Arc::new(
-        FilterExecBuilder::new(predicate1, scan)
+        FilterExecBuilder::new(predicate1, scan, &Funding::default())
             .with_fetch(Some(5))
             .build()
             .unwrap(),
     );
     let predicate2 = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate2, filter1)
+        FilterExecBuilder::new(predicate2, filter1, &Funding::default())
             .with_fetch(Some(10))
             .build()
             .unwrap(),
@@ -524,7 +538,7 @@ fn test_filter_with_fetch_fully_pushed_to_scan() {
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, scan)
+        FilterExecBuilder::new(predicate, scan, &Funding::default())
             .with_fetch(Some(10))
             .build()
             .unwrap(),
@@ -553,7 +567,7 @@ fn test_filter_with_fetch_and_projection_fully_pushed_to_scan() {
     let projection = vec![1, 0];
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, scan)
+        FilterExecBuilder::new(predicate, scan, &Funding::default())
             .with_fetch(Some(5))
             .apply_projection(Some(projection))
             .unwrap()
@@ -605,7 +619,7 @@ fn test_filter_with_fetch_partially_pushed_to_scan() {
         volatile_predicate,
     )) as Arc<dyn PhysicalExpr>;
     let plan = Arc::new(
-        FilterExecBuilder::new(combined, scan)
+        FilterExecBuilder::new(combined, scan, &Funding::default())
             .with_fetch(Some(7))
             .build()
             .unwrap(),
@@ -633,7 +647,7 @@ fn test_filter_with_fetch_not_pushed_to_unsupportive_scan() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, scan)
+        FilterExecBuilder::new(predicate, scan, &Funding::default())
             .with_fetch(Some(3))
             .build()
             .unwrap(),
@@ -659,12 +673,15 @@ fn test_push_down_through_transparent_nodes() {
     // expect the predicate to be pushed down into the DataSource
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let filter = Arc::new(FilterExec::try_new(predicate, scan).unwrap());
+    let filter =
+        Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap());
     let repartition = Arc::new(
         RepartitionExec::try_new(filter, Partitioning::RoundRobinBatch(1)).unwrap(),
     );
     let predicate = col_lit_predicate("b", "bar", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, repartition).unwrap());
+    let plan = Arc::new(
+        FilterExec::try_new(predicate, repartition, &Funding::default()).unwrap(),
+    );
 
     // expect the predicate to be pushed down into the DataSource
     insta::assert_snapshot!(
@@ -693,10 +710,14 @@ fn test_pushdown_through_aggregates_on_grouping_columns() {
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
 
     let filter = Arc::new(
-        FilterExecBuilder::new(col_lit_predicate("a", "foo", &schema()), scan)
-            .with_batch_size(10)
-            .build()
-            .unwrap(),
+        FilterExecBuilder::new(
+            col_lit_predicate("a", "foo", &schema()),
+            scan,
+            &Funding::default(),
+        )
+        .with_batch_size(10)
+        .build()
+        .unwrap(),
     );
 
     let aggregate_expr = vec![
@@ -725,7 +746,7 @@ fn test_pushdown_through_aggregates_on_grouping_columns() {
 
     let predicate = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, aggregate)
+        FilterExecBuilder::new(predicate, aggregate, &Funding::default())
             .with_batch_size(100)
             .build()
             .unwrap(),
@@ -789,7 +810,8 @@ fn test_pushdown_through_aggregates_preserves_parent_filter_order() {
     );
     let grouping_key_filter = col_lit_predicate("b", "bar", aggregate_schema.as_ref());
     let predicate = conjunction(vec![aggregate_output_filter, grouping_key_filter]);
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -1575,10 +1597,13 @@ fn test_hashjoin_parent_filter_pushdown_same_column_names() {
     let build_id_filter = col_lit_predicate("id", "aa", &join_schema);
     let probe_val_filter = col_lit_predicate("probe_val", "x", &join_schema);
 
-    let filter =
-        Arc::new(FilterExec::try_new(build_id_filter, Arc::clone(&join) as _).unwrap());
-    let plan = Arc::new(FilterExec::try_new(probe_val_filter, filter).unwrap())
-        as Arc<dyn ExecutionPlan>;
+    let filter = Arc::new(
+        FilterExec::try_new(build_id_filter, Arc::clone(&join) as _, &Funding::default())
+            .unwrap(),
+    );
+    let plan = Arc::new(
+        FilterExec::try_new(probe_val_filter, filter, &Funding::default()).unwrap(),
+    ) as Arc<dyn ExecutionPlan>;
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
@@ -1639,10 +1664,13 @@ fn test_hashjoin_parent_filter_pushdown_mark_join() {
     let left_filter = col_lit_predicate("val", "x", &join_schema);
     let mark_filter = col_lit_predicate("mark", true, &join_schema);
 
-    let filter =
-        Arc::new(FilterExec::try_new(left_filter, Arc::clone(&join) as _).unwrap());
-    let plan = Arc::new(FilterExec::try_new(mark_filter, filter).unwrap())
-        as Arc<dyn ExecutionPlan>;
+    let filter = Arc::new(
+        FilterExec::try_new(left_filter, Arc::clone(&join) as _, &Funding::default())
+            .unwrap(),
+    );
+    let plan =
+        Arc::new(FilterExec::try_new(mark_filter, filter, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
@@ -1710,10 +1738,13 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
     // Filter on non-key column: v = 'y' — should only be pushed to the left side
     let val_filter = col_lit_predicate("v", "y", &join_schema);
 
-    let filter =
-        Arc::new(FilterExec::try_new(key_filter, Arc::clone(&join) as _).unwrap());
-    let plan = Arc::new(FilterExec::try_new(val_filter, filter).unwrap())
-        as Arc<dyn ExecutionPlan>;
+    let filter = Arc::new(
+        FilterExec::try_new(key_filter, Arc::clone(&join) as _, &Funding::default())
+            .unwrap(),
+    );
+    let plan =
+        Arc::new(FilterExec::try_new(val_filter, filter, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
 
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new(), true),
@@ -1748,7 +1779,8 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
         .unwrap(),
     );
     let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
-    let plan = Arc::new(FilterExec::try_new(predicate, join).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, join, &Funding::default()).unwrap());
     assert_parent_filter_remains(plan);
 }
 
@@ -1760,7 +1792,8 @@ fn test_filter_pushdown_through_union() {
     let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
 
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, union).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, union, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -1789,7 +1822,8 @@ fn test_filter_pushdown_through_union_mixed_support() {
     let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
 
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, union).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, union, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -1819,7 +1853,8 @@ fn test_filter_pushdown_through_union_does_not_support() {
     let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
 
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, union).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, union, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -1851,7 +1886,7 @@ fn test_filter_with_fetch_fully_pushed_through_union() {
     let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, union)
+        FilterExecBuilder::new(predicate, union, &Funding::default())
             .with_fetch(Some(10))
             .build()
             .unwrap(),
@@ -1887,7 +1922,7 @@ fn test_filter_with_fetch_and_projection_fully_pushed_through_union() {
     let projection = vec![1, 0];
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, union)
+        FilterExecBuilder::new(predicate, union, &Funding::default())
             .with_fetch(Some(5))
             .apply_projection(Some(projection))
             .unwrap()
@@ -1924,7 +1959,7 @@ fn test_filter_with_fetch_not_fully_pushed_through_union() {
     let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, union)
+        FilterExecBuilder::new(predicate, union, &Funding::default())
             .with_fetch(Some(8))
             .build()
             .unwrap(),
@@ -2085,7 +2120,8 @@ fn test_pushdown_filter_on_non_first_grouping_column() {
     );
 
     let predicate = col_lit_predicate("b", "bar", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -2154,7 +2190,8 @@ fn test_no_pushdown_grouping_sets_filter_on_missing_column() {
 
     // Filter on column 'a' which is missing in the second grouping set, should not be pushed down
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -2224,7 +2261,8 @@ fn test_pushdown_grouping_sets_filter_on_common_column() {
 
     // Filter on column 'b' which is present in all grouping sets will be pushed down
     let predicate = col_lit_predicate("b", "bar", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -2277,7 +2315,8 @@ async fn test_no_pushdown_through_global_aggregate_with_name_collision() {
         Operator::Lt,
         Arc::new(Literal::new(ScalarValue::Int64(Some(10)))),
     ));
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     let mut config = ConfigOptions::default();
     config.execution.parquet.pushdown_filters = true;
@@ -2321,7 +2360,8 @@ fn test_no_pushdown_constant_false_through_global_aggregate() {
         .unwrap(),
     );
     let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     assert_parent_filter_remains(plan);
 }
@@ -2358,7 +2398,8 @@ fn test_no_pushdown_constant_false_through_empty_grouping_set() {
         .unwrap(),
     );
     let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     assert_parent_filter_remains(plan);
 }
@@ -2420,7 +2461,8 @@ fn test_pushdown_through_aggregate_with_reordered_input_columns() {
     // The grouping expr for b references input index 2, but output index is 1.
     let agg_output_schema = aggregate.schema();
     let predicate = col_lit_predicate("b", "bar", &agg_output_schema);
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     // The filter should be pushed down
     insta::assert_snapshot!(
@@ -2511,7 +2553,9 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
 
     // Filter on b (present in all grouping sets) should be pushed down
     let predicate = col_lit_predicate("b", "bar", &agg_output_schema);
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate.clone()).unwrap());
+    let plan = Arc::new(
+        FilterExec::try_new(predicate, aggregate.clone(), &Funding::default()).unwrap(),
+    );
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -2532,7 +2576,8 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
 
     // Filter on a (missing from second grouping set) should not be pushed down
     let predicate = col_lit_predicate("a", "foo", &agg_output_schema);
-    let plan = Arc::new(FilterExec::try_new(predicate, aggregate).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -2569,7 +2614,8 @@ fn test_pushdown_with_computed_grouping_key() {
         Operator::Gt,
         Arc::new(Literal::new(ScalarValue::Float64(Some(5.0)))),
     )) as Arc<dyn PhysicalExpr>;
-    let filter = Arc::new(FilterExec::try_new(predicate, scan).unwrap());
+    let filter =
+        Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap());
 
     let aggregate_expr = vec![
         AggregateExprBuilder::new(count_udaf(), vec![col("a", &schema()).unwrap()])
@@ -3118,7 +3164,7 @@ async fn test_filter_with_projection_pushdown() {
         Arc::new(Literal::new(ScalarValue::Int64(Some(350)))),
     ));
     let filter1 = Arc::new(
-        FilterExecBuilder::new(time_filter, memory_exec)
+        FilterExecBuilder::new(time_filter, memory_exec, &Funding::default())
             .apply_projection(Some(vec![1, 2]))
             .unwrap()
             .build()
@@ -3135,7 +3181,7 @@ async fn test_filter_with_projection_pushdown() {
         )))),
     ));
     let filter2 = Arc::new(
-        FilterExecBuilder::new(event_filter, filter1)
+        FilterExecBuilder::new(event_filter, filter1, &Funding::default())
             .apply_projection(Some(vec![1]))
             .unwrap()
             .build()
@@ -3341,7 +3387,8 @@ fn test_filter_pushdown_through_sort_into_scan() {
         scan,
     ));
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, sort).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), true),
@@ -3373,7 +3420,8 @@ fn test_filter_pushdown_through_sort_no_scan_support() {
         scan,
     ));
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, sort).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
@@ -3410,7 +3458,8 @@ fn test_multiple_filters_pushdown_through_sort() {
         Operator::And,
         col_lit_predicate("b", "bar", &schema()),
     )) as Arc<dyn PhysicalExpr>;
-    let plan = Arc::new(FilterExec::try_new(predicate, sort).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
@@ -3446,7 +3495,8 @@ fn test_filter_not_pushed_through_sort_with_fetch() {
         .with_fetch(Some(10)),
     );
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, sort).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
@@ -3482,7 +3532,8 @@ fn test_filter_pushed_through_sort_with_fetch() {
         .with_fetch(Some(10)),
     );
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, sort).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
@@ -3517,7 +3568,7 @@ fn test_filter_with_projection_pushdown_through_sort() {
     // FilterExec: b = 'bar', projection=[a] (only output column a)
     let predicate = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, sort)
+        FilterExecBuilder::new(predicate, sort, &Funding::default())
             .apply_projection(Some(vec![0]))
             .unwrap()
             .build()
@@ -3558,7 +3609,8 @@ fn test_filter_pushdown_through_sort_preserves_partitioning() {
         .with_preserve_partitioning(true),
     );
     let predicate = col_lit_predicate("a", "foo", &schema());
-    let plan = Arc::new(FilterExec::try_new(predicate, sort).unwrap());
+    let plan =
+        Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
 
     insta::assert_snapshot!(
         OptimizationTest::new(plan, FilterPushdown::new(), false),
@@ -3592,7 +3644,7 @@ fn test_filter_with_fetch_pushdown_through_sort() {
     ));
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, sort)
+        FilterExecBuilder::new(predicate, sort, &Funding::default())
             .with_fetch(Some(10))
             .build()
             .unwrap(),
@@ -3629,7 +3681,7 @@ fn test_filter_pushdown_through_sort_with_projection() {
     // FilterExec: b = 'bar', projection=[a] (only output column a)
     let predicate = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
-        FilterExecBuilder::new(predicate, sort)
+        FilterExecBuilder::new(predicate, sort, &Funding::default())
             .apply_projection(Some(vec![0]))
             .unwrap()
             .build()

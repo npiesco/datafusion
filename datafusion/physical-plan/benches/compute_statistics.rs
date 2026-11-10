@@ -27,6 +27,7 @@
 //! - Cross-join tree: balanced binary trees from multi-way joins
 //!   (mirrors the `physical_many_self_joins` sql_planner benchmark)
 
+use datafusion_common::funding::Funding;
 use std::fmt;
 use std::sync::Arc;
 
@@ -170,7 +171,7 @@ fn build_filter_chain(depth: usize) -> Arc<dyn ExecutionPlan> {
         Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
     for _ in 0..depth {
         plan = Arc::new(
-            FilterExec::try_new(Arc::clone(&predicate), plan)
+            FilterExec::try_new(Arc::clone(&predicate), plan, &Funding::default())
                 .expect("FilterExec::try_new failed"),
         );
     }
@@ -188,7 +189,7 @@ fn build_mixed_chain(groups: usize) -> Arc<dyn ExecutionPlan> {
         // Two partition-preserving filters
         for _ in 0..2 {
             plan = Arc::new(
-                FilterExec::try_new(Arc::clone(&predicate), plan)
+                FilterExec::try_new(Arc::clone(&predicate), plan, &Funding::default())
                     .expect("FilterExec::try_new failed"),
             );
         }

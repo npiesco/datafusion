@@ -275,6 +275,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
             Arc::new(BinaryExpr::new(udf_expr.clone(), Operator::Gt, lit(0))),
         )),
         input,
+        &Funding::default(),
     )?);
     let aggr_expr =
         AggregateExprBuilder::new(max_udaf(), vec![udf_expr as Arc<dyn PhysicalExpr>])
@@ -481,6 +482,7 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
             Arc::new(BinaryExpr::new(udf_expr, Operator::Gt, lit(0))),
         )),
         input,
+        &Funding::default(),
     )?);
 
     let window = Arc::new(WindowAggExec::try_new(

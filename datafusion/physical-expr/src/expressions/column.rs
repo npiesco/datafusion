@@ -81,9 +81,11 @@ impl CloneBytes for Column {
 impl Column {
     /// Create a new column expression which references the
     /// column with the given index in the schema.
-    pub fn new(name: &str, index: usize) -> Self {
+    ///
+    /// An owned `name` is kept as it is, without allocating.
+    pub fn new(name: impl Into<String>, index: usize) -> Self {
         Self {
-            name: name.to_owned(),
+            name: name.into(),
             index,
         }
     }

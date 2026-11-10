@@ -2435,6 +2435,7 @@ async fn collect_left_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
@@ -2795,7 +2796,9 @@ mod tests {
     ) -> Result<(HashJoinExec, Arc<DynamicFilterPhysicalExpr>)> {
         let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
         let consumer: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
-        let right = Arc::new(FilterExecBuilder::new(consumer, right).build()?);
+        let right = Arc::new(
+            FilterExecBuilder::new(consumer, right, &Funding::default()).build()?,
+        );
         let mut join = HashJoinExec::try_new(
             left,
             right,

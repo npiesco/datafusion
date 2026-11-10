@@ -1551,7 +1551,7 @@ impl ExecutionPlan for SortExec {
         &self,
         _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
-        _config: &datafusion_common::config::ConfigOptions,
+        config: &datafusion_common::config::ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
         // For a plain sort (no fetch) we intercept any unsupported filters
         // by inserting a FilterExec below this Sort. Moving the filter below
@@ -1569,12 +1569,13 @@ impl ExecutionPlan for SortExec {
         }
 
         // Collect parent filters that were NOT successfully pushed to our child.
-        let unsupported_filters: Vec<Arc<dyn PhysicalExpr>> = child_pushdown_result
-            .parent_filters
-            .iter()
-            .filter(|&f| matches!(f.all(), PushedDown::No))
-            .map(|f| Arc::clone(&f.filter))
-            .collect();
+        let funding = &config.funding;
+        let mut unsupported_filters = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+        for f in &child_pushdown_result.parent_filters {
+            if matches!(f.all(), PushedDown::No) {
+                unsupported_filters.push(Arc::clone(&f.filter))?;
+            }
+        }
 
         if unsupported_filters.is_empty() {
             // All filters were pushed — nothing extra to do.
@@ -1583,10 +1584,11 @@ impl ExecutionPlan for SortExec {
 
         // Build a single conjunctive predicate from the unsupported filters
         // and insert a FilterExec between this SortExec and its child.
-        let predicate = datafusion_physical_expr::conjunction(unsupported_filters);
+        let predicate =
+            datafusion_physical_expr::conjunction(unsupported_filters.drain(..));
         let new_child =
-            Arc::new(FilterExec::try_new(predicate, Arc::clone(self.input()))?)
-                as Arc<dyn ExecutionPlan>;
+            FilterExec::try_new(predicate, Arc::clone(self.input()), funding)?;
+        let new_child = funding.arc(new_child)? as Arc<dyn ExecutionPlan>;
         let new_sort = Arc::new(
             SortExec::new(self.expr.clone(), new_child)
                 .with_fetch(self.fetch())

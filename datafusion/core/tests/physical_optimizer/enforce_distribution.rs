@@ -609,7 +609,7 @@ fn filter_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Operator::Eq,
         Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
     ));
-    Arc::new(FilterExec::try_new(predicate, input).unwrap())
+    Arc::new(FilterExec::try_new(predicate, input, &Funding::default()).unwrap())
 }
 
 fn limit_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
@@ -1812,8 +1812,11 @@ fn multi_hash_join_key_ordering() -> Result<()> {
         top_join.schema().deref(),
     )?;
 
-    let filter_top_join: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, top_join)?);
+    let filter_top_join: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+        predicate,
+        top_join,
+        &Funding::default(),
+    )?);
 
     // The bottom joins' join key ordering is adjusted based on the top join. And the top join should not introduce additional RepartitionExec
     let test_config = TestConfig::default();
@@ -4599,8 +4602,11 @@ async fn preserve_fetch_when_parallelizing_sort_above_filter() -> Result<()> {
     ));
     let coalesce: Arc<dyn ExecutionPlan> =
         Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(5)));
-    let filter: Arc<dyn ExecutionPlan> =
-        Arc::new(FilterExec::try_new(predicate, coalesce)?);
+    let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+        predicate,
+        coalesce,
+        &Funding::default(),
+    )?);
     let mut plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_key, filter));
     let mut config = test_suite_default_config_options();
     config.optimizer.enable_round_robin_repartition = false;
@@ -4734,7 +4740,8 @@ async fn check_fetch_below_filter(
         .with_fetch(Some(5)),
     );
     let predicate = Arc::new(BinaryExpr::new(col("c", &schema)?, op, lit(0_i64)));
-    let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, merge)?);
+    let filter: Arc<dyn ExecutionPlan> =
+        Arc::new(FilterExec::try_new(predicate, merge, &Funding::default())?);
     let mut plan = sort_required_exec_with_req(filter, sort_key);
     let mut config = test_suite_default_config_options();
     config.optimizer.enable_round_robin_repartition = false;

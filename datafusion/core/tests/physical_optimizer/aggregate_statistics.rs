@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::TestAggregate;
@@ -257,6 +258,7 @@ async fn test_count_inexact_stat() -> Result<()> {
             &schema,
         )?,
         source,
+        &Funding::default(),
     )?);
 
     let partial_agg = AggregateExec::try_new(
@@ -301,6 +303,7 @@ async fn test_count_with_nulls_inexact_stat() -> Result<()> {
             &schema,
         )?,
         source,
+        &Funding::default(),
     )?);
 
     let partial_agg = AggregateExec::try_new(

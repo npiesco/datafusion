@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::{Arc, LazyLock};
 
 use arrow::array::{Array, RecordBatch, StringArray};
@@ -292,7 +293,8 @@ async fn execute_with_predicate(
     .build();
     let exec = DataSourceExec::from_data_source(config);
     let exec =
-        Arc::new(FilterExec::try_new(predicate, exec).unwrap()) as Arc<dyn ExecutionPlan>;
+        Arc::new(FilterExec::try_new(predicate, exec, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
 
     let batches = collect(exec, ctx.task_ctx()).await.unwrap();
     let mut values = vec![];

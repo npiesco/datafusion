@@ -75,6 +75,7 @@ fn filter_exec(
             lit(0),
         )),
         input,
+        &Funding::default(),
     )?))
 }
 

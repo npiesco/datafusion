@@ -1183,8 +1183,11 @@ mod tests {
             StatisticsRegistry::with_providers(vec![Arc::new(CustomStatisticsProvider)]);
         // CustomStatisticsProvider only handles CustomExec, delegates for others
         // With no default provider, filter returns fallback statistics
-        let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(lit(true), Arc::clone(&source))?);
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            lit(true),
+            Arc::clone(&source),
+            &Funding::default(),
+        )?);
         let stats = custom_only.compute(filter.as_ref())?;
         // Falls back to plan.statistics() since no provider handles it
         assert!(stats.base.num_rows.get_value().is_some());
@@ -1341,7 +1344,7 @@ mod tests {
 
         let source = make_source(1000);
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(lit(true), source)?);
+            Arc::new(FilterExec::try_new(lit(true), source, &Funding::default())?);
 
         let stats = engine.compute(filter.as_ref())?;
         assert!(matches!(stats.base.num_rows, Precision::Inexact(100)));
@@ -1354,7 +1357,7 @@ mod tests {
         let source = make_source(1000);
         let predicate = lit(true);
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, source)?);
+            Arc::new(FilterExec::try_new(predicate, source, &Funding::default())?);
 
         let stats = engine.compute(filter.as_ref())?;
         assert!(stats.base.num_rows.get_value().unwrap_or(&0) <= &1000);
@@ -1402,7 +1405,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int32(Some(900)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, source)?);
+            Arc::new(FilterExec::try_new(predicate, source, &Funding::default())?);
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(FilterStatisticsProvider),
@@ -1486,7 +1489,7 @@ mod tests {
 
         // FilterExec: CustomStatisticsProvider delegates, OverrideFilterProvider handles
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(lit(true), source)?);
+            Arc::new(FilterExec::try_new(lit(true), source, &Funding::default())?);
         let stats = engine.compute(filter.as_ref())?;
         assert!(matches!(stats.base.num_rows, Precision::Inexact(500)));
 
@@ -2292,7 +2295,7 @@ mod tests {
 
         let source = make_source(1000);
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(lit(true), source)?);
+            Arc::new(FilterExec::try_new(lit(true), source, &Funding::default())?);
         let stats = registry.compute(filter.as_ref())?;
         assert_eq!(stats.base.num_rows, Precision::Inexact(42));
         Ok(())
@@ -2329,10 +2332,16 @@ mod tests {
 
         let registry = StatisticsRegistry::with_providers(vec![Arc::new(provider)]);
 
-        let filter_a: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(lit(true), make_source(500))?);
-        let filter_b: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(lit(true), make_source(200))?);
+        let filter_a: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            lit(true),
+            make_source(500),
+            &Funding::default(),
+        )?);
+        let filter_b: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            lit(true),
+            make_source(200),
+            &Funding::default(),
+        )?);
 
         let stats_a = registry.compute(filter_a.as_ref())?;
         let stats_b = registry.compute(filter_b.as_ref())?;

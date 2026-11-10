@@ -192,6 +192,7 @@ fn roundtrip_dynamic_filter_plan_pair() -> Result<(
     let filter_exec = Arc::new(FilterExec::try_new(
         Arc::clone(&filter_expr_1),
         projection_exec,
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
 
     let codec = DefaultPhysicalExtensionCodec {};
@@ -903,6 +904,7 @@ fn test_custom_node_with_dynamic_filter_dedup_roundtrip() -> Result<()> {
     let filter_exec = Arc::new(FilterExec::try_new(
         Arc::clone(&dynamic_filter_expr),
         custom_exec,
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
 
     // Roundtrip with DeduplicatingProtoConverter

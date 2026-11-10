@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
-use itertools::Itertools;
 
 use super::{
     ColumnStatistics, DisplayAs, ExecutionPlanProperties, PlanProperties,
@@ -100,6 +99,8 @@ pub struct FilterExec {
     batch_size: usize,
     /// Number of rows to fetch
     fetch: Option<usize>,
+    /// What this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 /// Builder for [`FilterExec`] to set optional parameters
@@ -110,11 +111,17 @@ pub struct FilterExecBuilder {
     default_selectivity: u8,
     batch_size: usize,
     fetch: Option<usize>,
+    funding: Funding,
 }
 
 impl FilterExecBuilder {
-    /// Create a new builder with required parameters (predicate and input)
-    pub fn new(predicate: Arc<dyn PhysicalExpr>, input: Arc<dyn ExecutionPlan>) -> Self {
+    /// Create a new builder with required parameters (predicate and input), and the
+    /// funding what it builds is charged to before it is allocated
+    pub fn new(
+        predicate: Arc<dyn PhysicalExpr>,
+        input: Arc<dyn ExecutionPlan>,
+        funding: &Funding,
+    ) -> Self {
         Self {
             predicate,
             input,
@@ -122,6 +129,7 @@ impl FilterExecBuilder {
             default_selectivity: FILTER_EXEC_DEFAULT_SELECTIVITY,
             batch_size: FILTER_EXEC_DEFAULT_BATCH_SIZE,
             fetch: None,
+            funding: funding.clone(),
         }
     }
 
@@ -147,7 +155,7 @@ impl FilterExecBuilder {
     /// If no projection is currently set, the new projection is used directly.
     /// If `None` is passed, the projection is cleared.
     pub fn apply_projection(self, projection: Option<Vec<usize>>) -> Result<Self> {
-        let projection = projection.map(Into::into);
+        let projection = projection.map(|p| self.funding.arc_slice(&p)).transpose()?;
         self.apply_projection_by_ref(projection.as_ref())
     }
 
@@ -158,7 +166,8 @@ impl FilterExecBuilder {
     ) -> Result<Self> {
         // Check if the projection is valid against current output schema
         can_project(&self.input.schema(), projection.map(AsRef::as_ref))?;
-        self.projection = combine_projections(projection, self.projection.as_ref())?;
+        self.projection =
+            combine_projections(projection, self.projection.as_ref(), &self.funding)?;
         Ok(self)
     }
 
@@ -203,22 +212,27 @@ impl FilterExecBuilder {
         can_project(&self.input.schema(), self.projection.as_deref())?;
 
         // Compute properties once with all parameters
+        let funding = &self.funding;
         let cache = FilterExec::compute_properties(
             &self.input,
             &self.predicate,
             self.default_selectivity,
             self.projection.as_deref(),
+            funding,
         )?;
+        let cache = funding.arc(cache)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
 
         Ok(FilterExec {
             predicate: self.predicate,
             input: self.input,
             metrics: ExecutionPlanMetricsSet::new(),
             default_selectivity: self.default_selectivity,
-            cache: Arc::new(cache),
+            cache,
             projection: self.projection,
             batch_size: self.batch_size,
             fetch: self.fetch,
+            funding: self.funding,
         })
     }
 }
@@ -232,6 +246,7 @@ impl From<&FilterExec> for FilterExecBuilder {
             default_selectivity: exec.default_selectivity,
             batch_size: exec.batch_size,
             fetch: exec.fetch,
+            funding: exec.funding.clone(),
             // We could cache / copy over PlanProperties
             // here but that would require invalidating them in FilterExecBuilder::apply_projection, etc.
             // and currently every call to this method ends up invalidating them anyway.
@@ -241,12 +256,19 @@ impl From<&FilterExec> for FilterExecBuilder {
 }
 
 impl FilterExec {
-    /// Create a FilterExec on an input using the builder pattern
+    /// Create a FilterExec on an input using the builder pattern, what it makes charged
+    /// to `funding` before it is allocated
     pub fn try_new(
         predicate: Arc<dyn PhysicalExpr>,
         input: Arc<dyn ExecutionPlan>,
+        funding: &Funding,
     ) -> Result<Self> {
-        FilterExecBuilder::new(predicate, input).build()
+        FilterExecBuilder::new(predicate, input, funding).build()
+    }
+
+    /// What this node and the nodes rebuilt from it are charged to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Get a batch size
@@ -292,6 +314,7 @@ impl FilterExec {
             projection: self.projection.clone(),
             batch_size,
             fetch: self.fetch,
+            funding: self.funding.clone(),
         })
     }
 
@@ -423,6 +446,7 @@ impl FilterExec {
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
         projection: Option<&[usize]>,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Combine the equal predicates with the input equivalence properties
         // to construct the equivalence properties:
@@ -443,18 +467,19 @@ impl FilterExec {
         }
         // Add the columns that have only one viable value (singleton) after
         // filtering to constants.
-        let constants = collect_columns(predicate)
-            .into_iter()
-            .filter(|column| stats.column_statistics[column.index()].is_singleton())
-            .map(|column| {
-                let value = stats.column_statistics[column.index()]
-                    .min_value
-                    .get_value();
-                let expr = Arc::new(column) as _;
-                ConstExpr::new(expr, AcrossPartitions::Uniform(value.cloned()))
-            });
+        let mut constants = funding.held::<Vec<ConstExpr>>();
+        for column in collect_columns(predicate) {
+            let column_statistics = &stats.column_statistics[column.index()];
+            if !column_statistics.is_singleton() {
+                continue;
+            }
+            let value = column_statistics.min_value.get_value();
+            let value = value.map(|v| funding.cloned(v)).transpose()?;
+            let expr = funding.arc(column)? as _;
+            constants.push(ConstExpr::new(expr, AcrossPartitions::Uniform(value)))?;
+        }
         // This is for statistics
-        eq_properties.add_constants(constants)?;
+        eq_properties.add_constants(constants.drain(..))?;
         // This is for logical constant (for example: a = '1', then a could be marked as a constant)
         // to do: how to deal with multiple situation to represent = (for example c1 between 0 and 0)
         eq_properties.add_constants(ConstExpr::collect_predicate_constants(
@@ -467,7 +492,7 @@ impl FilterExec {
         if let Some(projection) = projection {
             let schema = eq_properties.schema();
             let projection_mapping =
-                ProjectionMapping::from_indices(projection, schema, &Funding::default())?;
+                ProjectionMapping::from_indices(projection, schema, funding)?;
             let out_schema = project_schema(schema, Some(&projection))?;
             output_partitioning =
                 output_partitioning.project(&projection_mapping, &eq_properties);
@@ -561,17 +586,20 @@ impl ExecutionPlan for FilterExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })? as _)
+            }
             ChildrenPropertiesMode::Recompute => {
                 let new_input = children.swap_remove(0);
-                FilterExecBuilder::from(&*self)
+                let rebuilt = FilterExecBuilder::from(&*self)
                     .with_input(new_input)
-                    .build()
-                    .map(|e| Arc::new(e) as _)
+                    .build()?;
+                Ok(self.funding.arc(rebuilt)? as _)
             }
         }
     }
@@ -663,15 +691,15 @@ impl ExecutionPlan for FilterExec {
             if let Some(new_predicate) =
                 update_expr(self.predicate(), projection.expr(), false)?
             {
-                return FilterExecBuilder::from(self)
+                let swapped = FilterExecBuilder::from(self)
                     .with_input(make_with_child(projection, self.input())?)
                     .with_predicate(new_predicate)
                     // The original FilterExec projection referenced columns from its old
                     // input. After the swap the new input is the ProjectionExec which
                     // already handles column selection, so clear the projection here.
                     .apply_projection(None)?
-                    .build()
-                    .map(|e| Some(Arc::new(e) as _));
+                    .build()?;
+                return Ok(Some(self.funding.arc(swapped)? as _));
             }
         }
         try_embed_projection(projection, self)
@@ -709,46 +737,38 @@ impl ExecutionPlan for FilterExec {
         if phase != FilterPushdownPhase::Pre {
             return Ok(FilterPushdownPropagation::if_all(child_pushdown_result));
         }
+        let funding = &self.funding;
         // We absorb any parent filters that were not handled by our children
-        let mut unsupported_parent_filters: Vec<Arc<dyn PhysicalExpr>> =
-            child_pushdown_result
-                .parent_filters
-                .iter()
-                .filter_map(|f| {
-                    matches!(f.all(), PushedDown::No).then_some(Arc::clone(&f.filter))
-                })
-                .collect();
+        let mut unhandled_filters = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+        for f in &child_pushdown_result.parent_filters {
+            if matches!(f.all(), PushedDown::No) {
+                unhandled_filters.push(Arc::clone(&f.filter))?;
+            }
+        }
 
         // If this FilterExec has a projection, the unsupported parent filters
         // are in the output schema (after projection) coordinates. We need to
         // remap them to the input schema coordinates before combining with self filters.
         if self.projection.is_some() {
             let input_schema = self.input().schema();
-            unsupported_parent_filters = unsupported_parent_filters
-                .into_iter()
-                .map(|expr| reassign_expr_columns(expr, &input_schema))
-                .collect::<Result<Vec<_>>>()?;
+            for expr in unhandled_filters.iter_mut() {
+                *expr = reassign_expr_columns(Arc::clone(expr), &input_schema)?;
+            }
         }
 
-        let unsupported_self_filters = child_pushdown_result
+        let self_filters = child_pushdown_result
             .self_filters
             .first()
-            .expect("we have exactly one child")
-            .iter()
-            .filter_map(|f| match f.discriminant {
-                PushedDown::Yes => None,
-                PushedDown::No => Some(&f.predicate),
-            })
-            .cloned();
-
-        let unhandled_filters = unsupported_parent_filters
-            .into_iter()
-            .chain(unsupported_self_filters)
-            .collect_vec();
+            .expect("we have exactly one child");
+        for f in self_filters {
+            if matches!(f.discriminant, PushedDown::No) {
+                unhandled_filters.push(Arc::clone(&f.predicate))?;
+            }
+        }
 
         // If we have unhandled filters, we need to create a new FilterExec
         let filter_input = Arc::clone(self.input());
-        let new_predicate = conjunction(unhandled_filters);
+        let new_predicate = conjunction(unhandled_filters.drain(..));
         let updated_node = if new_predicate.eq(&lit(true)) {
             // FilterExec is no longer needed, but we may need to leave a projection in place.
             // If this FilterExec had a fetch limit, propagate it to the child.
@@ -761,7 +781,9 @@ impl ExecutionPlan for FilterExec {
                 };
                 match filter_input.with_fetch(Some(effective_fetch)) {
                     Some(node) => node,
-                    None => Arc::new(LocalLimitExec::new(filter_input, effective_fetch)),
+                    None => {
+                        funding.arc(LocalLimitExec::new(filter_input, effective_fetch))?
+                    }
                 }
             } else {
                 filter_input
@@ -769,22 +791,22 @@ impl ExecutionPlan for FilterExec {
             match self.projection().as_ref() {
                 Some(projection_indices) => {
                     let filter_child_schema = filter_input.schema();
-                    let proj_exprs = projection_indices
-                        .iter()
-                        .map(|p| {
-                            let field = filter_child_schema.field(*p).clone();
-                            ProjectionExpr {
-                                expr: Arc::new(Column::new(field.name(), *p))
-                                    as Arc<dyn PhysicalExpr>,
-                                alias: field.name().to_string(),
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    Some(Arc::new(ProjectionExec::try_new(
-                        proj_exprs,
+                    let mut proj_exprs = funding.held::<Vec<ProjectionExpr>>();
+                    proj_exprs.reserve_exact(projection_indices.len())?;
+                    for p in projection_indices.iter() {
+                        let name = filter_child_schema.field(*p).name();
+                        let column = Column::new(funding.string(name)?, *p);
+                        proj_exprs.push(ProjectionExpr {
+                            expr: funding.arc(column)? as Arc<dyn PhysicalExpr>,
+                            alias: funding.string(name)?,
+                        })?;
+                    }
+                    let projection = ProjectionExec::try_new(
+                        proj_exprs.drain(..),
                         filter_input,
-                        &Funding::default(),
-                    )?) as Arc<dyn ExecutionPlan>)
+                        funding,
+                    )?;
+                    Some(funding.arc(projection)? as Arc<dyn ExecutionPlan>)
                 }
                 None => {
                     // No projection needed, just return the input
@@ -796,22 +818,25 @@ impl ExecutionPlan for FilterExec {
             None
         } else {
             // Create a new FilterExec with the new predicate, preserving the projection
+            let cache = Self::compute_properties(
+                &filter_input,
+                &new_predicate,
+                self.default_selectivity,
+                self.projection.as_deref(),
+                funding,
+            )?;
             let new = FilterExec {
                 predicate: Arc::clone(&new_predicate),
                 input: Arc::clone(&filter_input),
                 metrics: self.metrics.clone(),
                 default_selectivity: self.default_selectivity,
-                cache: Arc::new(Self::compute_properties(
-                    &filter_input,
-                    &new_predicate,
-                    self.default_selectivity,
-                    self.projection.as_deref(),
-                )?),
+                cache: funding.arc(cache)?,
                 projection: self.projection.clone(),
                 batch_size: self.batch_size,
                 fetch: self.fetch,
+                funding: funding.clone(),
             };
-            Some(Arc::new(new) as _)
+            Some(funding.arc(new)? as _)
         };
 
         Ok(FilterPushdownPropagation {
@@ -825,7 +850,7 @@ impl ExecutionPlan for FilterExec {
     }
 
     fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(Self {
+        let limited = self.funding.arc(Self {
             predicate: Arc::clone(&self.predicate),
             input: Arc::clone(&self.input),
             metrics: self.metrics.clone(),
@@ -834,7 +859,9 @@ impl ExecutionPlan for FilterExec {
             projection: self.projection.clone(),
             batch_size: self.batch_size,
             fetch,
-        }))
+            funding: self.funding.clone(),
+        });
+        limited.ok().map(|limited| limited as _)
     }
 
     fn with_preserve_order(
@@ -844,8 +871,10 @@ impl ExecutionPlan for FilterExec {
         self.input
             .with_preserve_order(preserve_order)
             .and_then(|new_input| {
-                replace_children_if_necessary(Arc::new(self.clone()), vec![new_input])
-                    .ok()
+                let funding = &self.funding;
+                let this = funding.arc(self.clone()).ok()?;
+                let children = funding.vec_of([new_input]).ok()?;
+                replace_children_if_necessary(this, children).ok()
             })
     }
 
@@ -929,7 +958,7 @@ impl FilterExec {
         } else {
             Some(projection_vec)
         };
-        let filter = FilterExecBuilder::new(predicate, input)
+        let filter = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(projection)?
             .with_batch_size(filter.batch_size as usize)
             .with_fetch(filter.fetch.map(|f| f as usize))
@@ -1493,7 +1522,7 @@ mod tests {
 
         // WHERE a <= 25
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -1538,6 +1567,7 @@ mod tests {
         let sub_filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
             binary(col("a", &schema)?, Operator::LtEq, lit(25i32), &schema)?,
             input,
+            &Funding::default(),
         )?);
 
         // Nested filters (two separate physical plans, instead of AND chain in the expr)
@@ -1546,6 +1576,7 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
             binary(col("a", &schema)?, Operator::GtEq, lit(10i32), &schema)?,
             sub_filter,
+            &Funding::default(),
         )?);
 
         let statistics =
@@ -1598,18 +1629,21 @@ mod tests {
         let a_lte_25: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
             binary(col("a", &schema)?, Operator::LtEq, lit(25i32), &schema)?,
             input,
+            &Funding::default(),
         )?);
 
         // WHERE b > 45
         let b_gt_5: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
             binary(col("b", &schema)?, Operator::Gt, lit(45i32), &schema)?,
             a_lte_25,
+            &Funding::default(),
         )?);
 
         // WHERE a >= 10
         let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
             binary(col("a", &schema)?, Operator::GtEq, lit(10i32), &schema)?,
             b_gt_5,
+            &Funding::default(),
         )?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -1660,7 +1694,7 @@ mod tests {
 
         // WHERE a <= 25
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -1735,7 +1769,7 @@ mod tests {
             )),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // 0.5 (from a) * 0.333333... (from b) * 0.798387... (from c) ≈ 0.1330...
@@ -1843,7 +1877,7 @@ mod tests {
             col.null_count = Precision::Exact(0);
         }
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -1897,7 +1931,7 @@ mod tests {
             )),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -1970,8 +2004,11 @@ mod tests {
             Operator::Gt,
             Arc::new(Literal::new(ScalarValue::Int32(Some(200)))),
         ));
-        let inner_filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(inner_predicate, input)?);
+        let inner_filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            inner_predicate,
+            input,
+            &Funding::default(),
+        )?);
 
         // Outer filter: a = 50
         // Before the fix, this would panic because the inner filter's
@@ -1982,8 +2019,11 @@ mod tests {
             Operator::Eq,
             Arc::new(Literal::new(ScalarValue::Int32(Some(50)))),
         ));
-        let outer_filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(outer_predicate, inner_filter)?);
+        let outer_filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            outer_predicate,
+            inner_filter,
+            &Funding::default(),
+        )?);
 
         // Should succeed without error
         let statistics = StatisticsContext::new()
@@ -2025,7 +2065,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int32(Some(50)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -2080,7 +2120,7 @@ mod tests {
             )),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let filter_statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -2118,7 +2158,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let filter_statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // First column is "a", and it is a column with only one value after the filter.
@@ -2140,7 +2180,7 @@ mod tests {
             Operator::Eq,
             Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
         ));
-        let filter = FilterExec::try_new(predicate, input)?;
+        let filter = FilterExec::try_new(predicate, input, &Funding::default())?;
         assert!(filter.with_default_selectivity(120).is_err());
         Ok(())
     }
@@ -2166,7 +2206,7 @@ mod tests {
             Operator::Eq,
             Arc::new(Literal::new(ScalarValue::Decimal128(Some(10), 10, 10))),
         ));
-        let filter = FilterExec::try_new(predicate, input)?;
+        let filter = FilterExec::try_new(predicate, input, &Funding::default())?;
         let statistics =
             StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(200));
@@ -2206,6 +2246,7 @@ mod tests {
                 &schema,
             )?,
             Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
+            &Funding::default(),
         )?;
 
         StatisticsContext::new()
@@ -2236,7 +2277,7 @@ mod tests {
 
         // Create filter with projection [0, 2] (columns a and c) using builder
         let projection = Some(vec![0, 2]);
-        let filter = FilterExecBuilder::new(predicate, input)
+        let filter = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(projection.clone())
             .unwrap()
             .build()?;
@@ -2270,7 +2311,8 @@ mod tests {
         ));
 
         // Create filter without projection using builder
-        let filter = FilterExecBuilder::new(predicate, input).build()?;
+        let filter =
+            FilterExecBuilder::new(predicate, input, &Funding::default()).build()?;
 
         // Verify no projection is set
         assert!(filter.projection().is_none());
@@ -2299,8 +2341,8 @@ mod tests {
         ));
 
         // Try to create filter with invalid projection (index out of bounds) using builder
-        let result =
-            FilterExecBuilder::new(predicate, input).apply_projection(Some(vec![0, 5])); // 5 is out of bounds
+        let result = FilterExecBuilder::new(predicate, input, &Funding::default())
+            .apply_projection(Some(vec![0, 5])); // 5 is out of bounds
 
         // Should return an error
         assert!(result.is_err());
@@ -2353,13 +2395,17 @@ mod tests {
         let projection = Some(vec![0, 2]);
 
         // Method 1: Builder with projection (one call to compute_properties)
-        let filter1 = FilterExecBuilder::new(Arc::clone(&predicate), Arc::clone(&input))
-            .apply_projection(projection.clone())
-            .unwrap()
-            .build()?;
+        let filter1 = FilterExecBuilder::new(
+            Arc::clone(&predicate),
+            Arc::clone(&input),
+            &Funding::default(),
+        )
+        .apply_projection(projection.clone())
+        .unwrap()
+        .build()?;
 
         // Method 2: Also using builder for comparison (deprecated try_new().with_projection() removed)
-        let filter2 = FilterExecBuilder::new(predicate, input)
+        let filter2 = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(projection)
             .unwrap()
             .build()?;
@@ -2420,7 +2466,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int32(Some(50)))),
         ));
 
-        let filter = FilterExecBuilder::new(predicate, input)
+        let filter = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(Some(vec![0, 2]))
             .unwrap()
             .build()?;
@@ -2452,10 +2498,11 @@ mod tests {
         let invalid_predicate = Arc::new(Column::new("a", 0));
 
         // Should fail because predicate doesn't return boolean
-        let result = FilterExecBuilder::new(invalid_predicate, input)
-            .apply_projection(Some(vec![0]))
-            .unwrap()
-            .build();
+        let result =
+            FilterExecBuilder::new(invalid_predicate, input, &Funding::default())
+                .apply_projection(Some(vec![0]))
+                .unwrap()
+                .build();
 
         assert!(result.is_err());
 
@@ -2487,7 +2534,7 @@ mod tests {
         // First projection: [0, 2, 3] -> select columns a, c, d
         // Second projection: [0, 2] -> select indices 0 and 2 of [0, 2, 3] -> [0, 3]
         // Final result: columns a and d
-        let filter = FilterExecBuilder::new(predicate, input)
+        let filter = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(Some(vec![0, 2, 3]))?
             .apply_projection(Some(vec![0, 2]))?
             .build()?;
@@ -2522,7 +2569,7 @@ mod tests {
         ));
 
         // Set a projection then clear it with None
-        let filter = FilterExecBuilder::new(predicate, input)
+        let filter = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(Some(vec![0]))?
             .apply_projection(None)?
             .build()?;
@@ -2557,7 +2604,7 @@ mod tests {
             Operator::Gt,
             Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
         ));
-        let filter = FilterExecBuilder::new(predicate, input)
+        let filter = FilterExecBuilder::new(predicate, input, &Funding::default())
             .apply_projection(Some(vec![2]))?
             .build()?;
 
@@ -2660,7 +2707,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -2949,7 +2996,7 @@ mod tests {
                 schema.clone(),
             ));
             let filter: Arc<dyn ExecutionPlan> =
-                Arc::new(FilterExec::try_new(predicate, input)?);
+                Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
             let statistics = StatisticsContext::new()
                 .compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -2998,7 +3045,7 @@ mod tests {
 
         let input = Arc::new(StatisticsExec::new(input_stats, schema.clone()));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -3040,8 +3087,11 @@ mod tests {
                 Arc::new(Literal::new(ScalarValue::Int32(Some(2)))),
             )),
         ));
-        let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(contradiction, input)?);
+        let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            contradiction,
+            input,
+            &Funding::default(),
+        )?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -3076,7 +3126,7 @@ mod tests {
 
             let input = Arc::new(StatisticsExec::new(input_stats, schema));
             let filter: Arc<dyn ExecutionPlan> =
-                Arc::new(FilterExec::try_new(predicate, input)?);
+                Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
             let statistics = StatisticsContext::new()
                 .compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -3148,7 +3198,7 @@ mod tests {
         for (desc, schema, input_stats, predicate) in cases {
             let input = Arc::new(StatisticsExec::new(input_stats, schema));
             let filter: Arc<dyn ExecutionPlan> =
-                Arc::new(FilterExec::try_new(predicate, input)?);
+                Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
             let statistics = StatisticsContext::new()
                 .compute(filter.as_ref(), &StatisticsArgs::new())?;
 
@@ -3226,7 +3276,7 @@ mod tests {
             )),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // Equality predicates collapse NDV and reject nulls for their columns.
@@ -3280,7 +3330,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
@@ -3314,7 +3364,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int8(Some(42)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
@@ -3348,7 +3398,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int64(Some(42)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
@@ -3382,7 +3432,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Float32(Some(42.5)))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
@@ -3417,7 +3467,7 @@ mod tests {
             Arc::new(Column::new("a", 0)),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
@@ -3464,7 +3514,7 @@ mod tests {
             ))),
         ));
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
@@ -3709,7 +3759,7 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
         ));
         let filter = Arc::new(
-            FilterExecBuilder::new(predicate, input)
+            FilterExecBuilder::new(predicate, input, &Funding::default())
                 .apply_projection(Some(vec![0, 1, 2]))?
                 .build()?,
         );
@@ -3768,7 +3818,7 @@ mod tests {
             binary(col("a", &schema)?, Operator::LtEq, lit(10i32), &schema)?;
 
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -3815,7 +3865,7 @@ mod tests {
         let predicate: Arc<dyn PhysicalExpr> =
             binary(col("name", &schema)?, Operator::Gt, lit("m"), &schema)?;
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -3859,7 +3909,7 @@ mod tests {
             &schema,
         )?;
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
@@ -3901,7 +3951,7 @@ mod tests {
         // also exercises the default-selectivity path.
         let predicate: Arc<dyn PhysicalExpr> = is_not_null(col("name", &schema)?)?;
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, input)?);
+            Arc::new(FilterExec::try_new(predicate, input, &Funding::default())?);
 
         let statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;

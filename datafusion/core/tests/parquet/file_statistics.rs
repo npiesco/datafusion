@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::fs;
 use std::sync::Arc;
 
@@ -86,9 +87,10 @@ async fn check_stats_precision_with_filter_pushdown() {
     let df_schema = DFSchema::try_from(table.schema()).unwrap();
     let physical_filter = ctx.create_physical_expr(filter_expr, &df_schema).unwrap();
 
-    let filtered_exec =
-        Arc::new(FilterExec::try_new(physical_filter, exec_with_filter).unwrap())
-            as Arc<dyn ExecutionPlan>;
+    let filtered_exec = Arc::new(
+        FilterExec::try_new(physical_filter, exec_with_filter, &Funding::default())
+            .unwrap(),
+    ) as Arc<dyn ExecutionPlan>;
 
     let optimized_exec = FilterPushdown::new()
         .optimize(filtered_exec, &options)

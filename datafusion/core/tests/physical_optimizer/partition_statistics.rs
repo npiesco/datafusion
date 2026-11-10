@@ -401,7 +401,7 @@ mod test {
             &schema,
         )?;
         let filter: Arc<dyn ExecutionPlan> =
-            Arc::new(FilterExec::try_new(predicate, scan)?);
+            Arc::new(FilterExec::try_new(predicate, scan, &Funding::default())?);
         let full_statistics =
             StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         let expected_full_statistic = Statistics {
