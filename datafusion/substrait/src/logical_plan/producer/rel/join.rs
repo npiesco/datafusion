@@ -129,7 +129,7 @@ mod tests {
             JoinType::Inner,
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
-            false,
+            false, &datafusion::common::funding::Funding::default(),
         )?;
         let join_expr = producer.handle_join(&join)?;
 

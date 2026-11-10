@@ -447,6 +447,7 @@ fn inner_join(
         left.schema(),
         right.schema(),
         &JoinType::Inner,
+        funding,
     )?)?;
 
     Ok(LogicalPlan::Join(Join {
@@ -1472,6 +1473,7 @@ mod tests {
             t1.schema(),
             t2.schema(),
             &JoinType::Inner,
+            &Funding::default(),
         )?);
 
         let inner_join = LogicalPlan::Join(Join {

@@ -50,9 +50,10 @@ use crate::{
 use super::dml::InsertOp;
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::file_options::file_type::FileType;
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{Funding, arc_bytes};
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
     Column, Constraints, DFSchema, DFSchemaRef, NullEquality, Result, ScalarValue,
@@ -1221,8 +1222,12 @@ impl LogicalPlanBuilder {
             .zip(right_keys)
             .map(|(l, r)| (Expr::Column(l), Expr::Column(r)))
             .collect();
-        let join_schema =
-            build_join_schema(self.plan.schema(), right.schema(), &join_type)?;
+        let join_schema = build_join_schema(
+            self.plan.schema(),
+            right.schema(),
+            &join_type,
+            &self.funding,
+        )?;
 
         // Inner type without join condition is cross join
         if join_type != JoinType::Inner && on.is_empty() && filter.is_none() {
@@ -1314,6 +1319,7 @@ impl LogicalPlanBuilder {
                 JoinConstraint::Using,
                 NullEquality::NullEqualsNothing,
                 false, // null_aware
+                &self.funding,
             )?;
 
             Self::built(LogicalPlan::Join(join), self.funding)
@@ -1331,6 +1337,7 @@ impl LogicalPlanBuilder {
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
             false, // null_aware
+            &self.funding,
         )?;
 
         Self::built(LogicalPlan::Join(join), self.funding)
@@ -1593,6 +1600,7 @@ impl LogicalPlanBuilder {
             JoinConstraint::On,
             NullEquality::NullEqualsNothing,
             false, // null_aware
+            &self.funding,
         )?;
 
         Self::built(LogicalPlan::Join(join), self.funding)
@@ -1725,110 +1733,112 @@ pub fn unique_field_aliases(fields: &Fields) -> Vec<Option<String>> {
         .collect()
 }
 
-fn mark_field(schema: &DFSchema) -> (Option<TableReference>, Arc<Field>) {
-    let mut table_references = schema
-        .iter()
-        .filter_map(|(qualifier, _)| qualifier)
-        .collect::<Vec<_>>();
-    table_references.dedup();
-    let table_reference = if table_references.len() == 1 {
-        table_references.pop().cloned()
-    } else {
-        None
-    };
-
-    (
+fn mark_field(
+    schema: &DFSchema,
+    funding: &Funding,
+) -> Result<(Option<TableReference>, FieldRef)> {
+    // The mark is qualified when every qualified field of `schema` shares one qualifier.
+    let mut qualifiers = schema.iter().filter_map(|(qualifier, _)| qualifier);
+    let table_reference = qualifiers
+        .next()
+        .filter(|first| qualifiers.all(|qualifier| qualifier == *first))
+        .cloned();
+    Ok((
         table_reference,
-        Arc::new(Field::new("mark", DataType::Boolean, false)),
-    )
+        funding.arc(Field::new(
+            funding.string("mark")?,
+            DataType::Boolean,
+            false,
+        ))?,
+    ))
 }
 
-/// Creates a schema for a join operation.
+/// `field`, nullable: itself if it already is, otherwise a copy in a counted block of its
+/// own, its block, name and type charged before they are allocated. A non-empty metadata
+/// map is copied uncharged: its table's size is not measured.
+fn nullable_field(field: &FieldRef, funding: &Funding) -> Result<FieldRef> {
+    if field.is_nullable() {
+        return Ok(Arc::clone(field));
+    }
+    funding.charge(
+        field
+            .name()
+            .len()
+            .saturating_add(field.data_type().clone_bytes())
+            .saturating_add(arc_bytes::<Field>()),
+    )?;
+    Ok(Arc::new(field.as_ref().clone().with_nullable(true)))
+}
+
+/// Creates a schema for a join operation, all it allocates charged to `funding` before it
+/// is made.
 /// The fields from the left side are first
 pub fn build_join_schema(
     left: &DFSchema,
     right: &DFSchema,
     join_type: &JoinType,
+    funding: &Funding,
 ) -> Result<DFSchema> {
-    fn nullify_fields<'a>(
-        fields: impl Iterator<Item = (Option<&'a TableReference>, &'a Arc<Field>)>,
-    ) -> Vec<(Option<TableReference>, Arc<Field>)> {
-        fields
-            .map(|(q, f)| {
-                // TODO: find a good way to do that
-                let field = f.as_ref().clone().with_nullable(true);
-                (q.cloned(), Arc::new(field))
-            })
-            .collect()
+    fn push_fields(
+        qualified_fields: &mut Vec<(Option<TableReference>, FieldRef)>,
+        schema: &DFSchema,
+        nullable: bool,
+        funding: &Funding,
+    ) -> Result<()> {
+        for (qualifier, field) in schema.iter() {
+            let field = if nullable {
+                // Set to nullable in case of a not matched row.
+                nullable_field(field, funding)?
+            } else {
+                Arc::clone(field)
+            };
+            qualified_fields.push((qualifier.cloned(), field));
+        }
+        Ok(())
     }
 
-    let right_fields = right.iter();
-    let left_fields = left.iter();
-
-    let qualified_fields: Vec<(Option<TableReference>, Arc<Field>)> = match join_type {
-        JoinType::Inner => {
-            // left then right
-            let left_fields = left_fields
-                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-                .collect::<Vec<_>>();
-            let right_fields = right_fields
-                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-                .collect::<Vec<_>>();
-            left_fields.into_iter().chain(right_fields).collect()
+    let (left_len, right_len) = (left.fields().len(), right.fields().len());
+    let len = match join_type {
+        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
+            left_len.saturating_add(right_len)
         }
-        JoinType::Left => {
-            // left then right, right set to nullable in case of not matched scenario
-            let left_fields = left_fields
-                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-                .collect::<Vec<_>>();
-            left_fields
-                .into_iter()
-                .chain(nullify_fields(right_fields))
-                .collect()
-        }
-        JoinType::Right => {
-            // left then right, left set to nullable in case of not matched scenario
-            let right_fields = right_fields
-                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-                .collect::<Vec<_>>();
-            nullify_fields(left_fields)
-                .into_iter()
-                .chain(right_fields)
-                .collect()
-        }
-        JoinType::Full => {
-            // left then right, all set to nullable in case of not matched scenario
-            nullify_fields(left_fields)
-                .into_iter()
-                .chain(nullify_fields(right_fields))
-                .collect()
-        }
-        JoinType::LeftSemi | JoinType::LeftAnti => {
-            // Only use the left side for the schema
-            left_fields
-                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-                .collect()
-        }
-        JoinType::LeftMark => left_fields
-            .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-            .chain(once(mark_field(right)))
-            .collect(),
-        JoinType::RightSemi | JoinType::RightAnti => {
-            // Only use the right side for the schema
-            right_fields
-                .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-                .collect()
-        }
-        JoinType::RightMark => right_fields
-            .map(|(q, f)| (q.cloned(), Arc::clone(f)))
-            .chain(once(mark_field(left)))
-            .collect(),
+        JoinType::LeftSemi | JoinType::LeftAnti => left_len,
+        JoinType::RightSemi | JoinType::RightAnti => right_len,
+        JoinType::LeftMark => left_len.saturating_add(1),
+        JoinType::RightMark => right_len.saturating_add(1),
     };
+    let mut qualified_fields = funding.vec_with_capacity(len)?;
+    match join_type {
+        // left then right; the side that may not match set to nullable
+        JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
+            let nullable_left = matches!(join_type, JoinType::Right | JoinType::Full);
+            let nullable_right = matches!(join_type, JoinType::Left | JoinType::Full);
+            push_fields(&mut qualified_fields, left, nullable_left, funding)?;
+            push_fields(&mut qualified_fields, right, nullable_right, funding)?;
+        }
+        // Only use the left side for the schema
+        JoinType::LeftSemi | JoinType::LeftAnti => {
+            push_fields(&mut qualified_fields, left, false, funding)?;
+        }
+        JoinType::LeftMark => {
+            push_fields(&mut qualified_fields, left, false, funding)?;
+            qualified_fields.push(mark_field(right, funding)?);
+        }
+        // Only use the right side for the schema
+        JoinType::RightSemi | JoinType::RightAnti => {
+            push_fields(&mut qualified_fields, right, false, funding)?;
+        }
+        JoinType::RightMark => {
+            push_fields(&mut qualified_fields, right, false, funding)?;
+            qualified_fields.push(mark_field(left, funding)?);
+        }
+    }
     let func_dependencies = left.functional_dependencies().join(
         right.functional_dependencies(),
         join_type,
-        left.fields().len(),
-    );
+        left_len,
+        funding,
+    )?;
 
     let (schema1, schema2) = match join_type {
         JoinType::Right
@@ -1838,6 +1848,7 @@ pub fn build_join_schema(
         _ => (right, left),
     };
 
+    // A non-empty metadata map is copied uncharged: its table's size is not measured.
     let metadata = schema1
         .metadata()
         .clone()
@@ -1845,8 +1856,9 @@ pub fn build_join_schema(
         .chain(schema2.metadata().clone())
         .collect();
 
-    let dfschema =
-        DFSchema::new_with_metadata(&qualified_fields, metadata, &Funding::default())?;
+    let dfschema = DFSchema::new_with_metadata(&qualified_fields, metadata, funding)?;
+    // The schema holds its own copy of the fields; their scratch list is freed.
+    funding.released(qualified_fields);
     dfschema.with_functional_dependencies(func_dependencies)
 }
 
@@ -3084,14 +3096,22 @@ mod tests {
             &Funding::default(),
         )?;
 
-        let join_schema =
-            build_join_schema(&left_schema, &right_schema, &JoinType::Left)?;
+        let join_schema = build_join_schema(
+            &left_schema,
+            &right_schema,
+            &JoinType::Left,
+            &Funding::default(),
+        )?;
         assert_eq!(
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "left".to_string())])
         );
-        let join_schema =
-            build_join_schema(&left_schema, &right_schema, &JoinType::Right)?;
+        let join_schema = build_join_schema(
+            &left_schema,
+            &right_schema,
+            &JoinType::Right,
+            &Funding::default(),
+        )?;
         assert_eq!(
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "right".to_string())])
