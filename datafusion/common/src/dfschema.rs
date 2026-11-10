@@ -1420,7 +1420,7 @@ pub fn qualified_name(qualifier: Option<&TableReference>, name: &str) -> String 
 }
 
 /// The bytes of the name [`qualified_name`] makes, yielded without allocating.
-fn qualified_name_bytes<'a>(
+pub(crate) fn qualified_name_bytes<'a>(
     qualifier: Option<&'a TableReference>,
     name: &'a str,
 ) -> impl Iterator<Item = u8> + 'a {

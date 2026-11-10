@@ -23,10 +23,11 @@ use std::ops::Deref;
 use std::vec::IntoIter;
 
 use crate::cloned::CloneBytes;
+use crate::dfschema::qualified_name_bytes;
 use crate::error::Result;
-use crate::funding::Funding;
+use crate::funding::{Funding, Held};
 use crate::utils::{merge_and_order_indices, set_difference};
-use crate::{DFSchema, HashSet, JoinType};
+use crate::{DFSchema, HashSet, JoinType, TableReference};
 
 /// This object defines a constraint on a table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
@@ -601,26 +602,31 @@ pub fn get_required_group_by_exprs_indices(
 }
 
 /// Returns indices for the minimal subset of ORDER BY expressions that are
-/// functionally equivalent to the original set of ORDER BY expressions.
-pub fn get_required_sort_exprs_indices(
+/// functionally equivalent to the original set of ORDER BY expressions, each named as
+/// `sort_expr_names` display. The list and the fields marked on the way are charged to
+/// `funding`; names are compared as they are written, nothing allocated for them.
+pub fn get_required_sort_exprs_indices<N: Display>(
     schema: &DFSchema,
-    sort_expr_names: &[String],
-) -> Vec<usize> {
+    sort_expr_names: impl ExactSizeIterator<Item = N>,
+    funding: &Funding,
+) -> Result<Held<Vec<usize>>> {
     let dependencies = schema.functional_dependencies();
-    let field_names = schema.field_names();
 
-    let mut known_field_indices = HashSet::new();
-    let mut required_sort_expr_indices = Vec::new();
+    let mut known_fields = funding.held::<Vec<bool>>();
+    known_fields.reserve_exact(schema.fields().len())?;
+    // Room for each is charged: filling it allocates nothing.
+    known_fields.resize(schema.fields().len(), false);
+    let mut required_sort_expr_indices = funding.held::<Vec<usize>>();
+    required_sort_expr_indices.reserve_exact(sort_expr_names.len())?;
 
-    for (sort_expr_idx, sort_expr_name) in sort_expr_names.iter().enumerate() {
+    for (sort_expr_idx, sort_expr_name) in sort_expr_names.enumerate() {
         // If the sort expression doesn't correspond to a known schema field
         // (e.g. a computed expression), we can't reason about it via functional
         // dependencies, so conservatively keep it.
-        let Some(field_idx) = field_names
-            .iter()
-            .position(|field_name| field_name == sort_expr_name)
-        else {
-            required_sort_expr_indices.push(sort_expr_idx);
+        let Some(field_idx) = schema.iter().position(|(qualifier, field)| {
+            displays_qualified_name(qualifier, field.name(), &sort_expr_name)
+        }) else {
+            required_sort_expr_indices.push(sort_expr_idx)?;
             continue;
         };
 
@@ -633,18 +639,42 @@ pub fn get_required_sort_exprs_indices(
                 && dependency
                     .source_indices
                     .iter()
-                    .all(|source_idx| known_field_indices.contains(source_idx))
+                    .all(|source_idx| known_fields.get(*source_idx) == Some(&true))
         });
 
         if removable {
             continue;
         }
 
-        known_field_indices.insert(field_idx);
-        required_sort_expr_indices.push(sort_expr_idx);
+        known_fields[field_idx] = true;
+        required_sort_expr_indices.push(sort_expr_idx)?;
     }
 
-    required_sort_expr_indices
+    Ok(required_sort_expr_indices)
+}
+
+/// Whether `value` displays as the [`qualified_name`] of `qualifier` and `name`, compared
+/// as it is written, nothing allocated.
+///
+/// [`qualified_name`]: crate::qualified_name
+fn displays_qualified_name(
+    qualifier: Option<&TableReference>,
+    name: &str,
+    value: &impl Display,
+) -> bool {
+    struct Rest<I>(I);
+    impl<I: Iterator<Item = u8>> std::fmt::Write for Rest<I> {
+        fn write_str(&mut self, part: &str) -> std::fmt::Result {
+            if part.bytes().all(|byte| self.0.next() == Some(byte)) {
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    let mut rest = Rest(qualified_name_bytes(qualifier, name));
+    std::fmt::Write::write_fmt(&mut rest, format_args!("{value}")).is_ok()
+        && rest.0.next().is_none()
 }
 
 /// Updates entries inside the `entries` vector with their corresponding

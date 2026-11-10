@@ -17,15 +17,14 @@
 
 //! [`EliminateDuplicatedExpr`] Removes redundant expressions
 
+use crate::funded::{Freed, HashIndex, deduplicated};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::Transformed;
 use datafusion_common::{Result, get_required_sort_exprs_indices, internal_err};
 use datafusion_expr::logical_plan::LogicalPlan;
 use datafusion_expr::{Aggregate, Expr, Sort, SortExpr};
-use std::hash::{Hash, Hasher};
-
-use indexmap::IndexSet;
 
 /// Optimization rule that eliminate duplicated expr.
 #[derive(Default, Debug)]
@@ -37,19 +36,57 @@ impl EliminateDuplicatedExpr {
         Self {}
     }
 }
-// use this structure to avoid initial clone
-#[derive(Eq, Clone, Debug)]
-struct SortExprWrapper(SortExpr);
-impl PartialEq for SortExprWrapper {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.expr == other.0.expr
-    }
+
+/// `exprs` kept where `keep` holds for their position, in order; each dropped freed and
+/// given back.
+fn retained(
+    funding: &Funding,
+    exprs: &mut Vec<SortExpr>,
+    mut keep: impl FnMut(usize) -> bool,
+) {
+    let mut at = 0;
+    exprs.retain(|sort_expr| {
+        let kept = keep(at);
+        at += 1;
+        if !kept {
+            funding.discharge(sort_expr.freed_bytes());
+        }
+        kept
+    });
 }
-impl Hash for SortExprWrapper {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.expr.hash(state);
+
+/// The sort expressions of `exprs` after the first ordering by the same expression dropped,
+/// and then those the input's functional dependencies make redundant: scratch charged to
+/// `funding` and given back, each dropped expression freed and given back.
+fn deduplicated_sort_exprs(
+    funding: &Funding,
+    sort: &Sort,
+    exprs: &mut Vec<SortExpr>,
+) -> Result<()> {
+    let mut firsts = funding.held::<Vec<bool>>();
+    {
+        let mut keys = funding.held::<Vec<&Expr>>();
+        keys.reserve_exact(exprs.len())?;
+        // Room for each is charged: extending allocates nothing.
+        keys.extend(exprs.iter().map(|sort_expr| &sort_expr.expr));
+        let index = HashIndex::new(funding, &keys)?;
+        firsts.reserve_exact(exprs.len())?;
+        firsts.extend((0..exprs.len()).map(|at| index.is_first(at)));
     }
+    retained(funding, exprs, |at| firsts[at]);
+
+    let required = get_required_sort_exprs_indices(
+        sort.input.schema().as_ref(),
+        exprs.iter().map(|sort_expr| sort_expr.expr.schema_name()),
+        funding,
+    )?;
+    if required.len() < exprs.len() {
+        let mut next = required.iter().peekable();
+        retained(funding, exprs, |at| next.next_if_eq(&&at).is_some());
+    }
+    Ok(())
 }
+
 impl OptimizerRule for EliminateDuplicatedExpr {
     fn apply_order(&self) -> Option<ApplyOrder> {
         Some(ApplyOrder::TopDown)
@@ -62,74 +99,38 @@ impl OptimizerRule for EliminateDuplicatedExpr {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        let funding = config.funding();
         match plan {
-            LogicalPlan::Sort(sort) => {
+            LogicalPlan::Sort(mut sort) => {
                 let len = sort.expr.len();
-                let unique_exprs: Vec<_> = sort
-                    .expr
-                    .into_iter()
-                    .map(SortExprWrapper)
-                    .collect::<IndexSet<_>>()
-                    .into_iter()
-                    .map(|wrapper| wrapper.0)
-                    .collect();
+                let mut exprs = std::mem::take(&mut sort.expr);
+                let deduplicated = deduplicated_sort_exprs(&funding, &sort, &mut exprs);
+                sort.expr = exprs;
+                deduplicated?;
 
-                let sort_expr_names = unique_exprs
-                    .iter()
-                    .map(|sort_expr| sort_expr.expr.schema_name().to_string())
-                    .collect::<Vec<_>>();
-                let required_indices = get_required_sort_exprs_indices(
-                    sort.input.schema().as_ref(),
-                    &sort_expr_names,
-                );
-
-                let unique_exprs = if required_indices.len() < unique_exprs.len() {
-                    required_indices
-                        .into_iter()
-                        .map(|idx| unique_exprs[idx].clone())
-                        .collect()
-                } else {
-                    unique_exprs
-                };
-
-                let transformed = if len != unique_exprs.len() {
-                    Transformed::yes
-                } else {
-                    Transformed::no
-                };
-
-                if unique_exprs.is_empty() {
+                if sort.expr.is_empty() {
                     return internal_err!(
                         "FD pruning unexpectedly removed all ORDER BY expressions"
                     );
                 }
 
-                Ok(transformed(LogicalPlan::Sort(Sort {
-                    expr: unique_exprs,
-                    input: sort.input,
-                    fetch: sort.fetch,
-                })))
-            }
-            LogicalPlan::Aggregate(agg) => {
-                let len = agg.group_expr.len();
-
-                let unique_exprs: Vec<Expr> = agg
-                    .group_expr
-                    .into_iter()
-                    .collect::<IndexSet<_>>()
-                    .into_iter()
-                    .collect();
-
-                let transformed = if len != unique_exprs.len() {
-                    Transformed::yes
+                Ok(if len != sort.expr.len() {
+                    Transformed::yes(LogicalPlan::Sort(sort))
                 } else {
-                    Transformed::no
-                };
+                    Transformed::no(LogicalPlan::Sort(sort))
+                })
+            }
+            LogicalPlan::Aggregate(mut agg) => {
+                let len = agg.group_expr.len();
+                deduplicated(&funding, &mut agg.group_expr)?;
+                if len == agg.group_expr.len() {
+                    return Ok(Transformed::no(LogicalPlan::Aggregate(agg)));
+                }
 
-                Aggregate::try_new(agg.input, unique_exprs, agg.aggr_expr)
-                    .map(|f| transformed(LogicalPlan::Aggregate(f)))
+                Aggregate::try_new(agg.input, agg.group_expr, agg.aggr_expr)
+                    .map(|f| Transformed::yes(LogicalPlan::Aggregate(f)))
             }
             _ => Ok(Transformed::no(plan)),
         }
@@ -145,6 +146,8 @@ mod tests {
     use crate::OptimizerContext;
     use crate::assert_optimized_plan_eq_snapshot;
     use crate::test::*;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::PlanningFunding;
     use datafusion_expr::{col, logical_plan::builder::LogicalPlanBuilder};
     use std::sync::Arc;
 
@@ -199,5 +202,38 @@ mod tests {
           Sort: test.a ASC NULLS FIRST, test.b ASC NULLS LAST
             TableScan: test
         ")
+    }
+
+    /// Funding without a limit.
+    struct Unlimited;
+
+    impl PlanningFunding for Unlimited {
+        fn charge(&self, _bytes: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn eliminated_sort_exprs_are_given_back() -> Result<()> {
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .sort_by(vec![col("a"), col("a"), col("b")])?
+            .build()?;
+        let mut options = ConfigOptions::default();
+        options.funding = Funding::new(Arc::new(Unlimited));
+        // Planned through the same funding.
+        options.funding.charge(plan.freed_bytes())?;
+        let config = OptimizerContext::new_with_config_options(Arc::new(options));
+
+        let sorted = EliminateDuplicatedExpr::new().rewrite(plan, &config)?;
+
+        assert!(sorted.transformed);
+        // The duplicate is given back; the scratch finding it is too.
+        assert_eq!(
+            config.options().funding.outstanding(),
+            sorted.data.freed_bytes()
+        );
+        Ok(())
     }
 }
