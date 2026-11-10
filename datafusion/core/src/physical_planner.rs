@@ -1416,8 +1416,9 @@ impl DefaultPhysicalPlanner {
                         "SortExec requires at least one sort expression"
                     );
                 };
-                let new_sort = SortExec::new(ordering, physical_input).with_fetch(*fetch);
-                Arc::new(new_sort)
+                let new_sort = SortExec::new(ordering, physical_input, funding)?
+                    .with_fetch(*fetch)?;
+                funding.arc(new_sort)?
             }
             // The optimizer's decorrelation passes remove Subquery nodes
             // for supported patterns. This error is hit for correlated
@@ -1450,13 +1451,13 @@ impl DefaultPhysicalPlanner {
                     // Apply a LocalLimitExec to each partition. The optimizer will also insert
                     // a CoalescePartitionsExec between the GlobalLimitExec and LocalLimitExec
                     if let Some(fetch) = fetch {
-                        Arc::new(LocalLimitExec::new(input, fetch + skip))
+                        funding.arc(LocalLimitExec::new(input, fetch + skip, funding)?)?
                     } else {
                         input
                     }
                 };
 
-                Arc::new(GlobalLimitExec::new(input, skip, fetch))
+                funding.arc(GlobalLimitExec::new(input, skip, fetch, funding)?)?
             }
             LogicalPlan::Unnest(Unnest {
                 list_type_columns,

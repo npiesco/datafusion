@@ -482,8 +482,13 @@ async fn run_sort_preserving_merge_peak_memory_with_spilled_input(
     };
 
     let merge = Arc::new(
-        SortPreservingMergeExec::new(LexOrdering::new(sort_exprs).unwrap(), input)
-            .with_round_robin_repartition(round_robin),
+        SortPreservingMergeExec::new(
+            LexOrdering::new(sort_exprs).unwrap(),
+            input,
+            &Funding::default(),
+        )
+        .unwrap()
+        .with_round_robin_repartition(round_robin),
     );
 
     // PeakRecordingPool records peak reserved bytes as a running high-water mark
@@ -614,17 +619,21 @@ async fn run_sort_test_with_limited_memory(
                 },
             )),
         ))));
-    let sort_exec = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr {
-            expr: col("col_0", &scan_schema).unwrap(),
-            options: SortOptions {
-                descending: false,
-                nulls_first: true,
-            },
-        }])
+    let sort_exec = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr {
+                expr: col("col_0", &scan_schema).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            }])
+            .unwrap(),
+            plan,
+            &Funding::default(),
+        )
         .unwrap(),
-        plan,
-    ));
+    );
 
     let result = sort_exec.execute(0, Arc::clone(&args.task_ctx))?;
 

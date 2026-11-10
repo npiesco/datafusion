@@ -82,6 +82,7 @@ use datafusion::{
     },
     prelude::SessionContext,
 };
+use datafusion_common::funding::Funding;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_physical_expr::{PhysicalSortExpr, expressions::col};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -274,7 +275,9 @@ impl BenchCase {
         let sort = make_sort_exprs(schema.as_ref());
 
         let exec = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
-        let plan = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let plan = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         Self {
             runtime,
@@ -295,8 +298,14 @@ impl BenchCase {
         let sort = make_sort_exprs(schema.as_ref());
 
         let source = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
-        let exec = SortExec::new(sort.clone(), source).with_preserve_partitioning(true);
-        let plan = Arc::new(SortPreservingMergeExec::new(sort, Arc::new(exec)));
+        let exec = SortExec::new(sort.clone(), source, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap();
+        let plan = Arc::new(
+            SortPreservingMergeExec::new(sort, Arc::new(exec), &Funding::default())
+                .unwrap(),
+        );
 
         Self {
             runtime,
@@ -318,8 +327,9 @@ impl BenchCase {
         let sort = make_sort_exprs(schema.as_ref());
 
         let exec = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
-        let exec = Arc::new(CoalescePartitionsExec::new(exec));
-        let plan = Arc::new(SortExec::new(sort, exec));
+        let exec =
+            Arc::new(CoalescePartitionsExec::new(exec, &Funding::default()).unwrap());
+        let plan = Arc::new(SortExec::new(sort, exec, &Funding::default()).unwrap());
 
         Self {
             runtime,
@@ -341,8 +351,13 @@ impl BenchCase {
         let sort = make_sort_exprs(schema.as_ref());
 
         let source = MemorySourceConfig::try_new_exec(partitions, schema, None).unwrap();
-        let exec = SortExec::new(sort, source).with_preserve_partitioning(true);
-        let plan = Arc::new(CoalescePartitionsExec::new(Arc::new(exec)));
+        let exec = SortExec::new(sort, source, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap();
+        let plan = Arc::new(
+            CoalescePartitionsExec::new(Arc::new(exec), &Funding::default()).unwrap(),
+        );
 
         Self {
             runtime,

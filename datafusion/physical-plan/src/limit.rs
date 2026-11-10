@@ -35,6 +35,7 @@ use crate::{
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
@@ -59,20 +60,33 @@ pub struct GlobalLimitExec {
     /// which rows are returned.
     required_ordering: Option<LexOrdering>,
     cache: Arc<PlanProperties>,
+    funding: Funding,
 }
 
 impl GlobalLimitExec {
-    /// Create a new GlobalLimitExec
-    pub fn new(input: Arc<dyn ExecutionPlan>, skip: usize, fetch: Option<usize>) -> Self {
-        let cache = Self::compute_properties(&input);
-        GlobalLimitExec {
+    /// Create a new GlobalLimitExec, charging what it allocates to `funding`
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        skip: usize,
+        fetch: Option<usize>,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let cache = funding.arc(Self::compute_properties(&input))?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(GlobalLimitExec {
             input,
             skip,
             fetch,
             metrics: ExecutionPlanMetricsSet::new(),
             required_ordering: None,
-            cache: Arc::new(cache),
-        }
+            cache,
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Input execution plan
@@ -182,16 +196,23 @@ impl ExecutionPlan for GlobalLimitExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
+            }
             ChildrenPropertiesMode::Recompute => {
-                let mut new_limit =
-                    GlobalLimitExec::new(children.swap_remove(0), self.skip, self.fetch);
+                let mut new_limit = GlobalLimitExec::new(
+                    children.swap_remove(0),
+                    self.skip,
+                    self.fetch,
+                    &self.funding,
+                )?;
                 new_limit.set_required_ordering(self.required_ordering.clone());
-                Ok(Arc::new(new_limit))
+                Ok(self.funding.arc(new_limit)?)
             }
         }
     }
@@ -328,7 +349,8 @@ impl GlobalLimitExec {
             &limit.required_ordering,
             &ctx.expr_ctx(input.schema().as_ref()),
         )?;
-        let mut exec = GlobalLimitExec::new(input, limit.skip as usize, fetch);
+        let mut exec =
+            GlobalLimitExec::new(input, limit.skip as usize, fetch, &Funding::default())?;
         exec.set_required_ordering(required_ordering);
         Ok(Arc::new(exec))
     }
@@ -347,19 +369,31 @@ pub struct LocalLimitExec {
     /// which rows are returned.
     required_ordering: Option<LexOrdering>,
     cache: Arc<PlanProperties>,
+    funding: Funding,
 }
 
 impl LocalLimitExec {
-    /// Create a new LocalLimitExec partition
-    pub fn new(input: Arc<dyn ExecutionPlan>, fetch: usize) -> Self {
-        let cache = Self::compute_properties(&input);
-        Self {
+    /// Create a new LocalLimitExec partition, charging what it allocates to `funding`
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        fetch: usize,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let cache = funding.arc(Self::compute_properties(&input))?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(Self {
             input,
             fetch,
             metrics: ExecutionPlanMetricsSet::new(),
             required_ordering: None,
-            cache: Arc::new(cache),
-        }
+            cache,
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Input execution plan
@@ -447,16 +481,22 @@ impl ExecutionPlan for LocalLimitExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
+            }
             ChildrenPropertiesMode::Recompute => {
-                let mut new_limit =
-                    LocalLimitExec::new(children.swap_remove(0), self.fetch);
+                let mut new_limit = LocalLimitExec::new(
+                    children.swap_remove(0),
+                    self.fetch,
+                    &self.funding,
+                )?;
                 new_limit.set_required_ordering(self.required_ordering.clone());
-                Ok(Arc::new(new_limit))
+                Ok(self.funding.arc(new_limit)?)
             }
         }
     }
@@ -576,7 +616,8 @@ impl LocalLimitExec {
             &limit.required_ordering,
             &ctx.expr_ctx(input.schema().as_ref()),
         )?;
-        let mut exec = LocalLimitExec::new(input, limit.fetch as usize);
+        let mut exec =
+            LocalLimitExec::new(input, limit.fetch as usize, &Funding::default())?;
         exec.set_required_ordering(required_ordering);
         Ok(Arc::new(exec))
     }
@@ -714,7 +755,6 @@ mod tests {
     use crate::common::collect;
     use crate::statistics::{StatisticsArgs, StatisticsContext};
     use crate::test;
-    use datafusion_common::funding::Funding;
 
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use arrow::array::RecordBatchOptions;
@@ -734,8 +774,13 @@ mod tests {
         // Input should have 4 partitions
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let limit =
-            GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(csv)), 0, Some(7));
+        let limit = GlobalLimitExec::new(
+            Arc::new(CoalescePartitionsExec::new(csv, &Funding::default()).unwrap()),
+            0,
+            Some(7),
+            &Funding::default(),
+        )
+        .unwrap();
 
         // The result should contain 4 batches (one per input partition)
         let iter = limit.execute(0, task_ctx)?;
@@ -850,8 +895,13 @@ mod tests {
 
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let offset =
-            GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(csv)), skip, fetch);
+        let offset = GlobalLimitExec::new(
+            Arc::new(CoalescePartitionsExec::new(csv, &Funding::default()).unwrap()),
+            skip,
+            fetch,
+            &Funding::default(),
+        )
+        .unwrap();
 
         // The result should contain 4 batches (one per input partition)
         let iter = offset.execute(0, task_ctx)?;
@@ -924,7 +974,9 @@ mod tests {
             },
         }]);
 
-        let mut global = GlobalLimitExec::new(Arc::clone(&source), 0, Some(10));
+        let mut global =
+            GlobalLimitExec::new(Arc::clone(&source), 0, Some(10), &Funding::default())
+                .unwrap();
         global.set_required_ordering(ordering.clone());
         let rebuilt = Arc::new(global).replace_children(
             vec![test::scan_partitioned(1)],
@@ -933,7 +985,7 @@ mod tests {
         let rebuilt = rebuilt.downcast_ref::<GlobalLimitExec>().unwrap();
         assert_eq!(rebuilt.required_ordering(), &ordering);
 
-        let mut local = LocalLimitExec::new(source, 10);
+        let mut local = LocalLimitExec::new(source, 10, &Funding::default()).unwrap();
         local.set_required_ordering(ordering.clone());
         let rebuilt = Arc::new(local).replace_children(
             vec![test::scan_partitioned(1)],
@@ -1020,8 +1072,13 @@ mod tests {
 
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let offset =
-            GlobalLimitExec::new(Arc::new(CoalescePartitionsExec::new(csv)), skip, fetch);
+        let offset = GlobalLimitExec::new(
+            Arc::new(CoalescePartitionsExec::new(csv, &Funding::default()).unwrap()),
+            skip,
+            fetch,
+            &Funding::default(),
+        )
+        .unwrap();
 
         Ok(StatisticsContext::new()
             .compute(&offset, &StatisticsArgs::new())?
@@ -1061,10 +1118,12 @@ mod tests {
         let agg_exec: Arc<dyn ExecutionPlan> = Arc::new(agg);
 
         let offset = GlobalLimitExec::new(
-            Arc::new(CoalescePartitionsExec::new(agg_exec)),
+            Arc::new(CoalescePartitionsExec::new(agg_exec, &Funding::default()).unwrap()),
             skip,
             fetch,
-        );
+            &Funding::default(),
+        )
+        .unwrap();
 
         Ok(StatisticsContext::new()
             .compute(&offset, &StatisticsArgs::new())?
@@ -1079,7 +1138,7 @@ mod tests {
 
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let offset = LocalLimitExec::new(csv, fetch);
+        let offset = LocalLimitExec::new(csv, fetch, &Funding::default()).unwrap();
 
         Ok(StatisticsContext::new()
             .compute(&offset, &StatisticsArgs::new())?

@@ -145,7 +145,7 @@ impl ExecutionPlan for BenchLeaf {
 fn build_coalesce_chain(depth: usize) -> Arc<dyn ExecutionPlan> {
     let mut plan: Arc<dyn ExecutionPlan> = Arc::new(BenchLeaf::new("a"));
     for _ in 0..depth {
-        plan = Arc::new(CoalescePartitionsExec::new(plan));
+        plan = Arc::new(CoalescePartitionsExec::new(plan, &Funding::default()).unwrap());
     }
     plan
 }
@@ -196,7 +196,7 @@ fn build_mixed_chain(groups: usize) -> Arc<dyn ExecutionPlan> {
             );
         }
         // One partition-merging coalesce
-        plan = Arc::new(CoalescePartitionsExec::new(plan));
+        plan = Arc::new(CoalescePartitionsExec::new(plan, &Funding::default()).unwrap());
     }
     plan
 }

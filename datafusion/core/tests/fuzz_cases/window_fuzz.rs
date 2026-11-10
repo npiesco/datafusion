@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, StringArray};
@@ -646,7 +647,8 @@ async fn run_window_test(
     // Table is ordered according to ORDER BY a, b, c In linear test we use PARTITION BY b, ORDER BY a
     // For WindowAggExec  to produce correct result it need table to be ordered by b,a. Hence add a sort.
     if is_linear && let Some(ordering) = LexOrdering::new(sort_keys) {
-        exec1 = Arc::new(SortExec::new(ordering, exec1)) as _;
+        exec1 =
+            Arc::new(SortExec::new(ordering, exec1, &Funding::default()).unwrap()) as _;
     }
 
     let extended_schema = schema_add_window_field(&args, &schema, &window_fn, &fn_name)?;

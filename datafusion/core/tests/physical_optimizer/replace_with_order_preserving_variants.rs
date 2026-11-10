@@ -1212,8 +1212,13 @@ fn test_plan_with_order_preserving_variants_preserves_fetch() -> Result<()> {
                 vec![],
             )],
         );
-        let res =
-            plan_with_order_preserving_variants(requirements, false, true, sort_fetch)?;
+        let res = plan_with_order_preserving_variants(
+            requirements,
+            false,
+            true,
+            sort_fetch,
+            &Funding::default(),
+        )?;
         assert!(Arc::ptr_eq(&res.plan, &coalesced));
         assert_eq!(res.plan.fetch(), Some(10));
     }
@@ -1239,7 +1244,7 @@ fn test_plan_with_order_breaking_variants_preserves_fetch() -> Result<()> {
             vec![],
         )],
     );
-    let res = plan_with_order_breaking_variants(requirements)?;
+    let res = plan_with_order_breaking_variants(requirements, &Funding::default())?;
     assert_eq!(res.plan.fetch(), Some(10));
     Ok(())
 }

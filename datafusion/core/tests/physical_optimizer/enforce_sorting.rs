@@ -142,7 +142,7 @@ impl EnforceSortingTest {
             let plan_requirements =
                 PlanWithCorrespondingSort::new_default(Arc::clone(&self.plan));
             let adjusted = plan_requirements
-                .transform_up(ensure_sorting)
+                .transform_up(|ctx| ensure_sorting(ctx, &config.funding))
                 .data()
                 .and_then(check_integrity)
                 .expect("check_integrity failed after ensure_sorting");
@@ -152,7 +152,7 @@ impl EnforceSortingTest {
                 let plan_with_coalesce_partitions =
                     PlanWithCorrespondingCoalescePartitions::new_default(adjusted.plan);
                 let parallel = plan_with_coalesce_partitions
-                    .transform_up(parallelize_sorts)
+                    .transform_up(|ctx| parallelize_sorts(ctx, &config.funding))
                     .data()
                     .and_then(check_integrity)
                     .expect("check_integrity failed after parallelize_sorts");
@@ -183,7 +183,8 @@ impl EnforceSortingTest {
             let mut sort_pushdown = SortPushDown::new_default(updated_plan.plan);
             assign_initial_requirements(&mut sort_pushdown);
             check_integrity(
-                pushdown_sorts(sort_pushdown).expect("pushdown_sorts failed"),
+                pushdown_sorts(sort_pushdown, &config.funding)
+                    .expect("pushdown_sorts failed"),
             )
             .expect("check_integrity failed after pushdown_sorts");
             // TODO: End state payloads will be checked here.
@@ -1302,7 +1303,9 @@ async fn test_window_multi_path_sort2() -> Result<()> {
     let sort1 = sort_exec(ordering1.clone(), source1);
     let sort2 = sort_exec(ordering1.clone(), source2);
     let union = union_exec(vec![sort1, sort2]);
-    let spm = Arc::new(SortPreservingMergeExec::new(ordering1, union)) as _;
+    let spm = Arc::new(
+        SortPreservingMergeExec::new(ordering1, union, &Funding::default()).unwrap(),
+    ) as _;
     let physical_plan = bounded_window_exec("nullable_col", ordering2, spm);
 
     // The `WindowAggExec` can get its required sorting from the leaf nodes directly.
@@ -2091,8 +2094,10 @@ async fn test_remove_unnecessary_sort3() -> Result<()> {
     ]
     .into();
     let sort2 = Arc::new(
-        SortExec::new(ordering2.clone(), repartition_exec)
-            .with_preserve_partitioning(true),
+        SortExec::new(ordering2.clone(), repartition_exec, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
     ) as _;
     let spm2 = sort_preserving_merge_exec(ordering2, sort2);
     let physical_plan = aggregate_exec(spm2);
@@ -2127,9 +2132,12 @@ async fn test_remove_unnecessary_sort4() -> Result<()> {
     let source2 = repartition_exec(memory_exec(&schema));
     let union = union_exec(vec![source1, source2]);
     let ordering: LexOrdering = [sort_expr("non_nullable_col", &schema)].into();
-    let sort =
-        Arc::new(SortExec::new(ordering.clone(), union).with_preserve_partitioning(true))
-            as _;
+    let sort = Arc::new(
+        SortExec::new(ordering.clone(), union, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
+    ) as _;
     let spm = sort_preserving_merge_exec(ordering, sort);
     let filter = filter_exec(
         Arc::new(NotExpr::new(col("non_nullable_col", schema.as_ref())?)),
@@ -2244,7 +2252,7 @@ async fn test_remove_unnecessary_sort8() -> Result<()> {
     let schema = create_test_schema()?;
     let source = memory_exec(&schema);
     let input = sort_exec([sort_expr("non_nullable_col", &schema)].into(), source);
-    let limit = Arc::new(LocalLimitExec::new(input, 2));
+    let limit = Arc::new(LocalLimitExec::new(input, 2, &Funding::default()).unwrap());
     let physical_plan = sort_exec(
         [
             sort_expr("non_nullable_col", &schema),
@@ -2277,7 +2285,9 @@ async fn test_do_not_pushdown_through_limit() -> Result<()> {
     let schema = create_test_schema()?;
     let source = memory_exec(&schema);
     let input = sort_exec([sort_expr("non_nullable_col", &schema)].into(), source);
-    let limit = Arc::new(GlobalLimitExec::new(input, 0, Some(5))) as _;
+    let limit =
+        Arc::new(GlobalLimitExec::new(input, 0, Some(5), &Funding::default()).unwrap())
+            as _;
     let physical_plan = sort_exec([sort_expr("nullable_col", &schema)].into(), limit);
 
     let test =
@@ -2362,7 +2372,7 @@ fn test_spm_fetch_preserves_ordering_through_child_rewrite() -> Result<()> {
     let plan = sort_preserving_merge_exec_with_fetch(ordering.clone(), projection, 100);
 
     let optimized = PlanWithCorrespondingSort::new_default(plan)
-        .transform_up(ensure_sorting)?
+        .transform_up(|ctx| ensure_sorting(ctx, &Funding::default()))?
         .data;
     let optimized = check_integrity(optimized)?.plan;
     let limit = optimized
@@ -2533,7 +2543,10 @@ async fn test_coalesce_propagate() -> Result<()> {
     let ordering: LexOrdering = [sort_expr("nullable_col", &schema)].into();
     // Add local sort
     let sort = Arc::new(
-        SortExec::new(ordering.clone(), repartition).with_preserve_partitioning(true),
+        SortExec::new(ordering.clone(), repartition, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
     ) as _;
     let spm = sort_preserving_merge_exec(ordering.clone(), sort);
     let sort = sort_exec(ordering, spm);
@@ -2813,7 +2826,7 @@ fn test_parallelize_sort_preserves_fetch() -> Result<()> {
         )],
     );
 
-    let res = parallelize_sorts(requirements)?;
+    let res = parallelize_sorts(requirements, &Funding::default())?;
 
     // Verify fetch was preserved
     assert_eq!(
@@ -3040,9 +3053,12 @@ fn reorder_projection_physical_plan() -> Result<Arc<dyn ExecutionPlan>> {
     )]
     .into();
     let inner_sort = Arc::new(
-        SortExec::new(inner_ordering, repartitioned)
+        SortExec::new(inner_ordering, repartitioned, &Funding::default())
+            .unwrap()
             .with_fetch(Some(1000))
-            .with_preserve_partitioning(true),
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
     );
 
     // Lower projection: compute `score` (= c + d) as the last column. Output

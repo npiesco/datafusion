@@ -175,10 +175,11 @@ impl TopKAggregation {
             Ok(Transformed::no(plan))
         };
         let child = Arc::clone(child).transform_down(closure).data()?;
-        let sort = SortExec::new(sort.expr().clone(), child)
-            .with_fetch(sort.fetch())
-            .with_preserve_partitioning(sort.preserve_partitioning());
-        Ok(Some(Arc::new(sort)))
+        let funding = sort.funding();
+        let new_sort = SortExec::new(sort.expr().clone(), child, funding)?
+            .with_fetch(sort.fetch())?
+            .with_preserve_partitioning(sort.preserve_partitioning())?;
+        Ok(Some(funding.arc(new_sort)?))
     }
 }
 

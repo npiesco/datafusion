@@ -40,6 +40,7 @@ use crate::{
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
@@ -56,18 +57,26 @@ pub struct CoalescePartitionsExec {
     cache: Arc<PlanProperties>,
     /// Optional number of rows to fetch. Stops producing rows after this fetch
     pub(crate) fetch: Option<usize>,
+    funding: Funding,
 }
 
 impl CoalescePartitionsExec {
-    /// Create a new CoalescePartitionsExec
-    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        let cache = Self::compute_properties(&input);
-        CoalescePartitionsExec {
+    /// Create a new CoalescePartitionsExec, charging what it allocates to `funding`
+    pub fn new(input: Arc<dyn ExecutionPlan>, funding: &Funding) -> Result<Self> {
+        let cache = funding.arc(Self::compute_properties(&input))?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(CoalescePartitionsExec {
             input,
             metrics: ExecutionPlanMetricsSet::new(),
-            cache: Arc::new(cache),
+            cache,
             fetch: None,
-        }
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Update fetch with the argument
@@ -163,15 +172,19 @@ impl ExecutionPlan for CoalescePartitionsExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
+            }
             ChildrenPropertiesMode::Recompute => {
-                let mut plan = CoalescePartitionsExec::new(children.swap_remove(0));
+                let mut plan =
+                    CoalescePartitionsExec::new(children.swap_remove(0), &self.funding)?;
                 plan.fetch = self.fetch;
-                Ok(Arc::new(plan))
+                Ok(self.funding.arc(plan)?)
             }
         }
     }
@@ -297,15 +310,10 @@ impl ExecutionPlan for CoalescePartitionsExec {
             return Ok(None);
         }
         // CoalescePartitionsExec always has a single child, so zero indexing is safe.
-        make_with_child(projection, projection.input().children()[0]).map(|e| {
-            if self.fetch.is_some() {
-                let mut plan = CoalescePartitionsExec::new(e);
-                plan.fetch = self.fetch;
-                Some(Arc::new(plan) as _)
-            } else {
-                Some(Arc::new(CoalescePartitionsExec::new(e)) as _)
-            }
-        })
+        let e = make_with_child(projection, projection.input().children()[0])?;
+        let mut plan = CoalescePartitionsExec::new(e, &self.funding)?;
+        plan.fetch = self.fetch;
+        Ok(Some(self.funding.arc(plan)? as _))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -313,12 +321,16 @@ impl ExecutionPlan for CoalescePartitionsExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(CoalescePartitionsExec {
-            input: Arc::clone(&self.input),
-            fetch: limit,
-            metrics: self.metrics.clone(),
-            cache: Arc::clone(&self.cache),
-        }))
+        self.funding
+            .arc(CoalescePartitionsExec {
+                input: Arc::clone(&self.input),
+                fetch: limit,
+                metrics: self.metrics.clone(),
+                cache: Arc::clone(&self.cache),
+                funding: self.funding.clone(),
+            })
+            .ok()
+            .map(|plan| plan as _)
     }
 
     fn with_preserve_order(
@@ -328,8 +340,9 @@ impl ExecutionPlan for CoalescePartitionsExec {
         self.input
             .with_preserve_order(preserve_order)
             .and_then(|new_input| {
-                replace_children_if_necessary(Arc::new(self.clone()), vec![new_input])
-                    .ok()
+                let this = self.funding.arc(self.clone()).ok()?;
+                let children = self.funding.vec_of([new_input]).ok()?;
+                replace_children_if_necessary(this, children).ok()
             })
     }
 
@@ -362,11 +375,9 @@ impl ExecutionPlan for CoalescePartitionsExec {
 
         result
             .try_map(|new_input| {
-                Ok(
-                    Arc::new(
-                        CoalescePartitionsExec::new(new_input).with_fetch(self.fetch),
-                    ) as Arc<dyn ExecutionPlan>,
-                )
+                let plan = CoalescePartitionsExec::new(new_input, &self.funding)?
+                    .with_fetch(self.fetch);
+                Ok(self.funding.arc(plan)? as Arc<dyn ExecutionPlan>)
             })
             .map(|r| {
                 if has_multiple_partitions {
@@ -423,7 +434,7 @@ impl CoalescePartitionsExec {
             "input",
         )?;
         Ok(Arc::new(
-            CoalescePartitionsExec::new(input)
+            CoalescePartitionsExec::new(input, &Funding::default())?
                 .with_fetch(merge.fetch.map(|f| f as usize)),
         ))
     }
@@ -455,7 +466,7 @@ mod tests {
         // input should have 4 partitions
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 
-        let merge = CoalescePartitionsExec::new(csv);
+        let merge = CoalescePartitionsExec::new(csv, &Funding::default()).unwrap();
 
         // output of CoalescePartitionsExec should have a single partition
         assert_eq!(
@@ -491,7 +502,8 @@ mod tests {
         let refs = Arc::downgrade(&input);
 
         let input_plan: Arc<BarrierExec> = Arc::clone(&input);
-        let coalesce = CoalescePartitionsExec::new(input_plan);
+        let coalesce =
+            CoalescePartitionsExec::new(input_plan, &Funding::default()).unwrap();
         let stream = coalesce.execute(0, task_ctx)?;
         drop(coalesce);
 
@@ -522,8 +534,9 @@ mod tests {
 
         let blocking_exec = Arc::new(BlockingExec::new(Arc::clone(&schema), 2));
         let refs = blocking_exec.refs();
-        let coalesce_partitions_exec =
-            Arc::new(CoalescePartitionsExec::new(blocking_exec));
+        let coalesce_partitions_exec = Arc::new(
+            CoalescePartitionsExec::new(blocking_exec, &Funding::default()).unwrap(),
+        );
 
         let fut = collect(coalesce_partitions_exec, task_ctx);
         let mut fut = fut.boxed();
@@ -543,8 +556,9 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, true)]));
 
         let panicking_exec = Arc::new(PanicExec::new(Arc::clone(&schema), 2));
-        let coalesce_partitions_exec =
-            Arc::new(CoalescePartitionsExec::new(panicking_exec));
+        let coalesce_partitions_exec = Arc::new(
+            CoalescePartitionsExec::new(panicking_exec, &Funding::default()).unwrap(),
+        );
 
         collect(coalesce_partitions_exec, task_ctx).await.unwrap();
     }
@@ -557,7 +571,9 @@ mod tests {
         let input = test::scan_partitioned(1);
 
         // Test with fetch=3
-        let coalesce = CoalescePartitionsExec::new(input).with_fetch(Some(3));
+        let coalesce = CoalescePartitionsExec::new(input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(3));
 
         let stream = coalesce.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
@@ -577,7 +593,9 @@ mod tests {
         let input = test::scan_partitioned(4);
 
         // Test with fetch=1 (the original bug: was returning multiple rows instead of 1)
-        let coalesce = CoalescePartitionsExec::new(input).with_fetch(Some(1));
+        let coalesce = CoalescePartitionsExec::new(input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(1));
 
         let stream = coalesce.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
@@ -599,7 +617,7 @@ mod tests {
         let input = test::scan_partitioned(1);
 
         // Test without fetch (should return all rows)
-        let coalesce = CoalescePartitionsExec::new(input);
+        let coalesce = CoalescePartitionsExec::new(input, &Funding::default()).unwrap();
 
         let stream = coalesce.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
@@ -621,7 +639,9 @@ mod tests {
         let input = test::scan_partitioned(1);
 
         // Test with fetch larger than available rows
-        let coalesce = CoalescePartitionsExec::new(input).with_fetch(Some(200));
+        let coalesce = CoalescePartitionsExec::new(input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(200));
 
         let stream = coalesce.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
@@ -644,7 +664,9 @@ mod tests {
         let csv = test::scan_partitioned(num_partitions);
 
         // Test with fetch=400 (exactly all rows)
-        let coalesce = CoalescePartitionsExec::new(csv).with_fetch(Some(400));
+        let coalesce = CoalescePartitionsExec::new(csv, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(400));
 
         let stream = coalesce.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;

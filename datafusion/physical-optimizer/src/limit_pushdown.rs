@@ -67,6 +67,7 @@ use crate::PhysicalOptimizerRule;
 
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion_common::utils::combine_limit;
@@ -111,7 +112,7 @@ impl PhysicalOptimizerRule for LimitPushdown {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let global_state = GlobalRequirements {
             fetch: None,
@@ -119,7 +120,7 @@ impl PhysicalOptimizerRule for LimitPushdown {
             satisfied: false,
             preserve_order: false,
         };
-        pushdown_limits(plan, global_state)
+        pushdown_limits(plan, global_state, &config.funding)
     }
 
     fn name(&self) -> &str {
@@ -148,6 +149,7 @@ struct LimitInfo {
 pub fn pushdown_limit_helper(
     mut pushdown_plan: Arc<dyn ExecutionPlan>,
     mut global_state: GlobalRequirements,
+    funding: &Funding,
 ) -> Result<(Transformed<Arc<dyn ExecutionPlan>>, GlobalRequirements)> {
     // Extract limit, if exist, and return child inputs.
     if let Some(limit_info) = extract_limit(&pushdown_plan) {
@@ -220,7 +222,8 @@ pub fn pushdown_limit_helper(
                     pushdown_plan,
                     global_state.skip,
                     None,
-                )),
+                    funding,
+                )?),
                 global_state,
             ))
         } else {
@@ -244,8 +247,12 @@ pub fn pushdown_limit_helper(
             // Execution plans can't (yet) handle skip, so if we have one,
             // we still need to add a global limit
             if global_state.skip > 0 {
-                new_plan =
-                    add_global_limit(new_plan, global_state.skip, global_state.fetch);
+                new_plan = add_global_limit(
+                    new_plan,
+                    global_state.skip,
+                    global_state.fetch,
+                    funding,
+                )?;
             }
             global_state.fetch = skip_and_fetch;
             global_state.skip = 0;
@@ -261,7 +268,8 @@ pub fn pushdown_limit_helper(
                     pushdown_plan,
                     global_state.skip,
                     global_fetch,
-                )),
+                    funding,
+                )?),
                 global_state,
             ))
         }
@@ -297,12 +305,13 @@ pub fn pushdown_limit_helper(
                         plan_with_preserve_order,
                         global_skip,
                         Some(global_fetch),
-                    )
+                        funding,
+                    )?
                 } else {
                     plan_with_preserve_order
                 }
             } else {
-                add_limit(pushdown_plan, global_skip, global_fetch)
+                add_limit(pushdown_plan, global_skip, global_fetch, funding)?
             };
             Ok((Transformed::yes(pushdown_plan), global_state))
         }
@@ -368,15 +377,17 @@ fn limit_eliminable_exact_num_rows(
 pub(crate) fn pushdown_limits(
     pushdown_plan: Arc<dyn ExecutionPlan>,
     global_state: GlobalRequirements,
+    funding: &Funding,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     // Call pushdown_limit_helper.
     // This will either extract the limit node (returning the child), or apply the limit pushdown.
     let (mut new_node, mut global_state) =
-        pushdown_limit_helper(pushdown_plan, global_state)?;
+        pushdown_limit_helper(pushdown_plan, global_state, funding)?;
 
     // While limits exist, continue combining the global_state.
     while new_node.tnr == TreeNodeRecursion::Stop {
-        (new_node, global_state) = pushdown_limit_helper(new_node.data, global_state)?;
+        (new_node, global_state) =
+            pushdown_limit_helper(new_node.data, global_state, funding)?;
     }
 
     // Once a limit has been materialized above the current node, child
@@ -396,6 +407,7 @@ pub(crate) fn pushdown_limits(
             let new_child = pushdown_limits(
                 Arc::<dyn ExecutionPlan>::clone(child),
                 global_state.clone(),
+                funding,
             )?;
             // Tracking if any of the children changed
             changed |= !Arc::ptr_eq(child, &new_child);
@@ -442,11 +454,12 @@ fn add_limit(
     pushdown_plan: Arc<dyn ExecutionPlan>,
     skip: usize,
     fetch: usize,
-) -> Arc<dyn ExecutionPlan> {
+    funding: &Funding,
+) -> Result<Arc<dyn ExecutionPlan>> {
     if skip > 0 || pushdown_plan.output_partitioning().partition_count() == 1 {
-        add_global_limit(pushdown_plan, skip, Some(fetch))
+        add_global_limit(pushdown_plan, skip, Some(fetch), funding)
     } else {
-        Arc::new(LocalLimitExec::new(pushdown_plan, fetch + skip)) as _
+        Ok(funding.arc(LocalLimitExec::new(pushdown_plan, fetch + skip, funding)?)? as _)
     }
 }
 
@@ -455,8 +468,9 @@ fn add_global_limit(
     pushdown_plan: Arc<dyn ExecutionPlan>,
     skip: usize,
     fetch: Option<usize>,
-) -> Arc<dyn ExecutionPlan> {
-    Arc::new(GlobalLimitExec::new(pushdown_plan, skip, fetch)) as _
+    funding: &Funding,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    Ok(funding.arc(GlobalLimitExec::new(pushdown_plan, skip, fetch, funding)?)? as _)
 }
 
 // See tests in datafusion/core/tests/physical_optimizer

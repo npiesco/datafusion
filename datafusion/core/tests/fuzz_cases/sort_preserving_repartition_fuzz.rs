@@ -17,6 +17,7 @@
 
 #[cfg(test)]
 mod sp_repartition_fuzz_tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, Int64Array, RecordBatch, UInt64Array};
@@ -425,7 +426,9 @@ mod sp_repartition_fuzz_tests {
         sort_exprs: LexOrdering,
         input: Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
-        Arc::new(SortPreservingMergeExec::new(sort_exprs, input))
+        Arc::new(
+            SortPreservingMergeExec::new(sort_exprs, input, &Funding::default()).unwrap(),
+        )
     }
 
     /// Return randomly sized record batches with:

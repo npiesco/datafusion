@@ -617,11 +617,15 @@ fn filter_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
 }
 
 fn limit_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(GlobalLimitExec::new(
-        Arc::new(LocalLimitExec::new(input, 100)),
-        0,
-        Some(100),
-    ))
+    Arc::new(
+        GlobalLimitExec::new(
+            Arc::new(LocalLimitExec::new(input, 100, &Funding::default()).unwrap()),
+            0,
+            Some(100),
+            &Funding::default(),
+        )
+        .unwrap(),
+    )
 }
 
 fn sort_required_exec_with_req(
@@ -2485,8 +2489,9 @@ fn merge_does_not_need_sort() -> Result<()> {
     let exec = parquet_exec_multiple_sorted(vec![sort_key.clone()]);
 
     // Merge from multiple parquet files and keep the data sorted
-    let exec: Arc<dyn ExecutionPlan> =
-        Arc::new(SortPreservingMergeExec::new(sort_key, exec));
+    let exec: Arc<dyn ExecutionPlan> = Arc::new(
+        SortPreservingMergeExec::new(sort_key, exec, &Funding::default()).unwrap(),
+    );
 
     // Test: run EnforceDistribution, then EnforceSort.
     //
@@ -4447,8 +4452,13 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
 
     // Create a SortPreservingMergeExec with fetch=5
     let spm_exec = Arc::new(
-        SortPreservingMergeExec::new([sort_expr].into(), parquet_exec.clone())
-            .with_fetch(Some(5)),
+        SortPreservingMergeExec::new(
+            [sort_expr].into(),
+            parquet_exec.clone(),
+            &Funding::default(),
+        )
+        .unwrap()
+        .with_fetch(Some(5)),
     );
 
     // Create distribution context
@@ -4459,7 +4469,7 @@ fn test_replace_order_preserving_variants_with_fetch() -> Result<()> {
     );
 
     // Apply the function
-    let result = replace_order_preserving_variants(dist_context)?;
+    let result = replace_order_preserving_variants(dist_context, &Funding::default())?;
 
     // A fetched ordered merge must still select the TopK rows.
     let result = check_integrity(result)?;
@@ -4484,8 +4494,11 @@ fn preserve_fetch_when_reoptimizing_ordered_merge() -> Result<()> {
     let sort_key: LexOrdering =
         [PhysicalSortExpr::new_default(col("c", &schema)?)].into();
     let input = parquet_exec_multiple_sorted(vec![sort_key.clone()]);
-    let plan: Arc<dyn ExecutionPlan> =
-        Arc::new(SortPreservingMergeExec::new(sort_key, input).with_fetch(Some(5)));
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        SortPreservingMergeExec::new(sort_key, input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5)),
+    );
 
     let optimized =
         EnsureRequirements::new().optimize(plan, &test_suite_default_config_options())?;
@@ -4502,8 +4515,11 @@ fn preserve_fetch_when_reoptimizing_ordered_merge() -> Result<()> {
 #[test]
 fn preserve_fetch_when_reoptimizing_coalesce_partitions() -> Result<()> {
     let input = parquet_exec_multiple();
-    let plan: Arc<dyn ExecutionPlan> =
-        Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(5)));
+    let plan: Arc<dyn ExecutionPlan> = Arc::new(
+        CoalescePartitionsExec::new(input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5)),
+    );
 
     let optimized =
         EnsureRequirements::new().optimize(plan, &test_suite_default_config_options())?;
@@ -4538,7 +4554,9 @@ async fn move_fetch_to_replacement_sort() -> Result<()> {
     ] {
         let (input, sort_key) = sorted_memory_input(partitions, options)?;
         let merge: Arc<dyn ExecutionPlan> = Arc::new(
-            SortPreservingMergeExec::new(sort_key.clone(), input).with_fetch(Some(5)),
+            SortPreservingMergeExec::new(sort_key.clone(), input, &Funding::default())
+                .unwrap()
+                .with_fetch(Some(5)),
         );
         assert_eq!(fetch_test_values(Arc::clone(&merge)).await?, expected);
         let plan = sort_required_exec_with_req(merge, sort_key);
@@ -4560,10 +4578,16 @@ async fn preserve_fetch_in_nested_distribution_operators() -> Result<()> {
             [0, 1].map(|start| (start..10).step_by(2).map(Some).collect()),
             SortOptions::default(),
         )?;
-        let merge: Arc<dyn ExecutionPlan> =
-            Arc::new(SortPreservingMergeExec::new(sort_key, input).with_fetch(Some(5)));
-        let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(CoalescePartitionsExec::new(merge).with_fetch(Some(outer_fetch)));
+        let merge: Arc<dyn ExecutionPlan> = Arc::new(
+            SortPreservingMergeExec::new(sort_key, input, &Funding::default())
+                .unwrap()
+                .with_fetch(Some(5)),
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            CoalescePartitionsExec::new(merge, &Funding::default())
+                .unwrap()
+                .with_fetch(Some(outer_fetch)),
+        );
         let expected = (0..outer_fetch.min(5))
             .map(|value| Some(value as i64))
             .collect::<Vec<_>>();
@@ -4586,9 +4610,13 @@ async fn preserve_topk_when_parent_changes_ordering() -> Result<()> {
         },
     )]
     .into();
-    let merge: Arc<dyn ExecutionPlan> =
-        Arc::new(SortPreservingMergeExec::new(sort_key, input).with_fetch(Some(5)));
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(descending, merge));
+    let merge: Arc<dyn ExecutionPlan> = Arc::new(
+        SortPreservingMergeExec::new(sort_key, input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5)),
+    );
+    let plan: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(descending, merge, &Funding::default()).unwrap());
     assert_reoptimized_fetch_values(plan, &[Some(4), Some(3), Some(2), Some(1), Some(0)])
         .await
 }
@@ -4607,14 +4635,18 @@ async fn preserve_fetch_when_parallelizing_sort_above_filter() -> Result<()> {
         Operator::Gt,
         lit(0_i64),
     ));
-    let coalesce: Arc<dyn ExecutionPlan> =
-        Arc::new(CoalescePartitionsExec::new(input).with_fetch(Some(5)));
+    let coalesce: Arc<dyn ExecutionPlan> = Arc::new(
+        CoalescePartitionsExec::new(input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5)),
+    );
     let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
         predicate,
         coalesce,
         &Funding::default(),
     )?);
-    let mut plan: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_key, filter));
+    let mut plan: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(sort_key, filter, &Funding::default()).unwrap());
     let mut config = test_suite_default_config_options();
     config.optimizer.enable_round_robin_repartition = false;
     config.optimizer.repartition_sorts = true;
@@ -4743,7 +4775,9 @@ async fn check_fetch_below_filter(
         SortPreservingMergeExec::new(
             sort_key.clone(),
             DataSourceExec::from_data_source(source),
+            &Funding::default(),
         )
+        .unwrap()
         .with_fetch(Some(5)),
     );
     let predicate = Arc::new(BinaryExpr::new(col("c", &schema)?, op, lit(0_i64)));

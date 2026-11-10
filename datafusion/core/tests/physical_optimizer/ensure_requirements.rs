@@ -280,8 +280,9 @@ fn test_union_mixed_partitions_sort_limit() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, union));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
+    let sort = Arc::new(SortExec::new(sort_expr, union, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(21), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=0, fetch=21
@@ -303,8 +304,9 @@ fn test_idempotent_union_mixed_partitions() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, union));
-    let limit = Arc::new(GlobalLimitExec::new(sort, 0, Some(5)));
+    let sort = Arc::new(SortExec::new(sort_expr, union, &Funding::default()).unwrap());
+    let limit =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(5), &Funding::default()).unwrap());
 
     assert_idempotent(limit);
 }
@@ -330,8 +332,10 @@ fn test_projection_over_multi_partition_sort_limit() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, projection));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
+    let sort =
+        Arc::new(SortExec::new(sort_expr, projection, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(21), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=0, fetch=21
@@ -353,8 +357,9 @@ fn test_single_partition_no_unnecessary_spm() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, source));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort = Arc::new(SortExec::new(sort_expr, source, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     // Snapshot asserts the plan-shape property: no `SortPreservingMergeExec`
     // is added on a single-partition source.
@@ -373,8 +378,9 @@ fn test_sort_already_satisfied_no_extra_sort() {
     // Sort ASC matches MockMultiPartitionExec's output ordering (a ASC)
     let sort_expr = sort_expr_on("a", 0, false, false);
 
-    let sort = Arc::new(SortExec::new(sort_expr, source));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort = Arc::new(SortExec::new(sort_expr, source, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     // Snapshot asserts the plan-shape property: no `SortExec` is added
     // when the source already satisfies the ordering.
@@ -396,9 +402,11 @@ fn test_various_partition_counts_all_pass_sanity_check() {
 
         let sort_expr = sort_expr_on("a", 0, true, true);
 
-        let sort = Arc::new(SortExec::new(sort_expr, source));
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
+        let sort =
+            Arc::new(SortExec::new(sort_expr, source, &Funding::default()).unwrap());
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(
+            GlobalLimitExec::new(sort, 0, Some(21), &Funding::default()).unwrap(),
+        );
 
         let result = optimize_and_sanity_check(limit);
         assert!(
@@ -417,12 +425,14 @@ fn test_various_partition_counts_all_pass_sanity_check() {
 #[test]
 fn test_coalesce_then_sort_limit() {
     let source = Arc::new(MockMultiPartitionExec::new(8));
-    let coalesce: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(source));
+    let coalesce: Arc<dyn ExecutionPlan> =
+        Arc::new(CoalescePartitionsExec::new(source, &Funding::default()).unwrap());
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, coalesce));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort = Arc::new(SortExec::new(sort_expr, coalesce, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=0, fetch=10
@@ -455,8 +465,9 @@ fn test_filter_over_multi_partition_sort_limit() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, filter));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
+    let sort = Arc::new(SortExec::new(sort_expr, filter, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(21), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=0, fetch=21
@@ -481,8 +492,10 @@ fn test_repartition_sort_limit_idempotent() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, repartition));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort =
+        Arc::new(SortExec::new(sort_expr, repartition, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=0, fetch=10
@@ -502,9 +515,10 @@ fn test_skip_and_fetch_multi_partition() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, source));
+    let sort = Arc::new(SortExec::new(sort_expr, source, &Funding::default()).unwrap());
     // skip=5, fetch=10
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 5, Some(10)));
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 5, Some(10), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=5, fetch=10
@@ -541,8 +555,9 @@ fn test_multi_column_sort_multi_partition() {
     ])
     .unwrap();
 
-    let sort = Arc::new(SortExec::new(sort_expr, source));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
+    let sort = Arc::new(SortExec::new(sort_expr, source, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(21), &Funding::default()).unwrap());
 
     assert_ensure_requirements_plan!(limit, @r"
     GlobalLimitExec: skip=0, fetch=21
@@ -720,11 +735,16 @@ fn test_issue_21973_idempotent_spm_sort_multi_partition() {
     let sort_expr = sort_expr_on("a", 0, true, true);
 
     let sort = Arc::new(
-        SortExec::new(sort_expr.clone(), source).with_preserve_partitioning(true),
+        SortExec::new(sort_expr.clone(), source, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
     );
-    let spm: Arc<dyn ExecutionPlan> =
-        Arc::new(SortPreservingMergeExec::new(sort_expr, sort));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(spm, 0, Some(21)));
+    let spm: Arc<dyn ExecutionPlan> = Arc::new(
+        SortPreservingMergeExec::new(sort_expr, sort, &Funding::default()).unwrap(),
+    );
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(spm, 0, Some(21), &Funding::default()).unwrap());
 
     // No-extra-SPM property: count SortPreservingMergeExec occurrences in
     // the first optimisation pass — must be ≤ 1 (the original SPM survives,
@@ -756,11 +776,14 @@ fn test_issue_21973_idempotent_spm_sort_multi_partition() {
 #[test]
 fn test_issue_21973_parallel_sort_survives_multiple_passes() {
     let source: Arc<dyn ExecutionPlan> = Arc::new(MockMultiPartitionExec::new(8));
-    let coalesce: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(source));
+    let coalesce: Arc<dyn ExecutionPlan> =
+        Arc::new(CoalescePartitionsExec::new(source, &Funding::default()).unwrap());
 
     let sort_expr = sort_expr_on("a", 0, true, true);
-    let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_expr, coalesce));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(sort_expr, coalesce, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     let config = test_config();
 
@@ -855,8 +878,10 @@ fn test_idempotent_sort_aggregate_sort_aggregate() {
 
     let sort_expr = sort_expr_on("a", 0, false, false);
 
-    let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_expr, partial_agg));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(sort_expr, partial_agg, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     assert_idempotent(limit);
 }
@@ -867,9 +892,11 @@ fn test_idempotent_all_partition_counts_1_to_64() {
     for n in 1..=64 {
         let source = Arc::new(MockMultiPartitionExec::new(n));
         let sort_expr = sort_expr_on("a", 0, true, true);
-        let sort = Arc::new(SortExec::new(sort_expr, source));
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+        let sort =
+            Arc::new(SortExec::new(sort_expr, source, &Funding::default()).unwrap());
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(
+            GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap(),
+        );
         assert_idempotent(limit);
     }
 }
@@ -888,8 +915,14 @@ fn test_issue_14150_fetch_survives_multiple_passes() {
 
     let sort_expr = sort_expr_on("a", 0, false, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, repartition as _).with_fetch(Some(5)));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(5)));
+    let sort = Arc::new(
+        SortExec::new(sort_expr, repartition as _, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5))
+            .unwrap(),
+    );
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(5), &Funding::default()).unwrap());
 
     let config = test_config();
 
@@ -950,15 +983,22 @@ fn test_issue_14150_fetch_survives_with_input_spm() {
 
     // Sort with fetch=5 (TopK).
     let sort = Arc::new(
-        SortExec::new(sort_expr.clone(), Arc::clone(&source)).with_fetch(Some(5)),
+        SortExec::new(sort_expr.clone(), Arc::clone(&source), &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5))
+            .unwrap(),
     );
 
     // SPM with fetch=5 above the sort — this is what `EnforceDistribution`
     // used to strip and re-add without `fetch`.
-    let spm: Arc<dyn ExecutionPlan> =
-        Arc::new(SortPreservingMergeExec::new(sort_expr, sort).with_fetch(Some(5)));
+    let spm: Arc<dyn ExecutionPlan> = Arc::new(
+        SortPreservingMergeExec::new(sort_expr, sort, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(5)),
+    );
 
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(spm, 0, Some(5)));
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(spm, 0, Some(5), &Funding::default()).unwrap());
 
     let config = test_config();
 
@@ -1104,13 +1144,16 @@ impl ExecutionPlan for MockReqExec {
 #[test]
 fn test_idempotent_parallelize_sorts() {
     let source: Arc<dyn ExecutionPlan> = Arc::new(MockMultiPartitionExec::new(8));
-    let coalesce: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(source));
+    let coalesce: Arc<dyn ExecutionPlan> =
+        Arc::new(CoalescePartitionsExec::new(source, &Funding::default()).unwrap());
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
     // Sort without preserve_partitioning on top of coalesced input
-    let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_expr, coalesce));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(10)));
+    let sort: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(sort_expr, coalesce, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(10), &Funding::default()).unwrap());
 
     // First pass should parallelize the sort (Sort+SPM replaces Coalesce+Sort)
     let config = test_config();
@@ -1166,8 +1209,9 @@ fn test_idempotent_sort_merge_join() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, join));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(50)));
+    let sort = Arc::new(SortExec::new(sort_expr, join, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(50), &Funding::default()).unwrap());
 
     assert_idempotent(limit);
 }
@@ -1205,8 +1249,10 @@ fn test_idempotent_window_over_multi_partition() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, window_like));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(20)));
+    let sort =
+        Arc::new(SortExec::new(sort_expr, window_like, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(20), &Funding::default()).unwrap());
 
     assert_idempotent(limit);
 }
@@ -1221,10 +1267,17 @@ fn test_idempotent_nested_subqueries_sort_limit() {
     // Inner sort (a DESC) + inner limit — use DESC to avoid matching
     // MockMultiPartitionExec's built-in ASC ordering, which would cause
     // the optimizer to eliminate the sort differently across passes.
-    let inner_sort: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(sort_expr_on("a", 0, true, true), source));
-    let inner_limit: Arc<dyn ExecutionPlan> =
-        Arc::new(GlobalLimitExec::new(inner_sort, 0, Some(100)));
+    let inner_sort: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(
+            sort_expr_on("a", 0, true, true),
+            source,
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
+    let inner_limit: Arc<dyn ExecutionPlan> = Arc::new(
+        GlobalLimitExec::new(inner_sort, 0, Some(100), &Funding::default()).unwrap(),
+    );
 
     // Identity projection
     let proj_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![
@@ -1236,10 +1289,17 @@ fn test_idempotent_nested_subqueries_sort_limit() {
     );
 
     // Outer sort (a DESC) + outer limit
-    let outer_sort: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(sort_expr_on("a", 0, true, true), projection));
-    let outer_limit: Arc<dyn ExecutionPlan> =
-        Arc::new(GlobalLimitExec::new(outer_sort, 0, Some(10)));
+    let outer_sort: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(
+            sort_expr_on("a", 0, true, true),
+            projection,
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
+    let outer_limit: Arc<dyn ExecutionPlan> = Arc::new(
+        GlobalLimitExec::new(outer_sort, 0, Some(10), &Funding::default()).unwrap(),
+    );
 
     assert_idempotent(outer_limit);
 }
@@ -1257,8 +1317,10 @@ fn test_idempotent_repartition_hash_sort_limit() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(sort_expr, repartition));
-    let limit: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(15)));
+    let sort: Arc<dyn ExecutionPlan> =
+        Arc::new(SortExec::new(sort_expr, repartition, &Funding::default()).unwrap());
+    let limit: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(15), &Funding::default()).unwrap());
 
     assert_idempotent(limit);
 }
@@ -1331,8 +1393,10 @@ fn test_idempotent_union_projection_sort() {
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let sort = Arc::new(SortExec::new(sort_expr, projection));
-    let plan: Arc<dyn ExecutionPlan> = Arc::new(GlobalLimitExec::new(sort, 0, Some(21)));
+    let sort =
+        Arc::new(SortExec::new(sort_expr, projection, &Funding::default()).unwrap());
+    let plan: Arc<dyn ExecutionPlan> =
+        Arc::new(GlobalLimitExec::new(sort, 0, Some(21), &Funding::default()).unwrap());
 
     assert_idempotent(plan);
 }
@@ -1358,11 +1422,16 @@ fn collect_left_plan_before_parallelize_sorts(
     build: Arc<dyn ExecutionPlan>,
     join_type: JoinType,
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let build: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(build));
+    let build: Arc<dyn ExecutionPlan> =
+        Arc::new(CoalescePartitionsExec::new(build, &Funding::default()).unwrap());
     let probe: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
-        Arc::new(CoalescePartitionsExec::new(Arc::new(
-            MockMultiPartitionExec::new(4),
-        ))),
+        Arc::new(
+            CoalescePartitionsExec::new(
+                Arc::new(MockMultiPartitionExec::new(4)),
+                &Funding::default(),
+            )
+            .unwrap(),
+        ),
         Partitioning::RoundRobinBatch(TEST_TARGET_PARTITIONS),
     )?);
 
@@ -1382,7 +1451,9 @@ fn collect_left_plan_before_parallelize_sorts(
         false,
     )?);
 
-    Ok(Arc::new(CoalescePartitionsExec::new(join)))
+    Ok(Arc::new(
+        CoalescePartitionsExec::new(join, &Funding::default()).unwrap(),
+    ))
 }
 
 /// Runs phase 3a of `EnsureRequirements` (`parallelize_sorts`) on its own, the same way
@@ -1395,7 +1466,10 @@ fn parallelize_sorts_and_sanity_check(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let ctx = PlanWithCorrespondingCoalescePartitions::new_default(plan);
-    let rewritten = ctx.transform_up(parallelize_sorts).data()?.plan;
+    let rewritten = ctx
+        .transform_up(|ctx| parallelize_sorts(ctx, &Funding::default()))?
+        .data
+        .plan;
     SanityCheckPlan::new().optimize(Arc::clone(&rewritten), &test_config())?;
     Ok(rewritten)
 }

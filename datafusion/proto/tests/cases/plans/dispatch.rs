@@ -309,10 +309,14 @@ fn custom_proto_converter_intercepts() -> Result<()> {
     ]
     .into();
 
-    let exec_plan = Arc::new(SortExec::new(
-        sort_exprs,
-        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
-    ));
+    let exec_plan = Arc::new(
+        SortExec::new(
+            sort_exprs,
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};

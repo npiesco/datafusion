@@ -1464,7 +1464,7 @@ mod tests {
         let engine = StatisticsRegistry::new();
         let source = make_source(1000);
         let coalesce: Arc<dyn ExecutionPlan> =
-            Arc::new(CoalescePartitionsExec::new(source));
+            Arc::new(CoalescePartitionsExec::new(source, &Funding::default()).unwrap());
 
         let stats = engine.compute(coalesce.as_ref())?;
         // PassthroughStatisticsProvider should propagate child row count unchanged
@@ -2146,7 +2146,8 @@ mod tests {
     fn test_limit_provider_caps_output() -> Result<()> {
         // input > fetch -> capped at fetch
         let source = make_source(1000);
-        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 100));
+        let limit: Arc<dyn ExecutionPlan> =
+            Arc::new(LocalLimitExec::new(source, 100, &Funding::default()).unwrap());
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2161,7 +2162,8 @@ mod tests {
     fn test_limit_provider_input_smaller_than_fetch() -> Result<()> {
         // input < fetch -> output = input
         let source = make_source(50);
-        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 200));
+        let limit: Arc<dyn ExecutionPlan> =
+            Arc::new(LocalLimitExec::new(source, 200, &Funding::default()).unwrap());
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2176,8 +2178,9 @@ mod tests {
     fn test_global_limit_provider_skip_and_fetch() -> Result<()> {
         // 1000 rows, skip 200, fetch 100 -> exactly 100
         let source = make_source(1000);
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(source, 200, Some(100)));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(
+            GlobalLimitExec::new(source, 200, Some(100), &Funding::default()).unwrap(),
+        );
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2192,8 +2195,9 @@ mod tests {
     fn test_global_limit_provider_skip_exceeds_rows() -> Result<()> {
         // 100 rows, skip 200 -> 0 rows (skip > available)
         let source = make_source(100);
-        let limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(source, 200, Some(50)));
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(
+            GlobalLimitExec::new(source, 200, Some(50), &Funding::default()).unwrap(),
+        );
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2209,7 +2213,8 @@ mod tests {
         // Inexact(1000) with fetch=100: result must stay Inexact, not Exact,
         // because the actual row count could be less than 100.
         let source = make_source_with_precision(Precision::Inexact(1000));
-        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 100));
+        let limit: Arc<dyn ExecutionPlan> =
+            Arc::new(LocalLimitExec::new(source, 100, &Funding::default()).unwrap());
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),

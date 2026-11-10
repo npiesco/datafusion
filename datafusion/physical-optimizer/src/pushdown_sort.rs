@@ -92,6 +92,7 @@ impl PhysicalOptimizerRule for PushdownSort {
         }
 
         let buffer_capacity = config.execution.sort_pushdown_buffer_capacity;
+        let funding = &config.funding;
 
         // Use transform_down to find and optimize all SortExec nodes (including nested ones)
         // Also handles SPM → SortExec pattern to insert BufferExec when sort is eliminated
@@ -110,9 +111,11 @@ impl PhysicalOptimizerRule for PushdownSort {
                         // Preserve fetch (LIMIT) from the eliminated SortExec.
                         // Use LocalLimitExec (not Global) since input is multi-partition.
                         let inner = if let Some(fetch) = sort_child.fetch() {
-                            inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
-                                Arc::new(LocalLimitExec::new(inner, fetch))
-                            })
+                            match inner.with_fetch(Some(fetch)) {
+                                Some(fetched) => fetched,
+                                None => funding
+                                    .arc(LocalLimitExec::new(inner, fetch, funding)?)?,
+                            }
                         } else {
                             inner
                         };
@@ -121,26 +124,31 @@ impl PhysicalOptimizerRule for PushdownSort {
                         // bounded buffering so SPM doesn't stall on I/O.
                         let buffered: Arc<dyn ExecutionPlan> =
                             Arc::new(BufferExec::new(inner, buffer_capacity));
-                        let new_spm =
-                            SortPreservingMergeExec::new(spm.expr().clone(), buffered)
-                                .with_fetch(spm.fetch());
-                        return Ok(Transformed::yes(Arc::new(new_spm)));
-                    }
-                    SortOrderPushdownResult::Inexact { inner } => {
-                        let new_sort = SortExec::new(required_ordering.clone(), inner)
-                            .with_fetch(sort_child.fetch())
-                            .with_preserve_partitioning(true);
                         let new_spm = SortPreservingMergeExec::new(
                             spm.expr().clone(),
-                            Arc::new(new_sort),
-                        )
+                            buffered,
+                            funding,
+                        )?
+                        .with_fetch(spm.fetch());
+                        return Ok(Transformed::yes(funding.arc(new_spm)?));
+                    }
+                    SortOrderPushdownResult::Inexact { inner } => {
+                        let new_sort =
+                            SortExec::new(required_ordering.clone(), inner, funding)?
+                                .with_fetch(sort_child.fetch())?
+                                .with_preserve_partitioning(true)?;
+                        let new_spm = SortPreservingMergeExec::new(
+                            spm.expr().clone(),
+                            funding.arc(new_sort)?,
+                            funding,
+                        )?
                         .with_fetch(spm.fetch());
                         // The replacement already has the required
                         // `SortPreservingMergeExec` parent. Do not descend
                         // into its `SortExec` child and treat it as a
                         // standalone TopK.
                         return Ok(Transformed::new(
-                            Arc::new(new_spm),
+                            funding.arc(new_spm)?,
                             true,
                             TreeNodeRecursion::Jump,
                         ));
@@ -170,9 +178,15 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // If the source doesn't support `with_fetch`, fall back to
                     // wrapping with GlobalLimitExec.
                     if let Some(fetch) = sort_exec.fetch() {
-                        let inner = inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
-                            Arc::new(GlobalLimitExec::new(inner, 0, Some(fetch)))
-                        });
+                        let inner = match inner.with_fetch(Some(fetch)) {
+                            Some(fetched) => fetched,
+                            None => funding.arc(GlobalLimitExec::new(
+                                inner,
+                                0,
+                                Some(fetch),
+                                funding,
+                            )?)?,
+                        };
                         Ok(Transformed::yes(inner))
                     } else {
                         Ok(Transformed::yes(inner))
@@ -189,22 +203,23 @@ impl PhysicalOptimizerRule for PushdownSort {
                     let needs_global_topk =
                         preserve_partitioning && sort_exec.fetch().is_some();
                     let input_partitions = inner.output_partitioning().partition_count();
-                    let new_sort: Arc<dyn ExecutionPlan> = Arc::new(
-                        SortExec::new(required_ordering.clone(), inner)
-                            .with_fetch(sort_exec.fetch())
-                            .with_preserve_partitioning(preserve_partitioning),
-                    );
+                    let new_sort: Arc<dyn ExecutionPlan> = funding.arc(
+                        SortExec::new(required_ordering.clone(), inner, funding)?
+                            .with_fetch(sort_exec.fetch())?
+                            .with_preserve_partitioning(preserve_partitioning)?,
+                    )?;
                     if needs_global_topk && input_partitions > 1 {
                         let new_spm = SortPreservingMergeExec::new(
                             required_ordering.clone(),
                             new_sort,
-                        )
+                            funding,
+                        )?
                         .with_fetch(sort_exec.fetch());
                         // Do not descend into the newly inserted
                         // `SortExec`, or this standalone branch will wrap it
                         // in another `SortPreservingMergeExec`.
                         Ok(Transformed::new(
-                            Arc::new(new_spm),
+                            funding.arc(new_spm)?,
                             true,
                             TreeNodeRecursion::Jump,
                         ))

@@ -27,6 +27,7 @@ use crate::utils::{
 
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::Transformed;
 use datafusion_physical_plan::ExecutionPlanProperties;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -103,6 +104,7 @@ pub fn plan_with_order_preserving_variants(
     // with `SortPreservingMergeExec`s:
     is_spm_better: bool,
     fetch: Option<usize>,
+    funding: &Funding,
 ) -> Result<OrderPreservationContext> {
     if is_coalesce_partitions(&sort_input.plan) && sort_input.plan.fetch().is_some() {
         // A fetched coalesce selects rows in arrival order. An ordered merge
@@ -121,6 +123,7 @@ pub fn plan_with_order_preserving_variants(
                     is_spr_better,
                     is_spm_better,
                     fetch,
+                    funding,
                 )
             } else {
                 Ok(node)
@@ -147,9 +150,13 @@ pub fn plan_with_order_preserving_variants(
         if let Some(ordering) = child.output_ordering() {
             // When the input of a `CoalescePartitionsExec` has an ordering,
             // replace it with a `SortPreservingMergeExec` if appropriate:
-            let spm = SortPreservingMergeExec::new(ordering.clone(), Arc::clone(child))
-                .with_fetch(fetch);
-            sort_input.plan = Arc::new(spm) as _;
+            let spm = SortPreservingMergeExec::new(
+                ordering.clone(),
+                Arc::clone(child),
+                funding,
+            )?
+            .with_fetch(fetch);
+            sort_input.plan = funding.arc(spm)? as _;
             sort_input.children[0].data = true;
             return Ok(sort_input);
         }
@@ -163,6 +170,7 @@ pub fn plan_with_order_preserving_variants(
 /// the original plan modified by [`plan_with_order_preserving_variants`].
 pub fn plan_with_order_breaking_variants(
     mut sort_input: OrderPreservationContext,
+    funding: &Funding,
 ) -> Result<OrderPreservationContext> {
     let plan = &sort_input.plan;
     sort_input.children = izip!(
@@ -176,14 +184,14 @@ pub fn plan_with_order_breaking_variants(
         if !maintains {
             return Ok(node);
         } else if is_sort_preserving_merge(plan) {
-            return plan_with_order_breaking_variants(node);
+            return plan_with_order_breaking_variants(node, funding);
         } else if let Some(required_ordering) = required_ordering {
             let eqp = node.plan.equivalence_properties();
             if eqp.ordering_satisfy_requirement(required_ordering.into_single())? {
                 return Ok(node);
             }
         }
-        plan_with_order_breaking_variants(node)
+        plan_with_order_breaking_variants(node, funding)
     })
     .collect::<Result<_>>()?;
     sort_input.data = false;
@@ -199,8 +207,8 @@ pub fn plan_with_order_breaking_variants(
         // SPM may have `fetch`, so pass it to the `CoalescePartitionsExec`
         let child = Arc::clone(&sort_input.children[0].plan);
         let coalesce =
-            Arc::new(CoalescePartitionsExec::new(child).with_fetch(plan.fetch()));
-        sort_input.plan = coalesce;
+            CoalescePartitionsExec::new(child, funding)?.with_fetch(plan.fetch());
+        sort_input.plan = funding.arc(coalesce)?;
     } else {
         return sort_input.update_plan_from_children();
     }
@@ -269,6 +277,7 @@ pub fn replace_with_order_preserving_variants(
         is_spr_better || use_order_preserving_variant,
         is_spm_better || use_order_preserving_variant,
         requirements.plan.fetch(),
+        &config.funding,
     )?;
 
     // If the alternate plan makes this sort unnecessary, accept the alternate:
@@ -276,7 +285,8 @@ pub fn replace_with_order_preserving_variants(
         let eqp = alternate_plan.plan.equivalence_properties();
         if !eqp.ordering_satisfy(ordering.clone())? {
             // The alternate plan does not help, use faster order-breaking variants:
-            alternate_plan = plan_with_order_breaking_variants(alternate_plan)?;
+            alternate_plan =
+                plan_with_order_breaking_variants(alternate_plan, &config.funding)?;
             alternate_plan.data = false;
             requirements.children = vec![alternate_plan];
             return Ok(Transformed::yes(requirements));

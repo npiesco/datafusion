@@ -24,6 +24,7 @@ use crate::utils::{
 };
 
 use arrow::datatypes::SchemaRef;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{HashSet, JoinSide, Result, internal_err};
 use datafusion_expr::JoinType;
@@ -99,9 +100,12 @@ pub fn assign_initial_requirements(sort_push_down: &mut SortPushDown) {
 }
 
 /// Tries to push down the sort requirements as far as possible, if decides a `SortExec` is unnecessary removes it.
-pub fn pushdown_sorts(sort_push_down: SortPushDown) -> Result<SortPushDown> {
+pub fn pushdown_sorts(
+    sort_push_down: SortPushDown,
+    funding: &Funding,
+) -> Result<SortPushDown> {
     sort_push_down
-        .transform_down(pushdown_sorts_helper)
+        .transform_down(|node| pushdown_sorts_helper(node, funding))
         .map(|transformed| transformed.data)
 }
 
@@ -139,6 +143,7 @@ fn stronger_distribution(a: &Distribution, b: &Distribution) -> Distribution {
 
 fn pushdown_sorts_helper(
     mut sort_push_down: SortPushDown,
+    funding: &Funding,
 ) -> Result<Transformed<SortPushDown>> {
     let plan = sort_push_down.plan;
     let parent_fetch = sort_push_down.data.fetch;
@@ -164,7 +169,7 @@ fn pushdown_sorts_helper(
                 Some(OrderingRequirements::from(sort_ordering));
             // Recursive call to helper, so it doesn't transform_down and miss
             // the new node (previous child of sort):
-            return pushdown_sorts_helper(sort_push_down);
+            return pushdown_sorts_helper(sort_push_down, funding);
         }
         sort_push_down.plan = plan;
         // No ordering is being pushed; use each child's own distribution requirement
@@ -212,7 +217,8 @@ fn pushdown_sorts_helper(
                 parent_requirement.into_single(),
                 parent_fetch,
                 &parent_distribution,
-            );
+                funding,
+            )?;
             // Update pushdown requirements:
             sort_push_down.children[0].data = ParentRequirements {
                 ordering_requirement: Some(OrderingRequirements::from(sort_ordering)),
@@ -240,7 +246,7 @@ fn pushdown_sorts_helper(
             };
             // Recursive call to helper, so it doesn't transform_down and miss
             // the new node (previous child of sort):
-            return pushdown_sorts_helper(sort_push_down);
+            return pushdown_sorts_helper(sort_push_down, funding);
         }
     }
 
@@ -313,7 +319,8 @@ fn pushdown_sorts_helper(
             parent_requirement.into_single(),
             parent_fetch,
             &parent_distribution,
-        );
+            funding,
+        )?;
         assign_initial_requirements(&mut sort_push_down);
     }
     Ok(Transformed::yes(sort_push_down))
@@ -1105,7 +1112,6 @@ fn handle_projection_pushdown(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_common::funding::Funding;
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};

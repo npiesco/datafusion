@@ -61,17 +61,18 @@ use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
 use arrow::datatypes::SchemaRef;
 use datafusion_common::config::SpillCompression;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
-    DataFusionError, Result, assert_or_internal_err, internal_datafusion_err,
-    unwrap_or_internal_err,
+    DataFusionError, Result, ScalarValue, assert_or_internal_err,
+    internal_datafusion_err, unwrap_or_internal_err,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::PhysicalExpr;
-use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, Literal, lit};
 
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -949,26 +950,38 @@ pub struct SortExec {
     /// If `fetch` is `Some`, this will also be set and a TopK operator may be used.
     /// If `fetch` is `None`, this will be `None`.
     filter: Option<Arc<RwLock<TopKDynamicFilters>>>,
+    funding: Funding,
 }
 
 impl SortExec {
     /// Create a new sort execution plan that produces a single,
-    /// sorted output partition.
-    pub fn new(expr: LexOrdering, input: Arc<dyn ExecutionPlan>) -> Self {
+    /// sorted output partition, charging what it allocates to `funding`.
+    pub fn new(
+        expr: LexOrdering,
+        input: Arc<dyn ExecutionPlan>,
+        funding: &Funding,
+    ) -> Result<Self> {
         let preserve_partitioning = false;
         let (cache, sort_prefix) =
-            Self::compute_properties(&input, expr.clone(), preserve_partitioning)
-                .unwrap();
-        Self {
+            Self::compute_properties(&input, expr.clone(), preserve_partitioning)?;
+        let cache = funding.arc(cache)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(Self {
             expr,
             input,
             metrics_set: ExecutionPlanMetricsSet::new(),
             preserve_partitioning,
             fetch: None,
             common_sort_prefix: sort_prefix,
-            cache: Arc::new(cache),
+            cache,
             filter: None,
-        }
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Whether this `SortExec` preserves partitioning of the children
@@ -983,14 +996,28 @@ impl SortExec {
     ///
     /// If `preserve_partitioning` is false, sorts and merges all
     /// input partitions producing a single, sorted partition.
-    pub fn with_preserve_partitioning(mut self, preserve_partitioning: bool) -> Self {
+    ///
+    /// Properties shared with a clone are copied anew, charged to this node's
+    /// funding first.
+    pub fn with_preserve_partitioning(
+        mut self,
+        preserve_partitioning: bool,
+    ) -> Result<Self> {
         self.preserve_partitioning = preserve_partitioning;
-        Arc::make_mut(&mut self.cache).partitioning =
+        let partitioning =
             Self::output_partitioning_helper(&self.input, self.preserve_partitioning);
-        if self.fetch.is_some() {
-            self.rebuild_filter_for_current_partitioning();
+        match Arc::get_mut(&mut self.cache) {
+            Some(cache) => cache.partitioning = partitioning,
+            None => {
+                let mut cache = PlanProperties::clone(&self.cache);
+                cache.partitioning = partitioning;
+                self.cache = self.funding.arc(cache)?;
+            }
         }
-        self
+        if self.fetch.is_some() {
+            self.rebuild_filter_for_current_partitioning()?;
+        }
+        Ok(self)
     }
 
     fn topk_emitter_count(&self) -> usize {
@@ -998,23 +1025,25 @@ impl SortExec {
     }
 
     /// Build a new shared TopK dynamic filter wrapper for this `SortExec`.
-    fn create_filter(&self) -> Arc<RwLock<TopKDynamicFilters>> {
-        let children = self
-            .expr
-            .iter()
-            .map(|sort_expr| Arc::clone(&sort_expr.expr))
-            .collect::<Vec<_>>();
-        self.create_filter_with_expr(Arc::new(DynamicFilterPhysicalExpr::new(
-            children,
-            lit(true),
-        )))
+    fn create_filter(&self) -> Result<Arc<RwLock<TopKDynamicFilters>>> {
+        let funding = &self.funding;
+        let mut children = funding.vec_with_capacity(self.expr.len())?;
+        children.extend(
+            self.expr
+                .iter()
+                .map(|sort_expr| Arc::clone(&sort_expr.expr)),
+        );
+        let always_true =
+            funding.arc(Literal::new(ScalarValue::Boolean(Some(true)), funding)?)?;
+        let expr = funding.arc(DynamicFilterPhysicalExpr::new(children, always_true))?;
+        self.create_filter_with_expr(expr)
     }
 
     fn create_filter_with_expr(
         &self,
         expr: Arc<DynamicFilterPhysicalExpr>,
-    ) -> Arc<RwLock<TopKDynamicFilters>> {
-        Arc::new(RwLock::new(
+    ) -> Result<Arc<RwLock<TopKDynamicFilters>>> {
+        self.funding.arc(RwLock::new(
             TopKDynamicFilters::new_with_topk_emitter_count(
                 expr,
                 self.topk_emitter_count(),
@@ -1027,24 +1056,26 @@ impl SortExec {
     /// The dynamic filter expression is preserved, but wrapper state such as the
     /// shared threshold and remaining emitter count is reset for the new
     /// partitioning.
-    fn rebuild_filter_for_current_partitioning(&mut self) {
+    fn rebuild_filter_for_current_partitioning(&mut self) -> Result<()> {
         let filter_expr = self.filter.as_ref().map(|filter| filter.read().expr());
         if let Some(filter_expr) = filter_expr {
-            self.filter = Some(self.create_filter_with_expr(filter_expr));
+            self.filter = Some(self.create_filter_with_expr(filter_expr)?);
         }
+        Ok(())
     }
 
-    fn cloned(&self) -> Self {
-        SortExec {
+    fn cloned(&self) -> Result<Self> {
+        Ok(SortExec {
             input: Arc::clone(&self.input),
             expr: self.expr.clone(),
             metrics_set: self.metrics_set.clone(),
             preserve_partitioning: self.preserve_partitioning,
-            common_sort_prefix: self.common_sort_prefix.clone(),
+            common_sort_prefix: self.funding.cloned(&self.common_sort_prefix)?,
             fetch: self.fetch,
             cache: Arc::clone(&self.cache),
             filter: self.filter.clone(),
-        }
+            funding: self.funding.clone(),
+        })
     }
 
     /// Modify how many rows to include in the result
@@ -1054,7 +1085,9 @@ impl SortExec {
     /// This can reduce the memory pressure required by the sort
     /// operation since rows that are not going to be included
     /// can be dropped.
-    pub fn with_fetch(&self, fetch: Option<usize>) -> Self {
+    ///
+    /// What the new node allocates is charged to this node's funding first.
+    pub fn with_fetch(&self, fetch: Option<usize>) -> Result<Self> {
         let mut cache = PlanProperties::clone(&self.cache);
         // If the SortExec can emit incrementally (that means the sort requirements
         // and properties of the input match), the SortExec can generate its result
@@ -1066,21 +1099,21 @@ impl SortExec {
         if fetch.is_some() && is_pipeline_friendly {
             cache = cache.with_boundedness(Boundedness::Bounded);
         }
-        let mut new_sort = self.cloned();
+        let mut new_sort = self.cloned()?;
         new_sort.fetch = fetch;
-        new_sort.cache = cache.into();
+        new_sort.cache = self.funding.arc(cache)?;
         if fetch.is_some() {
             if new_sort.filter.is_some() {
                 // Keep the dynamic filter expression, but reset wrapper state
                 // such as the shared threshold and expected emitter count.
-                new_sort.rebuild_filter_for_current_partitioning();
+                new_sort.rebuild_filter_for_current_partitioning()?;
             } else {
-                new_sort.filter = Some(new_sort.create_filter());
+                new_sort.filter = Some(new_sort.create_filter()?);
             }
         } else {
             new_sort.filter = None;
         }
-        new_sort
+        Ok(new_sort)
     }
 
     /// Input schema
@@ -1122,7 +1155,7 @@ impl SortExec {
         for child in filter.children() {
             child.data_type(&input_schema)?;
         }
-        self.filter = Some(self.create_filter_with_expr(filter));
+        self.filter = Some(self.create_filter_with_expr(filter)?);
         Ok(self)
     }
 
@@ -1313,7 +1346,7 @@ impl ExecutionPlan for SortExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
         options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut new_sort = self.cloned();
+        let mut new_sort = self.cloned()?;
         assert_eq!(children.len(), 1, "SortExec should have exactly one child");
         new_sort.input = Arc::clone(&children[0]);
 
@@ -1324,14 +1357,14 @@ impl ExecutionPlan for SortExec {
                 new_sort.expr.clone(),
                 new_sort.preserve_partitioning,
             )?;
-            new_sort.cache = Arc::new(cache);
+            new_sort.cache = self.funding.arc(cache)?;
             new_sort.common_sort_prefix = sort_prefix;
             if new_sort.fetch.is_some() {
-                new_sort.rebuild_filter_for_current_partitioning();
+                new_sort.rebuild_filter_for_current_partitioning()?;
             }
         }
 
-        Ok(Arc::new(new_sort))
+        Ok(self.funding.arc(new_sort)?)
     }
 
     fn with_new_children(
@@ -1358,7 +1391,7 @@ impl ExecutionPlan for SortExec {
             .expect("rebuilt SortExec with new children")
             .clone();
         // Our dynamic filter and execution metrics are the state we need to reset.
-        new_sort.filter = Some(new_sort.create_filter());
+        new_sort.filter = Some(new_sort.create_filter()?);
         new_sort.metrics_set = ExecutionPlanMetricsSet::new();
 
         Ok(Arc::new(new_sort))
@@ -1475,7 +1508,8 @@ impl ExecutionPlan for SortExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(SortExec::with_fetch(self, limit)))
+        let new_sort = SortExec::with_fetch(self, limit).ok()?;
+        Some(self.funding.arc(new_sort).ok()?)
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -1507,11 +1541,18 @@ impl ExecutionPlan for SortExec {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(
-            SortExec::new(updated_exprs, make_with_child(projection, self.input())?)
-                .with_fetch(self.fetch())
-                .with_preserve_partitioning(self.preserve_partitioning()),
-        )))
+        let funding = &self.funding;
+        Ok(Some(
+            funding.arc(
+                SortExec::new(
+                    updated_exprs,
+                    make_with_child(projection, self.input())?,
+                    funding,
+                )?
+                .with_fetch(self.fetch())?
+                .with_preserve_partitioning(self.preserve_partitioning())?,
+            )?,
+        ))
     }
 
     fn gather_filters_for_pushdown(
@@ -1589,11 +1630,11 @@ impl ExecutionPlan for SortExec {
         let new_child =
             FilterExec::try_new(predicate, Arc::clone(self.input()), funding)?;
         let new_child = funding.arc(new_child)? as Arc<dyn ExecutionPlan>;
-        let new_sort = Arc::new(
-            SortExec::new(self.expr.clone(), new_child)
-                .with_fetch(self.fetch())
-                .with_preserve_partitioning(self.preserve_partitioning()),
-        ) as Arc<dyn ExecutionPlan>;
+        let new_sort = funding.arc(
+            SortExec::new(self.expr.clone(), new_child, funding)?
+                .with_fetch(self.fetch())?
+                .with_preserve_partitioning(self.preserve_partitioning())?,
+        )? as Arc<dyn ExecutionPlan>;
 
         Ok(FilterPushdownPropagation {
             filters: vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()],
@@ -1692,9 +1733,9 @@ impl SortExec {
             return datafusion_common::internal_err!("SortExec requires an ordering");
         };
         let fetch = (sort.fetch >= 0).then_some(sort.fetch as usize);
-        let new_sort = SortExec::new(ordering, input)
-            .with_fetch(fetch)
-            .with_preserve_partitioning(sort.preserve_partitioning);
+        let new_sort = SortExec::new(ordering, input, &Funding::default())?
+            .with_fetch(fetch)?
+            .with_preserve_partitioning(sort.preserve_partitioning)?;
 
         let new_sort = if let Some(df_proto) = &sort.dynamic_filter {
             let df_expr =
@@ -1717,7 +1758,6 @@ impl SortExec {
 
 #[cfg(test)]
 mod tests {
-    use datafusion_common::funding::Funding;
     use std::collections::HashMap;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -1890,14 +1930,18 @@ mod tests {
         let csv = test::scan_partitioned(partitions);
         let schema = csv.schema();
 
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: col("i", &schema)?,
-                options: SortOptions::default(),
-            }]
-            .into(),
-            Arc::new(CoalescePartitionsExec::new(csv)),
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: col("i", &schema)?,
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                Arc::new(CoalescePartitionsExec::new(csv, &Funding::default()).unwrap()),
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let result = collect(sort_exec, Arc::clone(&task_ctx)).await?;
 
@@ -1954,18 +1998,22 @@ mod tests {
         let total_rows = num_batches * rows_per_batch;
 
         let options = SortOptions::default();
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: col("a", &schema)?,
-                options,
-            }]
-            .into(),
-            TestMemoryExec::try_new_exec(
-                std::slice::from_ref(&batches),
-                Arc::clone(&schema),
-                None,
-            )?,
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: col("a", &schema)?,
+                    options,
+                }]
+                .into(),
+                TestMemoryExec::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )?,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let result = collect(
             Arc::clone(&sort_exec) as Arc<dyn ExecutionPlan>,
@@ -2034,14 +2082,20 @@ mod tests {
         let input = test::scan_partitioned(partitions);
         let schema = input.schema();
 
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: col("i", &schema)?,
-                options: SortOptions::default(),
-            }]
-            .into(),
-            Arc::new(CoalescePartitionsExec::new(input)),
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: col("i", &schema)?,
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                Arc::new(
+                    CoalescePartitionsExec::new(input, &Funding::default()).unwrap(),
+                ),
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let result = collect(
             Arc::clone(&sort_exec) as Arc<dyn ExecutionPlan>,
@@ -2121,10 +2175,14 @@ mod tests {
             assert!(memory_limit < (merge_reservation + batch_reservation));
         }
 
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr::new_default(col("i", &plan.schema())?)].into(),
-            plan,
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr::new_default(col("i", &plan.schema())?)].into(),
+                plan,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let result = collect(Arc::clone(&sort_exec) as _, Arc::clone(&task_ctx)).await;
 
@@ -2179,14 +2237,20 @@ mod tests {
         let input = test::scan_partitioned_utf8(200);
         let schema = input.schema();
 
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: col("i", &schema)?,
-                options: SortOptions::default(),
-            }]
-            .into(),
-            Arc::new(CoalescePartitionsExec::new(input)),
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: col("i", &schema)?,
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                Arc::new(
+                    CoalescePartitionsExec::new(input, &Funding::default()).unwrap(),
+                ),
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let result = collect(Arc::clone(&sort_exec) as _, Arc::clone(&task_ctx)).await?;
 
@@ -2282,9 +2346,14 @@ mod tests {
                         options: SortOptions::default(),
                     }]
                     .into(),
-                    Arc::new(CoalescePartitionsExec::new(csv)),
+                    Arc::new(
+                        CoalescePartitionsExec::new(csv, &Funding::default()).unwrap(),
+                    ),
+                    &Funding::default(),
                 )
-                .with_fetch(fetch),
+                .unwrap()
+                .with_fetch(fetch)
+                .unwrap(),
             );
 
             let result =
@@ -2329,18 +2398,22 @@ mod tests {
 
         let batches = vec![input_batch];
 
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: Arc::new(Column::new("a", 0)),
-                options: SortOptions::default(),
-            }]
-            .into(),
-            TestMemoryExec::try_new_exec(
-                std::slice::from_ref(&batches),
-                Arc::clone(&schema),
-                None,
-            )?,
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: Arc::new(Column::new("a", 0)),
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                TestMemoryExec::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )?,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let mut stream = sort_exec.execute(0, Arc::clone(&task_ctx))?;
 
@@ -2409,14 +2482,18 @@ mod tests {
         let input =
             TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
 
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: col("field_name", &schema)?,
-                options: SortOptions::default(),
-            }]
-            .into(),
-            input,
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: col("field_name", &schema)?,
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                input,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let result: Vec<RecordBatch> = collect(sort_exec, task_ctx).await?;
 
@@ -2461,26 +2538,30 @@ mod tests {
             ],
         )?;
 
-        let sort_exec = Arc::new(SortExec::new(
-            [
-                PhysicalSortExpr {
-                    expr: col("a", &schema)?,
-                    options: SortOptions {
-                        descending: false,
-                        nulls_first: true,
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [
+                    PhysicalSortExpr {
+                        expr: col("a", &schema)?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: true,
+                        },
                     },
-                },
-                PhysicalSortExpr {
-                    expr: col("b", &schema)?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: false,
+                    PhysicalSortExpr {
+                        expr: col("b", &schema)?,
+                        options: SortOptions {
+                            descending: true,
+                            nulls_first: false,
+                        },
                     },
-                },
-            ]
-            .into(),
-            TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?,
-        ));
+                ]
+                .into(),
+                TestMemoryExec::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         assert_eq!(DataType::Int32, *sort_exec.schema().field(0).data_type());
         assert_eq!(
@@ -2548,26 +2629,30 @@ mod tests {
             ],
         )?;
 
-        let sort_exec = Arc::new(SortExec::new(
-            [
-                PhysicalSortExpr {
-                    expr: col("a", &schema)?,
-                    options: SortOptions {
-                        descending: true,
-                        nulls_first: true,
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [
+                    PhysicalSortExpr {
+                        expr: col("a", &schema)?,
+                        options: SortOptions {
+                            descending: true,
+                            nulls_first: true,
+                        },
                     },
-                },
-                PhysicalSortExpr {
-                    expr: col("b", &schema)?,
-                    options: SortOptions {
-                        descending: false,
-                        nulls_first: false,
+                    PhysicalSortExpr {
+                        expr: col("b", &schema)?,
+                        options: SortOptions {
+                            descending: false,
+                            nulls_first: false,
+                        },
                     },
-                },
-            ]
-            .into(),
-            TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?,
-        ));
+                ]
+                .into(),
+                TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         assert_eq!(DataType::Float32, *sort_exec.schema().field(0).data_type());
         assert_eq!(DataType::Float64, *sort_exec.schema().field(1).data_type());
@@ -2628,14 +2713,18 @@ mod tests {
 
         let blocking_exec = Arc::new(BlockingExec::new(Arc::clone(&schema), 1));
         let refs = blocking_exec.refs();
-        let sort_exec = Arc::new(SortExec::new(
-            [PhysicalSortExpr {
-                expr: col("a", &schema)?,
-                options: SortOptions::default(),
-            }]
-            .into(),
-            blocking_exec,
-        ));
+        let sort_exec = Arc::new(
+            SortExec::new(
+                [PhysicalSortExpr {
+                    expr: col("a", &schema)?,
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                blocking_exec,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let fut = collect(sort_exec, Arc::clone(&task_ctx));
         let mut fut = fut.boxed();
@@ -2690,8 +2779,10 @@ mod tests {
             )))]
             .into(),
             Arc::new(source),
-        );
-        plan = plan.with_fetch(Some(9));
+            &Funding::default(),
+        )
+        .unwrap();
+        plan = plan.with_fetch(Some(9)).unwrap();
 
         let batches = collect(Arc::new(plan), task_ctx).await?;
         assert_snapshot!(batches_to_string(&batches), @r"
@@ -3054,14 +3145,18 @@ mod tests {
             },
         }]
         .into();
-        let sort_exec: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(
-            ordering.clone(),
-            TestMemoryExec::try_new_exec(
-                std::slice::from_ref(&batches),
-                Arc::clone(&schema),
-                None,
-            )?,
-        ));
+        let sort_exec: Arc<dyn ExecutionPlan> = Arc::new(
+            SortExec::new(
+                ordering.clone(),
+                TestMemoryExec::try_new_exec(
+                    std::slice::from_ref(&batches),
+                    Arc::clone(&schema),
+                    None,
+                )?,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let sorted_batches =
             collect(Arc::clone(&sort_exec), Arc::clone(&task_ctx)).await?;
@@ -3255,8 +3350,11 @@ mod tests {
             }])
             .unwrap(),
             child,
+            &Funding::default(),
         )
-        .with_fetch(Some(10));
+        .unwrap()
+        .with_fetch(Some(10))
+        .unwrap();
 
         // SortExec with fetch creates a dynamic filter automatically.
         let produced = sort.dynamic_expressions_produced();
@@ -3336,11 +3434,13 @@ mod tests {
         let sort = SortExec::new(
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into(),
             input,
+            &Funding::default(),
         )
+        .unwrap()
         // `with_fetch` creates the TopK filter; preserving partitioning after
         // that must rebuild it with one emitter per output partition.
-        .with_fetch(Some(2))
-        .with_preserve_partitioning(true);
+        .with_fetch(Some(2))?
+        .with_preserve_partitioning(true)?;
 
         let dynamic_filter = dynamic_filter_produced(&sort);
         let sort = Arc::new(sort);
@@ -3384,10 +3484,12 @@ mod tests {
         let sort = SortExec::new(
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into(),
             input,
+            &Funding::default(),
         )
+        .unwrap()
         .with_dynamic_filter_expr(dynamic_filter)?
-        .with_preserve_partitioning(true)
-        .with_fetch(Some(2));
+        .with_preserve_partitioning(true)?
+        .with_fetch(Some(2))?;
 
         let dynamic_filter = dynamic_filter_produced(&sort);
         assert_eq!(
@@ -3427,8 +3529,11 @@ mod tests {
             }])
             .unwrap(),
             child,
+            &Funding::default(),
         )
-        .with_fetch(Some(10));
+        .unwrap()
+        .with_fetch(Some(10))
+        .unwrap();
 
         // Column index 99 is out of bounds for the input schema.
         let df = Arc::new(DynamicFilterPhysicalExpr::new(
@@ -3574,8 +3679,11 @@ mod tests {
         SortExec::new(
             [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into(),
             input,
+            &Funding::default(),
         )
+        .unwrap()
         .with_fetch(fetch)
+        .unwrap()
     }
 
     #[test]

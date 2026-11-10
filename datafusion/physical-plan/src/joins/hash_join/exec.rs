@@ -2435,7 +2435,6 @@ async fn collect_left_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_common::funding::Funding;
 
     fn assert_phj_used(metrics: &MetricsSet, use_phj: bool) {
         if use_phj {
@@ -2873,7 +2872,9 @@ mod tests {
             .unzip();
 
         let left_repartitioned: Arc<dyn ExecutionPlan> = match partition_mode {
-            PartitionMode::CollectLeft => Arc::new(CoalescePartitionsExec::new(left)),
+            PartitionMode::CollectLeft => {
+                Arc::new(CoalescePartitionsExec::new(left, &Funding::default()).unwrap())
+            }
             PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
                 left,
                 Partitioning::Hash(left_expr, partition_count),
@@ -3235,7 +3236,8 @@ mod tests {
         let left =
             TestMemoryExec::try_new_exec(&[vec![batch1], vec![batch2]], schema, None)
                 .unwrap();
-        let left = Arc::new(CoalescePartitionsExec::new(left));
+        let left =
+            Arc::new(CoalescePartitionsExec::new(left, &Funding::default()).unwrap());
 
         let right = build_table(
             ("a1", &vec![1, 2, 3]),
@@ -3322,7 +3324,8 @@ mod tests {
         let left =
             TestMemoryExec::try_new_exec(&[vec![batch1], vec![batch2]], schema, None)
                 .unwrap();
-        let left = Arc::new(CoalescePartitionsExec::new(left));
+        let left =
+            Arc::new(CoalescePartitionsExec::new(left, &Funding::default()).unwrap());
         let right = build_table(
             ("a2", &vec![20, 30, 10]),
             ("b2", &vec![5, 6, 4]),

@@ -25,6 +25,7 @@ pub use crate::metrics::Metric;
 pub use crate::ordering::InputOrderMode;
 use crate::sort_pushdown::SortOrderPushdownResult;
 pub use crate::stream::EmptyRecordBatchStream;
+use datafusion_common::funding::Funding;
 
 use arrow_schema::Schema;
 pub use datafusion_common::hash_utils;
@@ -1778,7 +1779,8 @@ pub fn execute_stream(
         1 => plan.execute(0, context),
         2.. => {
             // merge into a single partition
-            let plan = CoalescePartitionsExec::new(Arc::clone(&plan));
+            let plan =
+                CoalescePartitionsExec::new(Arc::clone(&plan), &Funding::default())?;
             // CoalescePartitionsExec must produce a single partition
             assert_eq!(1, plan.properties().output_partitioning().partition_count());
             plan.execute(0, context)
@@ -2077,8 +2079,6 @@ pub(crate) fn stub_properties() -> Arc<PlanProperties> {
 
 #[cfg(test)]
 mod tests {
-
-    use datafusion_common::funding::Funding;
 
     use super::*;
     use crate::buffer::BufferExec;

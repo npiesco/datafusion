@@ -31,6 +31,7 @@ use crate::{
     SendableRecordBatchStream, Statistics, validate_child_count,
 };
 
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
@@ -103,20 +104,32 @@ pub struct SortPreservingMergeExec {
     ///
     /// See [`Self::with_round_robin_repartition`] for more information.
     enable_round_robin_repartition: bool,
+    funding: Funding,
 }
 
 impl SortPreservingMergeExec {
-    /// Create a new sort execution plan
-    pub fn new(expr: LexOrdering, input: Arc<dyn ExecutionPlan>) -> Self {
-        let cache = Self::compute_properties(&input, expr.clone());
-        Self {
+    /// Create a new sort execution plan, charging what it allocates to `funding`
+    pub fn new(
+        expr: LexOrdering,
+        input: Arc<dyn ExecutionPlan>,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let cache = funding.arc(Self::compute_properties(&input, expr.clone()))?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(Self {
             input,
             expr,
             metrics: ExecutionPlanMetricsSet::new(),
             fetch: None,
-            cache: Arc::new(cache),
+            cache,
             enable_round_robin_repartition: true,
-        }
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Sets the number of rows to fetch
@@ -236,14 +249,18 @@ impl ExecutionPlan for SortPreservingMergeExec {
 
     /// Sets the number of rows to fetch
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        Some(Arc::new(Self {
-            input: Arc::clone(&self.input),
-            expr: self.expr.clone(),
-            metrics: self.metrics.clone(),
-            fetch: limit,
-            cache: Arc::clone(&self.cache),
-            enable_round_robin_repartition: self.enable_round_robin_repartition,
-        }))
+        self.funding
+            .arc(Self {
+                input: Arc::clone(&self.input),
+                expr: self.expr.clone(),
+                metrics: self.metrics.clone(),
+                fetch: limit,
+                cache: Arc::clone(&self.cache),
+                enable_round_robin_repartition: self.enable_round_robin_repartition,
+                funding: self.funding.clone(),
+            })
+            .ok()
+            .map(|plan| plan as _)
     }
 
     fn with_preserve_order(
@@ -253,8 +270,9 @@ impl ExecutionPlan for SortPreservingMergeExec {
         self.input
             .with_preserve_order(preserve_order)
             .and_then(|new_input| {
-                replace_children_if_necessary(Arc::new(self.clone()), vec![new_input])
-                    .ok()
+                let this = self.funding.arc(self.clone()).ok()?;
+                let children = self.funding.vec_of([new_input]).ok()?;
+                replace_children_if_necessary(this, children).ok()
             })
     }
 
@@ -301,15 +319,22 @@ impl ExecutionPlan for SortPreservingMergeExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
-            ChildrenPropertiesMode::Recompute => Ok(Arc::new(
-                SortPreservingMergeExec::new(self.expr.clone(), children.swap_remove(0))
-                    .with_fetch(self.fetch),
-            )),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
+            }
+            ChildrenPropertiesMode::Recompute => Ok(self.funding.arc(
+                SortPreservingMergeExec::new(
+                    self.expr.clone(),
+                    children.swap_remove(0),
+                    &self.funding,
+                )?
+                .with_fetch(self.fetch),
+            )?),
         }
     }
 
@@ -459,13 +484,16 @@ impl ExecutionPlan for SortPreservingMergeExec {
             return Ok(None);
         };
 
-        Ok(Some(Arc::new(
-            SortPreservingMergeExec::new(
-                updated_exprs,
-                make_with_child(projection, self.input())?,
-            )
-            .with_fetch(self.fetch()),
-        )))
+        Ok(Some(
+            self.funding.arc(
+                SortPreservingMergeExec::new(
+                    updated_exprs,
+                    make_with_child(projection, self.input())?,
+                    &self.funding,
+                )?
+                .with_fetch(self.fetch()),
+            )?,
+        ))
     }
     #[cfg(feature = "proto")]
     fn try_to_proto(
@@ -556,7 +584,8 @@ impl SortPreservingMergeExec {
         };
         let fetch = (spm.fetch >= 0).then_some(spm.fetch as usize);
         Ok(Arc::new(
-            SortPreservingMergeExec::new(ordering, input).with_fetch(fetch),
+            SortPreservingMergeExec::new(ordering, input, &Funding::default())?
+                .with_fetch(fetch),
         ))
     }
 }
@@ -654,8 +683,13 @@ mod tests {
             TestMemoryExec::try_new_exec(&[rbs], schema, None)?,
             Partitioning::RoundRobinBatch(2),
         )?;
-        let spm = SortPreservingMergeExec::new(sort, Arc::new(repartition_exec))
-            .with_round_robin_repartition(enable_round_robin_repartition);
+        let spm = SortPreservingMergeExec::new(
+            sort,
+            Arc::new(repartition_exec),
+            &Funding::default(),
+        )
+        .unwrap()
+        .with_round_robin_repartition(enable_round_robin_repartition);
         Ok(Arc::new(spm))
     }
 
@@ -672,7 +706,9 @@ mod tests {
         ));
         let sort = [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
 
-        let spm = SortPreservingMergeExec::new(sort, input).with_fetch(Some(1));
+        let spm = SortPreservingMergeExec::new(sort, input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(1));
         let statistics =
             StatisticsContext::new().compute(&spm, &StatisticsArgs::new())?;
 
@@ -696,7 +732,7 @@ mod tests {
         let input = Arc::new(StatisticsExec::new(input_stats.clone(), schema.clone()));
         let sort = [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
 
-        let spm = SortPreservingMergeExec::new(sort, input);
+        let spm = SortPreservingMergeExec::new(sort, input, &Funding::default()).unwrap();
         let statistics =
             StatisticsContext::new().compute(&spm, &StatisticsArgs::new())?;
 
@@ -959,7 +995,9 @@ mod tests {
         ]
         .into();
         let exec = TestMemoryExec::try_new_exec(partitions, schema, None).unwrap();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         let collected = collect(merge, context).await.unwrap();
         assert_batches_eq!(exp, collected.as_slice());
@@ -970,7 +1008,9 @@ mod tests {
         sort: LexOrdering,
         context: Arc<TaskContext>,
     ) -> RecordBatch {
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, input));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, input, &Funding::default()).unwrap(),
+        );
         let mut result = collect(merge, context).await.unwrap();
         assert_eq!(result.len(), 1);
         result.remove(0)
@@ -981,8 +1021,12 @@ mod tests {
         sort: LexOrdering,
         context: Arc<TaskContext>,
     ) -> RecordBatch {
-        let sort_exec =
-            Arc::new(SortExec::new(sort.clone(), input).with_preserve_partitioning(true));
+        let sort_exec = Arc::new(
+            SortExec::new(sort.clone(), input, &Funding::default())
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
+        );
         sorted_merge(sort_exec, sort, context).await
     }
 
@@ -991,8 +1035,10 @@ mod tests {
         sort: LexOrdering,
         context: Arc<TaskContext>,
     ) -> RecordBatch {
-        let merge = Arc::new(CoalescePartitionsExec::new(src));
-        let sort_exec = Arc::new(SortExec::new(sort, merge));
+        let merge =
+            Arc::new(CoalescePartitionsExec::new(src, &Funding::default()).unwrap());
+        let sort_exec =
+            Arc::new(SortExec::new(sort, merge, &Funding::default()).unwrap());
         let mut result = collect(sort_exec, context).await.unwrap();
         assert_eq!(result.len(), 1);
         result.remove(0)
@@ -1120,7 +1166,9 @@ mod tests {
             .with_session_config(SessionConfig::new().with_batch_size(23));
         let task_ctx = Arc::new(task_ctx);
 
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, input));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, input, &Funding::default()).unwrap(),
+        );
         let merged = collect(merge, task_ctx).await?;
 
         assert_eq!(merged.len(), 53);
@@ -1192,7 +1240,9 @@ mod tests {
         .into();
         let exec =
             TestMemoryExec::try_new_exec(&[vec![b1], vec![b2]], schema, None).unwrap();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         let collected = collect(merge, task_ctx).await.unwrap();
         assert_eq!(collected.len(), 1);
@@ -1232,8 +1282,11 @@ mod tests {
         }]
         .into();
         let exec = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap();
-        let merge =
-            Arc::new(SortPreservingMergeExec::new(sort, exec).with_fetch(Some(2)));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default())
+                .unwrap()
+                .with_fetch(Some(2)),
+        );
 
         let collected = collect(merge, task_ctx).await.unwrap();
         assert_eq!(collected.len(), 1);
@@ -1265,7 +1318,9 @@ mod tests {
         }]
         .into();
         let exec = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         let collected = collect(merge, task_ctx).await.unwrap();
         assert_eq!(collected.len(), 1);
@@ -1374,7 +1429,9 @@ mod tests {
         .into();
         let exec =
             TestMemoryExec::try_new_exec(&[vec![b1], vec![b2]], schema, None).unwrap();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         let collected = collect(Arc::clone(&merge) as Arc<dyn ExecutionPlan>, task_ctx)
             .await
@@ -1426,14 +1483,18 @@ mod tests {
 
         let blocking_exec = Arc::new(BlockingExec::new(Arc::clone(&schema), 2));
         let refs = blocking_exec.refs();
-        let sort_preserving_merge_exec = Arc::new(SortPreservingMergeExec::new(
-            [PhysicalSortExpr {
-                expr: col("a", &schema)?,
-                options: SortOptions::default(),
-            }]
-            .into(),
-            blocking_exec,
-        ));
+        let sort_preserving_merge_exec = Arc::new(
+            SortPreservingMergeExec::new(
+                [PhysicalSortExpr {
+                    expr: col("a", &schema)?,
+                    options: SortOptions::default(),
+                }]
+                .into(),
+                blocking_exec,
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
 
         let fut = collect(sort_preserving_merge_exec, task_ctx);
         let mut fut = fut.boxed();
@@ -1486,7 +1547,9 @@ mod tests {
         .into();
 
         let exec = TestMemoryExec::try_new_exec(&partitions, schema, None).unwrap();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         let collected = collect(merge, task_ctx).await.unwrap();
         assert_eq!(collected.len(), 1);
@@ -1712,7 +1775,9 @@ mod tests {
             )))]
             .into(),
             Arc::new(source),
-        );
+            &Funding::default(),
+        )
+        .unwrap();
         let spm_task = SpawnedTask::spawn(collect(Arc::new(spm), task_ctx));
 
         let result = timeout(Duration::from_secs(3), spm_task.join()).await;

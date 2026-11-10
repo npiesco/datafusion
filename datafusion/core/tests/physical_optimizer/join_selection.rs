@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use insta::assert_snapshot;
 use std::sync::Arc;
 use std::{
@@ -283,7 +284,9 @@ async fn test_join_with_swap_to_sort_preserving_merge_fetch_side() {
             )))]
             .into(),
             top1_input,
+            &Funding::default(),
         )
+        .unwrap()
         .with_fetch(Some(1)),
     );
 

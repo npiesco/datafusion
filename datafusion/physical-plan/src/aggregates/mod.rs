@@ -3578,7 +3578,9 @@ mod tests {
             }
         };
 
-        let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
+        let merge = Arc::new(
+            CoalescePartitionsExec::new(partial_aggregate, &Funding::default()).unwrap(),
+        );
 
         let final_grouping_set = grouping_set.as_final(&Funding::default())?;
 
@@ -3701,7 +3703,9 @@ mod tests {
             }
         };
 
-        let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
+        let merge = Arc::new(
+            CoalescePartitionsExec::new(partial_aggregate, &Funding::default()).unwrap(),
+        );
 
         let final_grouping_set = grouping_set.as_final(&Funding::default())?;
 
@@ -4123,7 +4127,9 @@ mod tests {
         );
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
 
-        let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
+        let merge = Arc::new(
+            CoalescePartitionsExec::new(partial_aggregate, &Funding::default()).unwrap(),
+        );
         let final_aggregate = AggregateExec::try_new(
             AggregateMode::Final,
             group_by.as_final(&Funding::default())?,
@@ -5059,8 +5065,9 @@ mod tests {
             Arc::clone(&schema),
             &Funding::default(),
         )?);
-        let coalesce = Arc::new(CoalescePartitionsExec::new(aggregate_exec))
-            as Arc<dyn ExecutionPlan>;
+        let coalesce = Arc::new(
+            CoalescePartitionsExec::new(aggregate_exec, &Funding::default()).unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
         let aggregate_final = Arc::new(AggregateExec::try_new(
             AggregateMode::Final,
             groups,
@@ -7266,7 +7273,9 @@ mod tests {
             None,
         )?;
         // Coalesce into a single partition for the PartialReduce
-        let coalesced = Arc::new(CoalescePartitionsExec::new(combined_input));
+        let coalesced = Arc::new(
+            CoalescePartitionsExec::new(combined_input, &Funding::default()).unwrap(),
+        );
 
         let partial_reduce = Arc::new(AggregateExec::try_new(
             AggregateMode::PartialReduce,

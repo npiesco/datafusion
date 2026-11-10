@@ -300,7 +300,10 @@ mod tests {
                 .unwrap();
 
         let sort: Arc<dyn ExecutionPlan> = Arc::new(
-            SortExec::new(ordering.clone(), input).with_preserve_partitioning(true),
+            SortExec::new(ordering.clone(), input, &Funding::default())
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
 
         let window_expr = Arc::new(StandardWindowExpr::new(
@@ -328,9 +331,11 @@ mod tests {
         )?);
 
         let limit: Arc<dyn ExecutionPlan> = if use_local_limit {
-            Arc::new(LocalLimitExec::new(window, 100))
+            Arc::new(LocalLimitExec::new(window, 100, &Funding::default()).unwrap())
         } else {
-            Arc::new(GlobalLimitExec::new(window, 0, Some(100)))
+            Arc::new(
+                GlobalLimitExec::new(window, 0, Some(100), &Funding::default()).unwrap(),
+            )
         };
 
         Ok(limit)

@@ -200,7 +200,8 @@ async fn test_count_partial_indirect_child() -> Result<()> {
     )?;
 
     // We introduce an intermediate optimization step between the partial and final aggregator
-    let coalesce = CoalescePartitionsExec::new(Arc::new(partial_agg));
+    let coalesce =
+        CoalescePartitionsExec::new(Arc::new(partial_agg), &Funding::default()).unwrap();
 
     let final_agg = AggregateExec::try_new(
         AggregateMode::Final,
@@ -234,7 +235,8 @@ async fn test_count_partial_with_nulls_indirect_child() -> Result<()> {
     )?;
 
     // We introduce an intermediate optimization step between the partial and final aggregator
-    let coalesce = CoalescePartitionsExec::new(Arc::new(partial_agg));
+    let coalesce =
+        CoalescePartitionsExec::new(Arc::new(partial_agg), &Funding::default()).unwrap();
 
     let final_agg = AggregateExec::try_new(
         AggregateMode::Final,

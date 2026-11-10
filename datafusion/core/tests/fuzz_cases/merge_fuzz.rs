@@ -17,6 +17,7 @@
 
 //! Fuzz Test for various corner cases merging streams of RecordBatches
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::{
@@ -118,7 +119,9 @@ async fn run_merge_test(input: Vec<Vec<RecordBatch>>) {
         .into();
 
         let exec = MemorySourceConfig::try_new_exec(&input, schema, None).unwrap();
-        let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+        let merge = Arc::new(
+            SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap(),
+        );
 
         let session_config = SessionConfig::new().with_batch_size(batch_size);
         let ctx = SessionContext::new_with_config(session_config);

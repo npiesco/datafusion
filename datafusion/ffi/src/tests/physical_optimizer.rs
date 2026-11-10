@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use datafusion_common::config::ConfigOptions;
@@ -36,7 +37,9 @@ impl PhysicalOptimizerRule for AddLimitRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(GlobalLimitExec::new(plan, 0, Some(10))))
+        Ok(Arc::new(
+            GlobalLimitExec::new(plan, 0, Some(10), &Funding::default()).unwrap(),
+        ))
     }
 
     fn name(&self) -> &str {
@@ -76,7 +79,9 @@ impl PhysicalOptimizerRule for ContextAwareAddLimitRule {
         plan: Arc<dyn ExecutionPlan>,
         _context: &dyn PhysicalOptimizerContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(GlobalLimitExec::new(plan, 0, Some(10))))
+        Ok(Arc::new(
+            GlobalLimitExec::new(plan, 0, Some(10), &Funding::default()).unwrap(),
+        ))
     }
 
     fn name(&self) -> &str {

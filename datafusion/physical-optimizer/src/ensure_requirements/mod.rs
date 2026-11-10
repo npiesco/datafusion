@@ -205,7 +205,10 @@ impl PhysicalOptimizerRule for EnsureRequirements {
 
         // Step 2b: Sorting enforcement (bottom-up) — runs on distribution-fixed plan
         let sort_ctx = PlanWithCorrespondingSort::new_default(dist_ctx.plan);
-        let sort_ctx = sort_ctx.transform_up(ensure_sorting)?.data;
+        let funding = &config.funding;
+        let sort_ctx = sort_ctx
+            .transform_up(|ctx| ensure_sorting(ctx, funding))?
+            .data;
 
         // Phase 3: Optimization passes
         // 3a: Parallelize sorts (Coalesce+Sort → SPM+Sort)
@@ -215,7 +218,9 @@ impl PhysicalOptimizerRule for EnsureRequirements {
         };
         let plan = if config.optimizer.repartition_sorts {
             let ctx = PlanWithCorrespondingCoalescePartitions::new_default(sort_ctx.plan);
-            ctx.transform_up(parallelize_sorts).data()?.plan
+            ctx.transform_up(|ctx| parallelize_sorts(ctx, funding))
+                .data()?
+                .plan
         } else {
             sort_ctx.plan
         };
@@ -238,12 +243,14 @@ impl PhysicalOptimizerRule for EnsureRequirements {
         };
         let mut sort_pushdown = SortPushDown::new_default(plan);
         assign_initial_requirements(&mut sort_pushdown);
-        let adjusted = pushdown_sorts(sort_pushdown)?;
+        let adjusted = pushdown_sorts(sort_pushdown, funding)?;
 
         // 3d: Partial sort
         adjusted
             .plan
-            .transform_up(|p| Ok(Transformed::yes(replace_with_partial_sort(p)?)))
+            .transform_up(|p| {
+                Ok(Transformed::yes(replace_with_partial_sort(p, funding)?))
+            })
             .data()
     }
 

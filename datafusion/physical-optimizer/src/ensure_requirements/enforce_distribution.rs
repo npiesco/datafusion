@@ -41,6 +41,7 @@ use crate::utils::{
 use arrow::compute::SortOptions;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::error::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::Transformed;
 use datafusion_expr::logical_plan::{Aggregate, JoinType};
@@ -759,6 +760,7 @@ fn partial_aggregate_output_satisfies_final_partitioning(
 fn preserving_order_enables_streaming(
     parent: &Arc<dyn ExecutionPlan>,
     ordered_child: &Arc<dyn ExecutionPlan>,
+    funding: &Funding,
 ) -> Result<bool> {
     // Only applicable to single-child operators that maintain input order
     // (e.g. AggregateExec in PartiallySorted mode). Operators that don't
@@ -780,8 +782,9 @@ fn preserving_order_enables_streaming(
         return Ok(false);
     }
     // Build parent with an unordered child via CoalescePartitionsExec.
-    let unordered_child: Arc<dyn ExecutionPlan> =
-        Arc::new(CoalescePartitionsExec::new(Arc::clone(ordered_child)));
+    let unordered_child: Arc<dyn ExecutionPlan> = funding.arc(
+        CoalescePartitionsExec::new(Arc::clone(ordered_child), funding)?,
+    )?;
     let without_ordered =
         replace_children_if_necessary(Arc::clone(parent), vec![unordered_child])?;
     Ok(without_ordered.pipeline_behavior() == EmissionType::Final)
@@ -791,7 +794,10 @@ fn preserving_order_enables_streaming(
 ///
 /// Updated node with an execution plan, where the desired single distribution
 /// requirement is satisfied.
-fn add_merge_on_top(input: DistributionContext) -> DistributionContext {
+fn add_merge_on_top(
+    input: DistributionContext,
+    funding: &Funding,
+) -> Result<DistributionContext> {
     // Apply only when the partition count is larger than one.
     if input.plan.output_partitioning().partition_count() > 1 {
         // When there is an existing ordering, we preserve ordering
@@ -802,18 +808,22 @@ fn add_merge_on_top(input: DistributionContext) -> DistributionContext {
         // (determined by flag `config.optimizer.prefer_existing_sort`)
         let new_plan: Arc<dyn ExecutionPlan> =
             if let Some(req) = input.plan.output_ordering() {
-                Arc::new(SortPreservingMergeExec::new(
+                funding.arc(SortPreservingMergeExec::new(
                     req.clone(),
                     Arc::clone(&input.plan),
-                ))
+                    funding,
+                )?)?
             } else {
                 // If there is no input order, we can simply coalesce partitions:
-                Arc::new(CoalescePartitionsExec::new(Arc::clone(&input.plan)))
+                funding.arc(CoalescePartitionsExec::new(
+                    Arc::clone(&input.plan),
+                    funding,
+                )?)?
             };
 
-        DistributionContext::new(new_plan, true, vec![input])
+        Ok(DistributionContext::new(new_plan, true, vec![input]))
     } else {
-        input
+        Ok(input)
     }
 }
 
@@ -871,13 +881,14 @@ fn remove_dist_changing_operators(
 /// ```
 pub fn replace_order_preserving_variants(
     mut context: DistributionContext,
+    funding: &Funding,
 ) -> Result<DistributionContext> {
     context.children = context
         .children
         .into_iter()
         .map(|child| {
             if child.data {
-                replace_order_preserving_variants(child)
+                replace_order_preserving_variants(child, funding)
             } else {
                 Ok(child)
             }
@@ -892,13 +903,15 @@ pub fn replace_order_preserving_variants(
             // fetch to an ancestor's sort can cross a filter, or lose the limit
             // entirely if the ancestor needs no additional sort.
             let ordering = spm.expr().clone();
-            context.plan = Arc::new(CoalescePartitionsExec::new(child_plan));
-            let sort = Arc::new(
-                SortExec::new(ordering, Arc::clone(&context.plan)).with_fetch(fetch),
-            );
+            context.plan =
+                funding.arc(CoalescePartitionsExec::new(child_plan, funding)?)?;
+            let sort = funding.arc(
+                SortExec::new(ordering, Arc::clone(&context.plan), funding)?
+                    .with_fetch(fetch)?,
+            )?;
             return Ok(DistributionContext::new(sort, false, vec![context]));
         }
-        context.plan = Arc::new(CoalescePartitionsExec::new(child_plan));
+        context.plan = funding.arc(CoalescePartitionsExec::new(child_plan, funding)?)?;
         return Ok(context);
     } else if let Some(repartition) = context.plan.downcast_ref::<RepartitionExec>()
         && repartition.preserve_order()
@@ -1318,7 +1331,7 @@ pub fn ensure_distribution(
             // Satisfy the distribution requirement if it is unmet.
             match &requirement {
                 Distribution::SinglePartition => {
-                    child = add_merge_on_top(child);
+                    child = add_merge_on_top(child, &config.funding)?;
                 }
                 Distribution::HashPartitioned(exprs)
                 | Distribution::KeyPartitioned(exprs) => {
@@ -1411,7 +1424,11 @@ pub fn ensure_distribution(
                  requirement,
              }| {
                 let streaming_benefit = if context.data {
-                    preserving_order_enables_streaming(&plan, &context.plan)?
+                    preserving_order_enables_streaming(
+                        &plan,
+                        &context.plan,
+                        &config.funding,
+                    )?
                 } else {
                     false
                 };
@@ -1431,7 +1448,8 @@ pub fn ensure_distribution(
                         && !streaming_benefit
                         && context.data
                     {
-                        context = replace_order_preserving_variants(context)?;
+                        context =
+                            replace_order_preserving_variants(context, &config.funding)?;
                         // If ordering requirements were satisfied before repartitioning,
                         // make sure ordering requirements are still satisfied after.
                         if ordering_satisfied {
@@ -1443,6 +1461,7 @@ pub fn ensure_distribution(
                                 context,
                                 sort_req,
                                 output_fetch,
+                                &config.funding,
                             )?;
                         }
                     }
@@ -1460,7 +1479,10 @@ pub fn ensure_distribution(
                             // input order, we keep order-preserving variants so
                             // ordering can flow through to ancestors that need it.
                             if !maintains_input_order && !streaming_benefit {
-                                context = replace_order_preserving_variants(context)?;
+                                context = replace_order_preserving_variants(
+                                    context,
+                                    &config.funding,
+                                )?;
                             }
                         }
                         Distribution::UnspecifiedDistribution => {
@@ -1468,7 +1490,10 @@ pub fn ensure_distribution(
                             if !maintains_input_order
                                 || plan.is::<OutputRequirementExec>()
                             {
-                                context = replace_order_preserving_variants(context)?;
+                                context = replace_order_preserving_variants(
+                                    context,
+                                    &config.funding,
+                                )?;
                             }
                         }
                     }

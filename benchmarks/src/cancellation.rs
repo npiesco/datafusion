@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -190,7 +191,8 @@ async fn datafusion(store: Arc<dyn ObjectStore>) -> Result<()> {
     println!("Creating physical plan...");
     let physical_plan = Arc::new(CoalescePartitionsExec::new(
         ctx.state().create_physical_plan(&logical_plan).await?,
-    ));
+        &Funding::default(),
+    )?);
 
     println!("Executing physical plan...");
     let partition = 0;

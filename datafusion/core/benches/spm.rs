@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -82,7 +83,8 @@ fn generate_spm_for_round_robin_tie_breaker(
     .into();
 
     let exec = MemorySourceConfig::try_new_exec(&partitions, schema, None).unwrap();
-    SortPreservingMergeExec::new(sort, exec)
+    SortPreservingMergeExec::new(sort, exec, &Funding::default())
+        .unwrap()
         .with_round_robin_repartition(enable_round_robin_repartition)
 }
 

@@ -936,7 +936,9 @@ async fn test_topk_filter_passes_through_coalesce_partitions() {
     let scan = DataSourceExec::from_data_source(base_config);
 
     // Add CoalescePartitionsExec to merge the two partitions
-    let coalesce = Arc::new(CoalescePartitionsExec::new(scan)) as Arc<dyn ExecutionPlan>;
+    let coalesce =
+        Arc::new(CoalescePartitionsExec::new(scan, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
 
     // Add SortExec with TopK
     let plan = Arc::new(
@@ -947,8 +949,11 @@ async fn test_topk_filter_passes_through_coalesce_partitions() {
             )])
             .unwrap(),
             coalesce,
+            &Funding::default(),
         )
-        .with_fetch(Some(1)),
+        .unwrap()
+        .with_fetch(Some(1))
+        .unwrap(),
     ) as Arc<dyn ExecutionPlan>;
 
     // Test optimization - the filter SHOULD pass through CoalescePartitionsExec
@@ -1136,16 +1141,22 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     );
 
     // Top-level CoalescePartitionsExec
-    let cp = Arc::new(CoalescePartitionsExec::new(hash_join)) as Arc<dyn ExecutionPlan>;
+    let cp =
+        Arc::new(CoalescePartitionsExec::new(hash_join, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
     // Add a sort for deterministic output
-    let plan = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new(
-            col("a", &probe_side_schema).unwrap(),
-            SortOptions::new(true, false), // descending, nulls_first
-        )])
+    let plan = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new(
+                col("a", &probe_side_schema).unwrap(),
+                SortOptions::new(true, false), // descending, nulls_first
+            )])
+            .unwrap(),
+            cp,
+            &Funding::default(),
+        )
         .unwrap(),
-        cp,
-    )) as Arc<dyn ExecutionPlan>;
+    ) as Arc<dyn ExecutionPlan>;
 
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
@@ -1352,16 +1363,22 @@ async fn test_hashjoin_dynamic_filter_pushdown_range_partitioned() {
     );
 
     // Top-level CoalescePartitionsExec
-    let cp = Arc::new(CoalescePartitionsExec::new(hash_join)) as Arc<dyn ExecutionPlan>;
+    let cp =
+        Arc::new(CoalescePartitionsExec::new(hash_join, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
     // Add a sort for deterministic output
-    let plan = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new(
-            col("a", &probe_side_schema).unwrap(),
-            SortOptions::new(true, false), // descending, nulls_first
-        )])
+    let plan = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new(
+                col("a", &probe_side_schema).unwrap(),
+                SortOptions::new(true, false), // descending, nulls_first
+            )])
+            .unwrap(),
+            cp,
+            &Funding::default(),
+        )
         .unwrap(),
-        cp,
-    )) as Arc<dyn ExecutionPlan>;
+    ) as Arc<dyn ExecutionPlan>;
 
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
@@ -1484,16 +1501,22 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     );
 
     // Top-level CoalescePartitionsExec
-    let cp = Arc::new(CoalescePartitionsExec::new(hash_join)) as Arc<dyn ExecutionPlan>;
+    let cp =
+        Arc::new(CoalescePartitionsExec::new(hash_join, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
     // Add a sort for deterministic output
-    let plan = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new(
-            col("a", &probe_side_schema).unwrap(),
-            SortOptions::new(true, false), // descending, nulls_first
-        )])
+    let plan = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new(
+                col("a", &probe_side_schema).unwrap(),
+                SortOptions::new(true, false), // descending, nulls_first
+            )])
+            .unwrap(),
+            cp,
+            &Funding::default(),
+        )
         .unwrap(),
-        cp,
-    )) as Arc<dyn ExecutionPlan>;
+    ) as Arc<dyn ExecutionPlan>;
 
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
@@ -2900,16 +2923,22 @@ async fn test_hashjoin_hash_table_pushdown_partitioned() {
     );
 
     // Top-level CoalescePartitionsExec
-    let cp = Arc::new(CoalescePartitionsExec::new(hash_join)) as Arc<dyn ExecutionPlan>;
+    let cp =
+        Arc::new(CoalescePartitionsExec::new(hash_join, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
     // Add a sort for deterministic output
-    let plan = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new(
-            col("a", &probe_side_schema).unwrap(),
-            SortOptions::new(true, false), // descending, nulls_first
-        )])
+    let plan = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new(
+                col("a", &probe_side_schema).unwrap(),
+                SortOptions::new(true, false), // descending, nulls_first
+            )])
+            .unwrap(),
+            cp,
+            &Funding::default(),
+        )
         .unwrap(),
-        cp,
-    )) as Arc<dyn ExecutionPlan>;
+    ) as Arc<dyn ExecutionPlan>;
 
     // Apply the optimization with config setting that forces HashTable strategy
     let mut config = ConfigOptions::default();
@@ -3001,16 +3030,22 @@ async fn test_hashjoin_hash_table_pushdown_collect_left() {
     );
 
     // Top-level CoalescePartitionsExec
-    let cp = Arc::new(CoalescePartitionsExec::new(hash_join)) as Arc<dyn ExecutionPlan>;
+    let cp =
+        Arc::new(CoalescePartitionsExec::new(hash_join, &Funding::default()).unwrap())
+            as Arc<dyn ExecutionPlan>;
     // Add a sort for deterministic output
-    let plan = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new(
-            col("a", &probe_side_schema).unwrap(),
-            SortOptions::new(true, false), // descending, nulls_first
-        )])
+    let plan = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new(
+                col("a", &probe_side_schema).unwrap(),
+                SortOptions::new(true, false), // descending, nulls_first
+            )])
+            .unwrap(),
+            cp,
+            &Funding::default(),
+        )
         .unwrap(),
-        cp,
-    )) as Arc<dyn ExecutionPlan>;
+    ) as Arc<dyn ExecutionPlan>;
 
     // Apply the optimization with config setting that forces HashTable strategy
     let mut config = ConfigOptions::default();
@@ -3423,13 +3458,17 @@ fn test_discover_dynamic_expression_producers() {
 #[test]
 fn test_filter_pushdown_through_sort_into_scan() {
     let scan = TestScanBuilder::new(schema()).with_support(true).build();
-    let sort = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new_default(
-            col("a", &schema()).unwrap(),
-        )])
+    let sort = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(
+                col("a", &schema()).unwrap(),
+            )])
+            .unwrap(),
+            scan,
+            &Funding::default(),
+        )
         .unwrap(),
-        scan,
-    ));
+    );
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
         Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
@@ -3456,13 +3495,17 @@ fn test_filter_pushdown_through_sort_into_scan() {
 #[test]
 fn test_filter_pushdown_through_sort_no_scan_support() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
-    let sort = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new_default(
-            col("a", &schema()).unwrap(),
-        )])
+    let sort = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(
+                col("a", &schema()).unwrap(),
+            )])
+            .unwrap(),
+            scan,
+            &Funding::default(),
+        )
         .unwrap(),
-        scan,
-    ));
+    );
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
         Arc::new(FilterExec::try_new(predicate, sort, &Funding::default()).unwrap());
@@ -3489,13 +3532,17 @@ fn test_filter_pushdown_through_sort_no_scan_support() {
 #[test]
 fn test_multiple_filters_pushdown_through_sort() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
-    let sort = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new_default(
-            col("a", &schema()).unwrap(),
-        )])
+    let sort = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(
+                col("a", &schema()).unwrap(),
+            )])
+            .unwrap(),
+            scan,
+            &Funding::default(),
+        )
         .unwrap(),
-        scan,
-    ));
+    );
     // WHERE a = 'foo' AND b = 'bar'
     let predicate = Arc::new(BinaryExpr::new(
         col_lit_predicate("a", "foo", &schema()),
@@ -3535,8 +3582,11 @@ fn test_filter_not_pushed_through_sort_with_fetch() {
             )])
             .unwrap(),
             scan,
+            &Funding::default(),
         )
-        .with_fetch(Some(10)),
+        .unwrap()
+        .with_fetch(Some(10))
+        .unwrap(),
     );
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
@@ -3572,8 +3622,11 @@ fn test_filter_pushed_through_sort_with_fetch() {
             )])
             .unwrap(),
             scan,
+            &Funding::default(),
         )
-        .with_fetch(Some(10)),
+        .unwrap()
+        .with_fetch(Some(10))
+        .unwrap(),
     );
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
@@ -3602,13 +3655,17 @@ fn test_filter_pushed_through_sort_with_fetch() {
 #[test]
 fn test_filter_with_projection_pushdown_through_sort() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
-    let sort = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new_default(
-            col("a", &schema()).unwrap(),
-        )])
+    let sort = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(
+                col("a", &schema()).unwrap(),
+            )])
+            .unwrap(),
+            scan,
+            &Funding::default(),
+        )
         .unwrap(),
-        scan,
-    ));
+    );
     // FilterExec: b = 'bar', projection=[a] (only output column a)
     let predicate = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
@@ -3649,8 +3706,11 @@ fn test_filter_pushdown_through_sort_preserves_partitioning() {
             )])
             .unwrap(),
             scan,
+            &Funding::default(),
         )
-        .with_preserve_partitioning(true),
+        .unwrap()
+        .with_preserve_partitioning(true)
+        .unwrap(),
     );
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
@@ -3679,13 +3739,17 @@ fn test_filter_pushdown_through_sort_preserves_partitioning() {
 #[test]
 fn test_filter_with_fetch_pushdown_through_sort() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
-    let sort = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new_default(
-            col("a", &schema()).unwrap(),
-        )])
+    let sort = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new_default(
+                col("a", &schema()).unwrap(),
+            )])
+            .unwrap(),
+            scan,
+            &Funding::default(),
+        )
         .unwrap(),
-        scan,
-    ));
+    );
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
         FilterExecBuilder::new(predicate, sort, &Funding::default())
@@ -3714,14 +3778,18 @@ fn test_filter_with_fetch_pushdown_through_sort() {
 #[test]
 fn test_filter_pushdown_through_sort_with_projection() {
     let scan = TestScanBuilder::new(schema()).with_support(false).build();
-    let sort = Arc::new(SortExec::new(
-        LexOrdering::new(vec![PhysicalSortExpr::new(
-            col("a", &schema()).unwrap(),
-            SortOptions::new(true, false), // descending, nulls_last
-        )])
+    let sort = Arc::new(
+        SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr::new(
+                col("a", &schema()).unwrap(),
+                SortOptions::new(true, false), // descending, nulls_last
+            )])
+            .unwrap(),
+            scan,
+            &Funding::default(),
+        )
         .unwrap(),
-        scan,
-    ));
+    );
     // FilterExec: b = 'bar', projection=[a] (only output column a)
     let predicate = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(

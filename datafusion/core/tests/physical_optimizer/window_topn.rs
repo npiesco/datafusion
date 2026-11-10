@@ -126,8 +126,12 @@ fn build_window_topn_no_partition(limit_value: i64) -> Result<Arc<dyn ExecutionP
         LexOrdering::new(vec![PhysicalSortExpr::new_default(col("val", &s)?).asc()])
             .unwrap();
 
-    let sort: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true));
+    let sort: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(ordering.clone(), input, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
+    );
 
     // ROW_NUMBER() OVER (ORDER BY val) — no partition by
     let order_by = vec![PhysicalSortExpr::new_default(col("val", &s)?).asc()];
@@ -177,8 +181,12 @@ fn build_non_window_filter_plan() -> Result<Arc<dyn ExecutionPlan>> {
     ])
     .unwrap();
 
-    let sort: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true));
+    let sort: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(ordering.clone(), input, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
+    );
 
     let partition_by = vec![col("pk", &s)?];
     let order_by = vec![PhysicalSortExpr::new_default(col("val", &s)?).asc()];
@@ -477,8 +485,12 @@ fn build_rank_no_order_by_plan(limit_value: i64) -> Result<Arc<dyn ExecutionPlan
         LexOrdering::new(vec![PhysicalSortExpr::new_default(col("pk", &s)?).asc()])
             .unwrap();
 
-    let sort: Arc<dyn ExecutionPlan> =
-        Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true));
+    let sort: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(ordering.clone(), input, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
+    );
 
     let partition_by = vec![col("pk", &s)?];
 

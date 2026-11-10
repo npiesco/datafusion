@@ -51,28 +51,45 @@ use std::vec;
 
 #[test]
 fn roundtrip_local_limit() -> Result<()> {
-    roundtrip_test(Arc::new(LocalLimitExec::new(
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap()),
-        25,
-    )))
+    roundtrip_test(Arc::new(
+        LocalLimitExec::new(
+            Arc::new(
+                EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap(),
+            ),
+            25,
+            &Funding::default(),
+        )
+        .unwrap(),
+    ))
 }
 
 #[test]
 fn roundtrip_global_limit() -> Result<()> {
-    roundtrip_test(Arc::new(GlobalLimitExec::new(
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap()),
-        0,
-        Some(25),
-    )))
+    roundtrip_test(Arc::new(
+        GlobalLimitExec::new(
+            Arc::new(
+                EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap(),
+            ),
+            0,
+            Some(25),
+            &Funding::default(),
+        )
+        .unwrap(),
+    ))
 }
 
 #[test]
 fn roundtrip_global_skip_no_limit() -> Result<()> {
-    roundtrip_test(Arc::new(GlobalLimitExec::new(
-        Arc::new(EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap()),
-        10,
-        None, // no limit
-    )))
+    roundtrip_test(Arc::new(
+        GlobalLimitExec::new(
+            Arc::new(
+                EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap(),
+            ),
+            10,
+            None, // no limit, &Funding::default()
+        )
+        .unwrap(),
+    ))
 }
 
 /// Sort key at index 1, so a decoder that misbinds column name vs index
@@ -108,7 +125,9 @@ fn roundtrip_limit_with_required_ordering() -> Result<()> {
         Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
         3,
         Some(25),
-    );
+        &Funding::default(),
+    )
+    .unwrap();
     global.set_required_ordering(required_ordering.clone());
     let decoded =
         roundtrip_test_and_return(Arc::new(global), &ctx, &codec, &proto_converter)?;
@@ -120,7 +139,9 @@ fn roundtrip_limit_with_required_ordering() -> Result<()> {
     let mut local = LocalLimitExec::new(
         Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
         25,
-    );
+        &Funding::default(),
+    )
+    .unwrap();
     local.set_required_ordering(required_ordering.clone());
     let decoded =
         roundtrip_test_and_return(Arc::new(local), &ctx, &codec, &proto_converter)?;
@@ -173,14 +194,16 @@ fn roundtrip_limit_required_ordering_reaches_data_source() -> Result<()> {
             .clone())
     };
 
-    let mut limit = GlobalLimitExec::new(make_scan(), 0, Some(10));
+    let mut limit =
+        GlobalLimitExec::new(make_scan(), 0, Some(10), &Funding::default()).unwrap();
     limit.set_required_ordering(limit_required_ordering(&file_schema)?);
     let scan_config = scan_after_limit_pushdown(limit)?;
     assert_eq!(scan_config.limit, Some(10));
     assert!(scan_config.preserve_order);
 
-    let scan_config =
-        scan_after_limit_pushdown(GlobalLimitExec::new(make_scan(), 0, Some(10)))?;
+    let scan_config = scan_after_limit_pushdown(
+        GlobalLimitExec::new(make_scan(), 0, Some(10), &Funding::default()).unwrap(),
+    )?;
     assert_eq!(scan_config.limit, Some(10));
     assert!(!scan_config.preserve_order);
     Ok(())
@@ -214,14 +237,20 @@ fn roundtrip_coalesce_partitions_with_fetch() -> Result<()> {
     let field_b = Field::new("b", DataType::Int64, false);
     let schema = Arc::new(Schema::new(vec![field_a, field_b]));
 
-    roundtrip_test(Arc::new(CoalescePartitionsExec::new(Arc::new(
-        EmptyExec::new(schema.clone(), &Funding::default()).unwrap(),
-    ))))?;
+    roundtrip_test(Arc::new(
+        CoalescePartitionsExec::new(
+            Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
+            &Funding::default(),
+        )
+        .unwrap(),
+    ))?;
 
     roundtrip_test(Arc::new(
-        CoalescePartitionsExec::new(Arc::new(
-            EmptyExec::new(schema, &Funding::default()).unwrap(),
-        ))
+        CoalescePartitionsExec::new(
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            &Funding::default(),
+        )
+        .unwrap()
         .with_fetch(Some(10)),
     ))
 }

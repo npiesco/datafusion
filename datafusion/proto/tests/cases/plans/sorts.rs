@@ -56,10 +56,14 @@ fn roundtrip_sort() -> Result<()> {
         },
     ]
     .into();
-    roundtrip_test(Arc::new(SortExec::new(
-        sort_exprs,
-        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
-    )))
+    roundtrip_test(Arc::new(
+        SortExec::new(
+            sort_exprs,
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            &Funding::default(),
+        )
+        .unwrap(),
+    ))
 }
 
 #[test]
@@ -85,17 +89,24 @@ fn roundtrip_sort_preserve_partitioning() -> Result<()> {
     ]
     .into();
 
-    roundtrip_test(Arc::new(SortExec::new(
-        sort_exprs.clone(),
-        Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
-    )))?;
+    roundtrip_test(Arc::new(
+        SortExec::new(
+            sort_exprs.clone(),
+            Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
+            &Funding::default(),
+        )
+        .unwrap(),
+    ))?;
 
     roundtrip_test(Arc::new(
         SortExec::new(
             sort_exprs,
             Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            &Funding::default(),
         )
-        .with_preserve_partitioning(true),
+        .unwrap()
+        .with_preserve_partitioning(true)
+        .unwrap(),
     ))
 }
 
@@ -141,8 +152,11 @@ fn roundtrip_sort_with_fetch() -> Result<()> {
                 Arc::new(
                     EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap(),
                 ),
+                &Funding::default(),
             )
-            .with_fetch(Some(7)),
+            .unwrap()
+            .with_fetch(Some(7))
+            .unwrap(),
         ),
         &ctx,
         &codec,
@@ -161,9 +175,13 @@ fn roundtrip_sort_with_fetch() -> Result<()> {
             SortExec::new(
                 sort_exprs.clone(),
                 Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+                &Funding::default(),
             )
+            .unwrap()
             .with_fetch(Some(3))
-            .with_preserve_partitioning(true),
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
         ),
         &ctx,
         &codec,
@@ -222,10 +240,16 @@ fn roundtrip_sort_preserving_merge() -> Result<()> {
 
     // No fetch: `fetch` is encoded as -1 and must decode back to `None`.
     let roundtripped = roundtrip_test_and_return(
-        Arc::new(SortPreservingMergeExec::new(
-            sort_exprs.clone(),
-            Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
-        )),
+        Arc::new(
+            SortPreservingMergeExec::new(
+                sort_exprs.clone(),
+                Arc::new(
+                    EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap(),
+                ),
+                &Funding::default(),
+            )
+            .unwrap(),
+        ),
         &ctx,
         &codec,
         &proto_converter,
@@ -246,7 +270,9 @@ fn roundtrip_sort_preserving_merge() -> Result<()> {
                 Arc::new(
                     EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap(),
                 ),
+                &Funding::default(),
             )
+            .unwrap()
             .with_fetch(Some(11)),
         ),
         &ctx,

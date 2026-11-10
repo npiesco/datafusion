@@ -17,6 +17,7 @@
 
 //! Fuzz Test for various corner cases sorting RecordBatches exceeds available memory and should spill
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::{
@@ -239,7 +240,8 @@ impl SortTest {
             .unwrap();
 
         let exec = MemorySourceConfig::try_new_exec(&input, schema, None).unwrap();
-        let sort = Arc::new(SortExec::new(sort_ordering, exec));
+        let sort =
+            Arc::new(SortExec::new(sort_ordering, exec, &Funding::default()).unwrap());
 
         let session_config = SessionConfig::new().with_repartition_file_scans(false);
         let session_ctx = if let Some(pool_size) = self.pool_size {

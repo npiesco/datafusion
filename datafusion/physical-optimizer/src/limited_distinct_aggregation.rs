@@ -26,6 +26,7 @@ use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 
 use crate::PhysicalOptimizerRule;
@@ -65,6 +66,7 @@ impl LimitedDistinctAggregation {
     /// aggregation
     fn transform_limit(
         plan: Arc<dyn ExecutionPlan>,
+        funding: &Funding,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let limit: usize;
         let mut global_fetch: Option<usize> = None;
@@ -136,13 +138,16 @@ impl LimitedDistinctAggregation {
         };
         let child = child.to_owned().transform_down(closure).data()?;
         if is_global_limit {
-            return Ok(Some(Arc::new(GlobalLimitExec::new(
+            return Ok(Some(funding.arc(GlobalLimitExec::new(
                 child,
                 global_skip,
                 global_fetch,
-            ))));
+                funding,
+            )?)?));
         }
-        Ok(Some(Arc::new(LocalLimitExec::new(child, limit))))
+        Ok(Some(
+            funding.arc(LocalLimitExec::new(child, limit, funding)?)?,
+        ))
     }
 }
 
@@ -161,9 +166,10 @@ impl PhysicalOptimizerRule for LimitedDistinctAggregation {
         if config.optimizer.enable_distinct_aggregation_soft_limit {
             plan.transform_down(|plan| {
                 Ok(
-                    if let Some(plan) =
-                        LimitedDistinctAggregation::transform_limit(plan.to_owned())?
-                    {
+                    if let Some(plan) = LimitedDistinctAggregation::transform_limit(
+                        plan.to_owned(),
+                        &config.funding,
+                    )? {
                         Transformed::yes(plan)
                     } else {
                         Transformed::no(plan)

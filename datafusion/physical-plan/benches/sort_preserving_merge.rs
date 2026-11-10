@@ -21,6 +21,7 @@ use arrow::{
 };
 use arrow_schema::{SchemaRef, SortOptions};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use datafusion_common::funding::Funding;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, expressions::col};
 use datafusion_physical_plan::test::TestMemoryExec;
@@ -178,7 +179,14 @@ fn bench_merge_sorted_preserving(c: &mut Criterion) {
                             None,
                         )
                         .unwrap();
-                        Arc::new(SortPreservingMergeExec::new(sort_order.clone(), exec))
+                        Arc::new(
+                            SortPreservingMergeExec::new(
+                                sort_order.clone(),
+                                exec,
+                                &Funding::default(),
+                            )
+                            .unwrap(),
+                        )
                     },
                     |merge_exec| {
                         let rt = tokio::runtime::Runtime::new().unwrap();

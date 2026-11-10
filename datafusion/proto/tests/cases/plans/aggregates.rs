@@ -113,10 +113,16 @@ fn roundtrip_aggregate_preserves_optimizer_schema_and_reversed_state() -> Result
         options: SortOptions::new(true, true),
     }])
     .expect("single sort expression should form an ordering");
-    let input: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(
-        input_ordering,
-        Arc::new(EmptyExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap()),
-    ));
+    let input: Arc<dyn ExecutionPlan> = Arc::new(
+        SortExec::new(
+            input_ordering,
+            Arc::new(
+                EmptyExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap(),
+            ),
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
     let original_name = "first_value(b) ORDER BY [b ASC NULLS LAST]";
     let aggregate_expr = Arc::new(
         AggregateExprBuilder::new(first_value_udaf(), vec![col("b", &input_schema)?])

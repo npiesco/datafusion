@@ -832,7 +832,7 @@ fn test_output_req_after_projection() -> Result<()> {
 fn test_coalesce_partitions_after_projection() -> Result<()> {
     let csv = create_simple_csv_exec();
     let coalesce_partitions: Arc<dyn ExecutionPlan> =
-        Arc::new(CoalescePartitionsExec::new(csv));
+        Arc::new(CoalescePartitionsExec::new(csv, &Funding::default()).unwrap());
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
@@ -1467,7 +1467,9 @@ fn test_sort_after_projection() -> Result<()> {
         ]
         .into(),
         csv,
-    );
+        &Funding::default(),
+    )
+    .unwrap();
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
             ProjectionExpr::new(Arc::new(Column::new("c", 2)), "c"),
@@ -1521,7 +1523,9 @@ fn test_sort_preserving_after_projection() -> Result<()> {
         ]
         .into(),
         csv,
-    );
+        &Funding::default(),
+    )
+    .unwrap();
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
             ProjectionExpr::new(Arc::new(Column::new("c", 2)), "c"),

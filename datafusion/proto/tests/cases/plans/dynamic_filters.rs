@@ -686,8 +686,11 @@ fn test_sort_topk_with_dynamic_filter_roundtrip() -> Result<()> {
             }])
             .unwrap(),
             child,
+            &Funding::default(),
         )
-        .with_fetch(Some(10)),
+        .unwrap()
+        .with_fetch(Some(10))
+        .unwrap(),
     ) as Arc<dyn ExecutionPlan>;
 
     // Verify the optimizer kept the dynamic filter on the SortExec.

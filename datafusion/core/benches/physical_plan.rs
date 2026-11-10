@@ -16,6 +16,7 @@
 // under the License.
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use datafusion_common::funding::Funding;
 
 use std::sync::Arc;
 
@@ -56,7 +57,8 @@ fn sort_preserving_merge_operator(
         None,
     )
     .unwrap();
-    let merge = Arc::new(SortPreservingMergeExec::new(sort, exec));
+    let merge =
+        Arc::new(SortPreservingMergeExec::new(sort, exec, &Funding::default()).unwrap());
     let task_ctx = session_ctx.task_ctx();
     rt.block_on(collect(merge, task_ctx)).unwrap();
 }

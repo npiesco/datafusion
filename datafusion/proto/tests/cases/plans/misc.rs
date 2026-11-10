@@ -248,11 +248,15 @@ fn roundtrip_repartition_preserve_order() -> Result<()> {
     let source1 = SortExec::new(
         sort_exprs.clone(),
         Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
-    );
+        &Funding::default(),
+    )
+    .unwrap();
     let source2 = SortExec::new(
         sort_exprs,
         Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
-    );
+        &Funding::default(),
+    )
+    .unwrap();
     let union = UnionExec::try_new(vec![
         Arc::new(source1) as Arc<dyn ExecutionPlan>,
         Arc::new(source2) as Arc<dyn ExecutionPlan>,

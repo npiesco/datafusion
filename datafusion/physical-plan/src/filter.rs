@@ -781,9 +781,11 @@ impl ExecutionPlan for FilterExec {
                 };
                 match filter_input.with_fetch(Some(effective_fetch)) {
                     Some(node) => node,
-                    None => {
-                        funding.arc(LocalLimitExec::new(filter_input, effective_fetch))?
-                    }
+                    None => funding.arc(LocalLimitExec::new(
+                        filter_input,
+                        effective_fetch,
+                        funding,
+                    )?)?,
                 }
             } else {
                 filter_input
@@ -1450,7 +1452,6 @@ mod tests {
     use crate::test;
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
-    use datafusion_common::funding::Funding;
 
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {

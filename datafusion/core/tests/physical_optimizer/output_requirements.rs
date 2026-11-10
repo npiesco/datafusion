@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{parquet_exec, schema, sort_exec, sort_expr};
@@ -160,7 +161,9 @@ async fn scalar_subquery_root_preserves_global_ordering_end_to_end() {
             .expect("attach sort information to source"),
     );
     // The main plan establishes the query's global ordering via an `SortPreservingMergeExec` over the two sorted partitions.
-    let main_input = Arc::new(SortPreservingMergeExec::new(ordering, source));
+    let main_input = Arc::new(
+        SortPreservingMergeExec::new(ordering, source, &Funding::default()).unwrap(),
+    );
 
     // Dummy subquery that returns a single row
     let sq_batch = record_batch!(("v", Int32, [42])).expect("build subquery batch");

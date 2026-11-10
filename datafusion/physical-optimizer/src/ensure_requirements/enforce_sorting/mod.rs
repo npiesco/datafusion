@@ -55,6 +55,7 @@ use crate::utils::{
 };
 
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::plan_err;
 use datafusion_common::tree_node::Transformed;
 use datafusion_physical_expr::{Distribution, Partitioning};
@@ -196,6 +197,7 @@ fn update_coalesce_ctx_children(
 /// If there's one replaces the [`SortExec`] plan with a [`PartialSortExec`]
 pub fn replace_with_partial_sort(
     plan: Arc<dyn ExecutionPlan>,
+    funding: &Funding,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some(sort_plan) = plan.downcast_ref::<SortExec>() else {
         return Ok(plan);
@@ -219,15 +221,16 @@ pub fn replace_with_partial_sort(
         common_prefix_length += 1;
     }
     if common_prefix_length > 0 {
-        return Ok(Arc::new(
+        return Ok(funding.arc(
             PartialSortExec::new(
                 sort_exprs,
                 Arc::clone(sort_plan.input()),
                 common_prefix_length,
-            )
-            .with_preserve_partitioning(sort_plan.preserve_partitioning())
+                funding,
+            )?
+            .with_preserve_partitioning(sort_plan.preserve_partitioning())?
             .with_fetch(sort_plan.fetch()),
-        ));
+        )?);
     }
     Ok(plan)
 }
@@ -320,6 +323,7 @@ pub fn replace_with_partial_sort(
 ///        If so, remove (see `remove_bottleneck_in_subplan`).
 pub fn parallelize_sorts(
     mut requirements: PlanWithCorrespondingCoalescePartitions,
+    funding: &Funding,
 ) -> Result<Transformed<PlanWithCorrespondingCoalescePartitions>> {
     update_coalesce_ctx_children(&mut requirements);
 
@@ -348,13 +352,17 @@ pub fn parallelize_sorts(
         // deals with the children and their children and so on.
         requirements = requirements.children.swap_remove(0);
 
-        requirements = add_sort_above_with_check(requirements, sort_reqs, fetch)?;
+        requirements =
+            add_sort_above_with_check(requirements, sort_reqs, fetch, funding)?;
 
-        let spm =
-            SortPreservingMergeExec::new(sort_exprs, Arc::clone(&requirements.plan));
+        let spm = SortPreservingMergeExec::new(
+            sort_exprs,
+            Arc::clone(&requirements.plan),
+            funding,
+        )?;
         Ok(Transformed::yes(
             PlanWithCorrespondingCoalescePartitions::new(
-                Arc::new(spm.with_fetch(fetch)),
+                funding.arc(spm.with_fetch(fetch))?,
                 false,
                 vec![requirements],
             ),
@@ -369,10 +377,10 @@ pub fn parallelize_sorts(
 
         Ok(Transformed::yes(
             PlanWithCorrespondingCoalescePartitions::new(
-                Arc::new(
-                    CoalescePartitionsExec::new(Arc::clone(&requirements.plan))
+                funding.arc(
+                    CoalescePartitionsExec::new(Arc::clone(&requirements.plan), funding)?
                         .with_fetch(fetch),
-                ),
+                )?,
                 false,
                 vec![requirements],
             ),
@@ -405,6 +413,7 @@ pub fn parallelize_sorts(
 ///          decides this SPM is unnecessary and removes it from the plan.
 pub fn ensure_sorting(
     mut requirements: PlanWithCorrespondingSort,
+    funding: &Funding,
 ) -> Result<Transformed<PlanWithCorrespondingSort>> {
     requirements = update_sort_ctx_children_data(requirements, false)?;
 
@@ -412,7 +421,7 @@ pub fn ensure_sorting(
     if requirements.children.is_empty() {
         return Ok(Transformed::no(requirements));
     }
-    let maybe_requirements = analyze_immediate_sort_removal(requirements)?;
+    let maybe_requirements = analyze_immediate_sort_removal(requirements, funding)?;
     requirements = if !maybe_requirements.transformed {
         maybe_requirements.data
     } else {
@@ -435,7 +444,9 @@ pub fn ensure_sorting(
             if !eq_properties.ordering_satisfy_requirement(req.clone())? {
                 // Make sure we preserve the ordering requirements:
                 if physical_ordering.is_some() {
-                    child = update_child_to_remove_unnecessary_sort(idx, child, plan)?;
+                    child = update_child_to_remove_unnecessary_sort(
+                        idx, child, plan, funding,
+                    )?;
                 }
                 child = add_sort_above(
                     child,
@@ -443,13 +454,14 @@ pub fn ensure_sorting(
                     plan.downcast_ref::<OutputRequirementExec>()
                         .map(|output| output.fetch())
                         .unwrap_or(None),
-                );
+                    funding,
+                )?;
                 child = update_sort_ctx_children_data(child, true)?;
             }
         } else if physical_ordering.is_none() || !plan.maintains_input_order()[idx] {
             // We have a `SortExec` whose effect may be neutralized by another
             // order-imposing operator, remove this sort:
-            child = update_child_to_remove_unnecessary_sort(idx, child, plan)?;
+            child = update_child_to_remove_unnecessary_sort(idx, child, plan, funding)?;
         }
         updated_children.push(child);
     }
@@ -459,7 +471,7 @@ pub fn ensure_sorting(
     // calculate the result in reverse:
     let child_node = &requirements.children[0];
     if is_window(&requirements.plan) && child_node.data {
-        return adjust_window_sort_removal(requirements).map(Transformed::yes);
+        return adjust_window_sort_removal(requirements, funding).map(Transformed::yes);
     } else if is_sort_preserving_merge(&requirements.plan)
         && child_node.plan.output_partitioning().partition_count() <= 1
     {
@@ -467,10 +479,11 @@ pub fn ensure_sorting(
         // single partition.
         let child_node = requirements.children.swap_remove(0);
         if let Some(fetch) = requirements.plan.fetch() {
-            let mut limit = LocalLimitExec::new(Arc::clone(&child_node.plan), fetch);
+            let mut limit =
+                LocalLimitExec::new(Arc::clone(&child_node.plan), fetch, funding)?;
             limit.set_required_ordering(requirements.plan.output_ordering().cloned());
             return Ok(Transformed::yes(PlanContext::new(
-                Arc::new(limit),
+                funding.arc(limit)?,
                 false,
                 vec![child_node],
             )));
@@ -488,6 +501,7 @@ pub fn ensure_sorting(
 /// Otherwise, returns the original plan
 fn analyze_immediate_sort_removal(
     mut node: PlanWithCorrespondingSort,
+    funding: &Funding,
 ) -> Result<Transformed<PlanWithCorrespondingSort>> {
     let Some(sort_exec) = node.plan.downcast_ref::<SortExec>() else {
         return Ok(Transformed::no(node));
@@ -505,13 +519,14 @@ fn analyze_immediate_sort_removal(
         && sort_input.output_partitioning().partition_count() > 1
     {
         // Replace the sort with a sort-preserving merge:
-        Arc::new(
+        funding.arc(
             SortPreservingMergeExec::new(
                 sort_exec.expr().clone(),
                 Arc::clone(sort_input),
-            )
+                funding,
+            )?
             .with_fetch(sort_exec.fetch()),
-        ) as _
+        )? as _
     } else {
         // Remove the sort:
         node.children = node.children.swap_remove(0).children;
@@ -519,14 +534,19 @@ fn analyze_immediate_sort_removal(
             let required_ordering = sort_exec.properties().output_ordering().cloned();
             // If the sort has a fetch, we need to add a limit:
             if properties.output_partitioning().partition_count() == 1 {
-                let mut global_limit =
-                    GlobalLimitExec::new(Arc::clone(sort_input), 0, Some(fetch));
+                let mut global_limit = GlobalLimitExec::new(
+                    Arc::clone(sort_input),
+                    0,
+                    Some(fetch),
+                    funding,
+                )?;
                 global_limit.set_required_ordering(required_ordering);
-                Arc::new(global_limit)
+                funding.arc(global_limit)?
             } else {
-                let mut local_limit = LocalLimitExec::new(Arc::clone(sort_input), fetch);
+                let mut local_limit =
+                    LocalLimitExec::new(Arc::clone(sort_input), fetch, funding)?;
                 local_limit.set_required_ordering(required_ordering);
-                Arc::new(local_limit)
+                funding.arc(local_limit)?
             }
         } else {
             Arc::clone(sort_input)
@@ -543,6 +563,7 @@ fn analyze_immediate_sort_removal(
 /// whether it may allow removing a sort.
 fn adjust_window_sort_removal(
     mut window_tree: PlanWithCorrespondingSort,
+    funding: &Funding,
 ) -> Result<PlanWithCorrespondingSort> {
     // Window operators have a single child we need to adjust:
     let child_node = remove_corresponding_sort_from_sub_plan(
@@ -554,6 +575,7 @@ fn adjust_window_sort_removal(
                 .child_distribution(0),
             Some(Distribution::SinglePartition)
         ),
+        funding,
     )?;
     window_tree.children.push(child_node);
 
@@ -601,7 +623,7 @@ fn adjust_window_sort_removal(
         // Satisfy the ordering requirement so that the window can run:
         let mut child_node = window_tree.children.swap_remove(0);
         if let Some(reqs) = reqs {
-            child_node = add_sort_above(child_node, reqs.into_single(), None);
+            child_node = add_sort_above(child_node, reqs.into_single(), None, funding)?;
         }
         let child_plan = Arc::clone(&child_node.plan);
         window_tree.children.push(child_node);
@@ -723,6 +745,7 @@ fn update_child_to_remove_unnecessary_sort(
     child_idx: usize,
     mut node: PlanWithCorrespondingSort,
     parent: &Arc<dyn ExecutionPlan>,
+    funding: &Funding,
 ) -> Result<PlanWithCorrespondingSort> {
     if node.data {
         let requires_single_partition = matches!(
@@ -731,7 +754,11 @@ fn update_child_to_remove_unnecessary_sort(
                 .child_distribution(child_idx),
             Some(Distribution::SinglePartition)
         );
-        node = remove_corresponding_sort_from_sub_plan(node, requires_single_partition)?;
+        node = remove_corresponding_sort_from_sub_plan(
+            node,
+            requires_single_partition,
+            funding,
+        )?;
     }
     node.data = false;
     Ok(node)
@@ -741,6 +768,7 @@ fn update_child_to_remove_unnecessary_sort(
 fn remove_corresponding_sort_from_sub_plan(
     mut node: PlanWithCorrespondingSort,
     requires_single_partition: bool,
+    funding: &Funding,
 ) -> Result<PlanWithCorrespondingSort> {
     // A `SortExec` is always at the bottom of the tree.
     if let Some(sort_exec) = node.plan.downcast_ref::<SortExec>() {
@@ -761,6 +789,7 @@ fn remove_corresponding_sort_from_sub_plan(
                     remove_corresponding_sort_from_sub_plan(
                         child,
                         matches!(required_dist[idx], Distribution::SinglePartition),
+                        funding,
                     )
                 } else {
                     Ok(child)
@@ -792,11 +821,12 @@ fn remove_corresponding_sort_from_sub_plan(
         let plan = Arc::clone(&node.plan);
         let fetch = plan.fetch();
         let plan = if let Some(ordering) = plan.output_ordering() {
-            Arc::new(
-                SortPreservingMergeExec::new(ordering.clone(), plan).with_fetch(fetch),
-            ) as _
+            funding.arc(
+                SortPreservingMergeExec::new(ordering.clone(), plan, funding)?
+                    .with_fetch(fetch),
+            )? as _
         } else {
-            Arc::new(CoalescePartitionsExec::new(plan)) as _
+            funding.arc(CoalescePartitionsExec::new(plan, funding)?)? as _
         };
         node = PlanWithCorrespondingSort::new(plan, false, vec![node]);
         node = update_sort_ctx_children_data(node, false)?;

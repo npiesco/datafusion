@@ -209,6 +209,7 @@ mod tests {
     use crate::coalesce_partitions::CoalescePartitionsExec;
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_common::{ColumnStatistics, stats::Precision};
 
     fn make_stats_leaf(num_rows: usize) -> Arc<dyn ExecutionPlan> {
@@ -234,7 +235,8 @@ mod tests {
     #[test]
     fn coalesce_returns_overall_stats_for_any_partition() {
         let leaf = make_stats_leaf(100);
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(CoalescePartitionsExec::new(leaf));
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(leaf, &Funding::default()).unwrap());
 
         let ctx = StatisticsContext::new();
         let stats = ctx

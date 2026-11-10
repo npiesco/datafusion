@@ -323,7 +323,8 @@ mod test {
             Arc::new(Column::new("id", 0)),
             SortOptions::new(false, false),
         )];
-        let sort = SortExec::new(ordering.clone().into(), scan_1);
+        let sort =
+            SortExec::new(ordering.clone().into(), scan_1, &Funding::default()).unwrap();
         let sort_exec: Arc<dyn ExecutionPlan> = Arc::new(sort);
         let statistics = (0..sort_exec.output_partitioning().partition_count())
             .map(|idx| {
@@ -351,7 +352,10 @@ mod test {
         let scan_2 = create_scan_exec_with_statistics(None, Some(2)).await;
         // Add sort execution plan
         let sort_exec: Arc<dyn ExecutionPlan> = Arc::new(
-            SortExec::new(ordering.into(), scan_2).with_preserve_partitioning(true),
+            SortExec::new(ordering.into(), scan_2, &Funding::default())
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
         // Partition 1: ids [3,4], dates [2025-03-01, 2025-03-02]
         let expected_statistic_partition_1 = create_partition_statistics(
@@ -686,8 +690,9 @@ mod test {
         use datafusion_expr::JoinType;
 
         let left_scan = create_scan_exec_with_statistics(None, Some(2)).await;
-        let left_scan_coalesced: Arc<dyn ExecutionPlan> =
-            Arc::new(CoalescePartitionsExec::new(left_scan));
+        let left_scan_coalesced: Arc<dyn ExecutionPlan> = Arc::new(
+            CoalescePartitionsExec::new(left_scan, &Funding::default()).unwrap(),
+        );
 
         let right_scan = create_scan_exec_with_statistics(None, Some(2)).await;
 
@@ -763,7 +768,7 @@ mod test {
     async fn test_statistic_by_partition_of_coalesce_partitions() -> Result<()> {
         let scan = create_scan_exec_with_statistics(None, Some(2)).await;
         let coalesce_partitions: Arc<dyn ExecutionPlan> =
-            Arc::new(CoalescePartitionsExec::new(scan));
+            Arc::new(CoalescePartitionsExec::new(scan, &Funding::default()).unwrap());
         // All files merged: ids [1-4], dates [2025-03-01, 2025-03-04]
         let expected_statistic_partition = create_partition_statistics(
             4,
@@ -793,7 +798,7 @@ mod test {
     async fn test_statistic_by_partition_of_local_limit() -> Result<()> {
         let scan = create_scan_exec_with_statistics(None, Some(2)).await;
         let local_limit: Arc<dyn ExecutionPlan> =
-            Arc::new(LocalLimitExec::new(scan.clone(), 1));
+            Arc::new(LocalLimitExec::new(scan.clone(), 1, &Funding::default()).unwrap());
         let statistics = (0..local_limit.output_partitioning().partition_count())
             .map(|idx| {
                 StatisticsContext::new().compute(
@@ -824,8 +829,9 @@ mod test {
     async fn test_statistic_by_partition_of_global_limit_partitions() -> Result<()> {
         let scan = create_scan_exec_with_statistics(None, Some(2)).await;
         // Skip 2 rows
-        let global_limit: Arc<dyn ExecutionPlan> =
-            Arc::new(GlobalLimitExec::new(scan.clone(), 0, Some(2)));
+        let global_limit: Arc<dyn ExecutionPlan> = Arc::new(
+            GlobalLimitExec::new(scan.clone(), 0, Some(2), &Funding::default()).unwrap(),
+        );
         let statistics = (0..global_limit.output_partitioning().partition_count())
             .map(|idx| {
                 StatisticsContext::new().compute(
@@ -1138,7 +1144,10 @@ mod test {
             assert_eq!(1, rows);
         }
 
-        let coalesce = Arc::new(CoalescePartitionsExec::new(agg_partial.clone()));
+        let coalesce = Arc::new(
+            CoalescePartitionsExec::new(agg_partial.clone(), &Funding::default())
+                .unwrap(),
+        );
 
         let agg_final = Arc::new(AggregateExec::try_new(
             AggregateMode::Final,
@@ -1573,8 +1582,9 @@ mod test {
     async fn test_hash_join_partition_statistics() -> Result<()> {
         // Create left table scan and coalesce to 1 partition for CollectLeft mode
         let left_scan = create_scan_exec_with_statistics(None, Some(2)).await;
-        let left_scan_coalesced = Arc::new(CoalescePartitionsExec::new(left_scan.clone()))
-            as Arc<dyn ExecutionPlan>;
+        let left_scan_coalesced = Arc::new(
+            CoalescePartitionsExec::new(left_scan.clone(), &Funding::default()).unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
 
         // Create right table scan with different table name
         let right_create_table_sql = "CREATE EXTERNAL TABLE t2 (id INT NOT NULL, date DATE) \

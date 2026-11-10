@@ -81,6 +81,7 @@ impl PhysicalOptimizerRule for TopKRepartition {
         if !config.optimizer.enable_topk_repartition {
             return Ok(plan);
         }
+        let funding = &config.funding;
         plan.transform_down(|node| {
             // Match SortExec with fetch (TopK)
             let Some(sort_exec) = node.downcast_ref::<SortExec>() else {
@@ -139,11 +140,11 @@ impl PhysicalOptimizerRule for TopKRepartition {
             }
 
             // Insert a copy of the TopK below the repartition
-            let new_sort: Arc<dyn ExecutionPlan> = Arc::new(
-                SortExec::new(sort_exprs.clone(), Arc::clone(repart_input))
-                    .with_fetch(Some(fetch))
-                    .with_preserve_partitioning(sort_exec.preserve_partitioning()),
-            );
+            let new_sort: Arc<dyn ExecutionPlan> = funding.arc(
+                SortExec::new(sort_exprs.clone(), Arc::clone(repart_input), funding)?
+                    .with_fetch(Some(fetch))?
+                    .with_preserve_partitioning(sort_exec.preserve_partitioning())?,
+            )?;
 
             let new_partitioning =
                 Partitioning::Hash(hash_exprs.clone(), *num_partitions);
@@ -157,11 +158,11 @@ impl PhysicalOptimizerRule for TopKRepartition {
                 new_repartition
             };
 
-            let new_top_sort: Arc<dyn ExecutionPlan> = Arc::new(
-                SortExec::new(sort_exprs.clone(), new_sort_input)
-                    .with_fetch(Some(fetch))
-                    .with_preserve_partitioning(sort_exec.preserve_partitioning()),
-            );
+            let new_top_sort: Arc<dyn ExecutionPlan> = funding.arc(
+                SortExec::new(sort_exprs.clone(), new_sort_input, funding)?
+                    .with_fetch(Some(fetch))?
+                    .with_preserve_partitioning(sort_exec.preserve_partitioning())?,
+            )?;
 
             Ok(Transformed::yes(new_top_sort))
         })
@@ -181,6 +182,7 @@ impl PhysicalOptimizerRule for TopKRepartition {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
     use datafusion_physical_plan::displayable;
@@ -219,9 +221,12 @@ mod tests {
         );
 
         let sort = Arc::new(
-            SortExec::new(ordering, repartition)
+            SortExec::new(ordering, repartition, &Funding::default())
+                .unwrap()
                 .with_fetch(Some(3))
-                .with_preserve_partitioning(true),
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
 
         let config = ConfigOptions::new();
@@ -252,7 +257,10 @@ mod tests {
         );
 
         let sort: Arc<dyn ExecutionPlan> = Arc::new(
-            SortExec::new(ordering, repartition).with_preserve_partitioning(true),
+            SortExec::new(ordering, repartition, &Funding::default())
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
 
         let config = ConfigOptions::new();
@@ -283,9 +291,12 @@ mod tests {
         );
 
         let sort: Arc<dyn ExecutionPlan> = Arc::new(
-            SortExec::new(ordering, repartition)
+            SortExec::new(ordering, repartition, &Funding::default())
+                .unwrap()
                 .with_fetch(Some(3))
-                .with_preserve_partitioning(true),
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
 
         let config = ConfigOptions::new();
@@ -320,9 +331,12 @@ mod tests {
             Arc::new(CoalesceBatchesExec::new(repartition, 8192));
 
         let sort = Arc::new(
-            SortExec::new(ordering, coalesce)
+            SortExec::new(ordering, coalesce, &Funding::default())
+                .unwrap()
                 .with_fetch(Some(3))
-                .with_preserve_partitioning(true),
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
 
         let config = ConfigOptions::new();
@@ -350,9 +364,12 @@ mod tests {
         );
 
         let sort: Arc<dyn ExecutionPlan> = Arc::new(
-            SortExec::new(ordering, repartition)
+            SortExec::new(ordering, repartition, &Funding::default())
+                .unwrap()
                 .with_fetch(Some(3))
-                .with_preserve_partitioning(true),
+                .unwrap()
+                .with_preserve_partitioning(true)
+                .unwrap(),
         );
 
         let config = ConfigOptions::new();

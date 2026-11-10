@@ -228,7 +228,7 @@ pub fn sort_expr_options(
 }
 
 pub fn coalesce_partitions_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(CoalescePartitionsExec::new(input))
+    Arc::new(CoalescePartitionsExec::new(input, &Funding::default()).unwrap())
 }
 
 pub fn memory_exec(schema: &SchemaRef) -> Arc<dyn ExecutionPlan> {
@@ -333,7 +333,7 @@ pub fn sort_preserving_merge_exec(
     ordering: LexOrdering,
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(SortPreservingMergeExec::new(ordering, input))
+    Arc::new(SortPreservingMergeExec::new(ordering, input, &Funding::default()).unwrap())
 }
 
 pub fn sort_preserving_merge_exec_with_fetch(
@@ -341,7 +341,11 @@ pub fn sort_preserving_merge_exec_with_fetch(
     input: Arc<dyn ExecutionPlan>,
     fetch: usize,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(SortPreservingMergeExec::new(ordering, input).with_fetch(Some(fetch)))
+    Arc::new(
+        SortPreservingMergeExec::new(ordering, input, &Funding::default())
+            .unwrap()
+            .with_fetch(Some(fetch)),
+    )
 }
 
 pub fn union_exec(input: Vec<Arc<dyn ExecutionPlan>>) -> Arc<dyn ExecutionPlan> {
@@ -352,7 +356,7 @@ pub fn local_limit_exec(
     input: Arc<dyn ExecutionPlan>,
     fetch: usize,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(LocalLimitExec::new(input, fetch))
+    Arc::new(LocalLimitExec::new(input, fetch, &Funding::default()).unwrap())
 }
 
 pub fn global_limit_exec(
@@ -360,7 +364,7 @@ pub fn global_limit_exec(
     skip: usize,
     fetch: Option<usize>,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(GlobalLimitExec::new(input, skip, fetch))
+    Arc::new(GlobalLimitExec::new(input, skip, fetch, &Funding::default()).unwrap())
 }
 
 pub fn repartition_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
@@ -402,7 +406,12 @@ pub fn sort_exec_with_preserve_partitioning(
     ordering: LexOrdering,
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(SortExec::new(ordering, input).with_preserve_partitioning(true))
+    Arc::new(
+        SortExec::new(ordering, input, &Funding::default())
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
+    )
 }
 
 pub fn sort_exec_with_fetch_and_preserve_partitioning(
@@ -411,9 +420,12 @@ pub fn sort_exec_with_fetch_and_preserve_partitioning(
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
     Arc::new(
-        SortExec::new(ordering, input)
+        SortExec::new(ordering, input, &Funding::default())
+            .unwrap()
             .with_fetch(fetch)
-            .with_preserve_partitioning(true),
+            .unwrap()
+            .with_preserve_partitioning(true)
+            .unwrap(),
     )
 }
 
@@ -422,7 +434,12 @@ pub fn sort_exec_with_fetch(
     fetch: Option<usize>,
     input: Arc<dyn ExecutionPlan>,
 ) -> Arc<dyn ExecutionPlan> {
-    Arc::new(SortExec::new(ordering, input).with_fetch(fetch))
+    Arc::new(
+        SortExec::new(ordering, input, &Funding::default())
+            .unwrap()
+            .with_fetch(fetch)
+            .unwrap(),
+    )
 }
 
 pub fn projection_exec(
