@@ -563,6 +563,7 @@ fn test_aggregate_with_dynamic_filter_roundtrip() -> Result<()> {
         vec![None],
         child,
         Arc::clone(&schema),
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
 
     // Run the optimizer rule for filter pushdown.
@@ -633,6 +634,7 @@ fn test_aggregate_without_dynamic_filter_roundtrip() -> Result<()> {
         vec![None],
         child,
         Arc::clone(&schema),
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
 
     let mut config = ConfigOptions::default();

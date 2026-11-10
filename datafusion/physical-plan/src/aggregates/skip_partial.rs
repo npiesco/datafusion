@@ -121,6 +121,7 @@ mod tests {
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use crate::execution_plan::ExecutionPlan;
     use crate::test::TestMemoryExec;
+    use datafusion_common::funding::Funding;
 
     use std::sync::Arc;
 
@@ -253,6 +254,7 @@ mod tests {
             vec![None],
             exec,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         // Execute and collect results

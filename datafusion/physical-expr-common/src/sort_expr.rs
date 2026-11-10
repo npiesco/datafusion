@@ -886,6 +886,12 @@ impl OrderingRequirements {
     }
 }
 
+impl CloneBytes for PhysicalSortExpr {
+    fn clone_bytes(&self) -> usize {
+        0
+    }
+}
+
 impl CloneBytes for PhysicalSortRequirement {
     fn clone_bytes(&self) -> usize {
         0

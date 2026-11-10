@@ -848,6 +848,7 @@ fn test_idempotent_sort_aggregate_sort_aggregate() {
             vec![],
             source,
             Arc::clone(&schema),
+            &Funding::default(),
         )
         .unwrap(),
     );

@@ -560,8 +560,8 @@ impl<'a> LoweredAggregateBuilder<'a> {
             == NullTreatment::IgnoreNulls;
 
         let mut builder = AggregateExprBuilder::new(func.to_owned(), physical_args)
-            .order_by(order_bys.clone())
-            .schema(Arc::new(physical_input_schema.to_owned()))
+            .order_by(funding.cloned(&order_bys)?)
+            .schema(funding.arc(physical_input_schema.to_owned())?)
             .alias(name)
             .output_metadata(output_metadata)
             .with_ignore_nulls(ignore_nulls)
@@ -575,7 +575,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
         }
 
         Ok(LoweredAggregate {
-            aggregate: Arc::new(builder.build()?),
+            aggregate: funding.arc(builder.build()?)?,
             filter,
             order_bys,
         })
@@ -729,6 +729,12 @@ impl AggregateFunctionExpr {
     /// Return if the aggregation is nullable
     pub fn is_nullable(&self) -> bool {
         self.is_nullable
+    }
+
+    /// The field of the final result of this aggregation as the function returns it,
+    /// before it is named after this expression (see [`Self::field`]).
+    pub fn return_field(&self) -> &FieldRef {
+        &self.return_field
     }
 
     /// the field of the final result of this aggregation.

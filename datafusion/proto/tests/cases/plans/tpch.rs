@@ -246,6 +246,7 @@ fn roundtrip_first_value_aggregate(
         vec![None],
         Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
         schema,
+        &Funding::default(),
     )?);
 
     let ctx = SessionContext::new();

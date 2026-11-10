@@ -142,7 +142,8 @@
 //! See the issue for details: <https://github.com/apache/datafusion/issues/22710>
 #![expect(rustdoc::private_intra_doc_links)]
 
-use datafusion_common::funding::Funding;
+use datafusion_common::cloned::CloneBytes;
+use datafusion_common::funding::{Funding, arc_bytes};
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -190,9 +191,9 @@ use datafusion_execution::memory_pool::MemoryLimit;
 use datafusion_expr::{Accumulator, Aggregate};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion_physical_expr::{
-    ConstExpr, EquivalenceProperties, physical_exprs_contains,
+    ConstExpr, EquivalenceProperties, Partitioning, physical_exprs_contains,
 };
 use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, fmt_sql};
 use datafusion_physical_expr_common::sort_expr::{
@@ -600,30 +601,43 @@ impl PhysicalGroupBy {
     }
 
     /// Returns the `PhysicalGroupBy` for a final aggregation if `self` is used for a partial
-    /// aggregation.
-    pub fn as_final(&self) -> PhysicalGroupBy {
-        let expr: Vec<_> =
-            self.output_exprs()
-                .into_iter()
-                .zip(
-                    self.expr.iter().map(|t| t.1.clone()).chain(std::iter::once(
-                        Aggregate::INTERNAL_GROUPING_ID.to_owned(),
-                    )),
-                )
-                .collect();
-        let num_exprs = expr.len();
+    /// aggregation, what it makes charged to `funding` before it is allocated.
+    pub fn as_final(&self, funding: &Funding) -> Result<PhysicalGroupBy> {
+        let num_exprs = self.num_output_exprs();
+        let mut expr = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+        expr.reserve_exact(num_exprs)?;
+        let grouping_id = self
+            .has_grouping_set
+            .then_some(Aggregate::INTERNAL_GROUPING_ID);
+        let names = self.expr.iter().map(|(_, name)| name.as_str());
+        for (index, name) in names.chain(grouping_id).enumerate() {
+            let column: Arc<dyn PhysicalExpr> =
+                funding.arc(Column::new(funding.string(name)?, index))?;
+            expr.push((column, funding.string(name)?))?;
+        }
         let groups = if self.expr.is_empty() && !self.has_grouping_set {
             // No GROUP BY expressions - should have no groups
             vec![]
         } else {
-            vec![vec![false; num_exprs]]
+            let mut group = funding.vec_with_capacity(num_exprs)?;
+            group.resize(num_exprs, false);
+            funding.vec_of([group])?
         };
-        Self {
-            expr,
+        Ok(Self {
+            expr: expr.keep(),
             null_expr: vec![],
             groups,
             has_grouping_set: false,
-        }
+        })
+    }
+}
+
+impl CloneBytes for PhysicalGroupBy {
+    fn clone_bytes(&self) -> usize {
+        self.expr
+            .clone_bytes()
+            .saturating_add(self.null_expr.clone_bytes())
+            .saturating_add(self.groups.clone_bytes())
     }
 }
 
@@ -868,18 +882,22 @@ pub struct AggregateExec {
     /// it remains `Some(..)` to enable dynamic filtering during aggregate execution;
     /// otherwise, it is cleared to `None`.
     dynamic_filter: Option<Arc<AggrDynFilter>>,
+    /// What this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl AggregateExec {
     /// Function used in `OptimizeAggregateOrder` optimizer rule,
     /// where we need parts of the new value, others cloned from the old one
-    /// Rewrites aggregate exec with new aggregate expressions.
+    /// Rewrites aggregate exec with new aggregate expressions, what it makes charged
+    /// to this node's funding before it is allocated.
     pub fn with_new_aggr_exprs(
         &self,
-        aggr_expr: impl Into<Arc<[Arc<AggregateFunctionExpr>]>>,
-    ) -> Self {
-        Self {
-            aggr_expr: aggr_expr.into(),
+        aggr_expr: Arc<[Arc<AggregateFunctionExpr>]>,
+    ) -> Result<Self> {
+        self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(Self {
+            aggr_expr,
             // clone the rest of the fields
             required_input_ordering: self.required_input_ordering.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
@@ -893,12 +911,18 @@ impl AggregateExec {
             schema: Arc::clone(&self.schema),
             input_schema: Arc::clone(&self.input_schema),
             dynamic_filter: self.dynamic_filter.clone(),
-        }
+            funding: self.funding.clone(),
+        })
     }
 
-    /// Clone this exec, overriding only the limit hint.
-    pub fn with_new_limit_options(&self, limit_options: Option<LimitOptions>) -> Self {
-        Self {
+    /// Clone this exec, overriding only the limit hint, what it makes charged to this
+    /// node's funding before it is allocated.
+    pub fn with_new_limit_options(
+        &self,
+        limit_options: Option<LimitOptions>,
+    ) -> Result<Self> {
+        self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(Self {
             limit_options,
             // clone the rest of the fields
             required_input_ordering: self.required_input_ordering.clone(),
@@ -913,27 +937,33 @@ impl AggregateExec {
             schema: Arc::clone(&self.schema),
             input_schema: Arc::clone(&self.input_schema),
             dynamic_filter: self.dynamic_filter.clone(),
-        }
+            funding: self.funding.clone(),
+        })
     }
 
     pub fn cache(&self) -> &PlanProperties {
         &self.cache
     }
 
-    /// Create a new hash aggregate execution plan
+    /// Create a new hash aggregate execution plan, what it makes charged to `funding`
+    /// before it is allocated. `aggr_expr` and `filter_expr` are lists made through
+    /// `funding`: the node keeps their items in blocks of its own and gives their blocks
+    /// back. The node keeps `funding` for the nodes rebuilt from it.
     pub fn try_new(
         mode: AggregateMode,
-        group_by: impl Into<Arc<PhysicalGroupBy>>,
+        group_by: PhysicalGroupBy,
         aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
         filter_expr: Vec<Option<Arc<dyn PhysicalExpr>>>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: SchemaRef,
+        funding: &Funding,
     ) -> Result<Self> {
-        let group_by = group_by.into();
-        let schema = create_schema(&input.schema(), &group_by, &aggr_expr, mode)?;
-
-        let schema = Arc::new(schema);
-        AggregateExec::try_new_with_schema(
+        let group_by = funding.arc(group_by)?;
+        let schema =
+            create_schema(&input.schema(), &group_by, &aggr_expr, mode, funding)?;
+        let schema = funding.arc(schema)?;
+        let filter_expr = funding.arc_from_vec(filter_expr)?;
+        let mut exec = AggregateExec::try_new_with_schema(
             mode,
             group_by,
             aggr_expr,
@@ -941,7 +971,10 @@ impl AggregateExec {
             input,
             input_schema,
             schema,
-        )
+            funding,
+        )?;
+        exec.init_dynamic_filter()?;
+        Ok(exec)
     }
 
     /// Create a new hash aggregate execution plan with the given schema.
@@ -951,19 +984,19 @@ impl AggregateExec {
     /// `AggregateExec` depends on the names of aggregate expressions. Since
     /// a rule may re-write aggregate expressions (e.g. reverse them) during
     /// initialization, field names may change inadvertently if one re-creates
-    /// the schema in such cases.
+    /// the schema in such cases. The dynamic filter is left for the caller to
+    /// initialize or carry over.
+    #[expect(clippy::too_many_arguments)]
     fn try_new_with_schema(
         mode: AggregateMode,
-        group_by: impl Into<Arc<PhysicalGroupBy>>,
+        group_by: Arc<PhysicalGroupBy>,
         mut aggr_expr: Vec<Arc<AggregateFunctionExpr>>,
-        filter_expr: impl Into<Arc<[Option<Arc<dyn PhysicalExpr>>]>>,
+        filter_expr: Arc<[Option<Arc<dyn PhysicalExpr>>]>,
         input: Arc<dyn ExecutionPlan>,
         input_schema: SchemaRef,
         schema: SchemaRef,
+        funding: &Funding,
     ) -> Result<Self> {
-        let group_by = group_by.into();
-        let filter_expr = filter_expr.into();
-
         // Make sure arguments are consistent in size
         assert_eq_or_internal_err!(
             aggr_expr.len(),
@@ -975,18 +1008,15 @@ impl AggregateExec {
 
         let input_eq_properties = input.equivalence_properties();
         // Get GROUP BY expressions:
-        let groupby_exprs = group_by.input_exprs();
+        let mut groupby_exprs = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+        groupby_exprs.reserve_exact(group_by.expr.len())?;
+        groupby_exprs.extend(group_by.expr.iter().map(|(expr, _)| Arc::clone(expr)));
         // If existing ordering satisfies a prefix of the GROUP BY expressions,
         // prefix requirements with this section. In this case, aggregation will
         // work more efficiently.
         // Copy the `PhysicalSortExpr`s to retain the sort options.
-        let (new_sort_exprs, indices) =
+        let (new_sort_exprs, mut indices) =
             input_eq_properties.find_longest_permutation(&groupby_exprs)?;
-
-        let mut new_requirements = new_sort_exprs
-            .into_iter()
-            .map(PhysicalSortRequirement::from)
-            .collect::<Vec<_>>();
 
         let req = get_finer_aggregate_exprs_requirement(
             &mut aggr_expr,
@@ -994,20 +1024,29 @@ impl AggregateExec {
             input_eq_properties,
             &mode,
         )?;
+        let mut new_requirements = funding.held::<Vec<PhysicalSortRequirement>>();
+        new_requirements.reserve_exact(new_sort_exprs.len() + req.len())?;
+        new_requirements.extend(
+            new_sort_exprs
+                .into_iter()
+                .map(PhysicalSortRequirement::from),
+        );
         new_requirements.extend(req);
 
-        let required_input_ordering =
-            LexRequirement::new(new_requirements).map(OrderingRequirements::new_soft);
+        let required_input_ordering = LexRequirement::new(new_requirements.drain(..))
+            .map(|requirement| {
+                funding
+                    .vec_of([requirement])
+                    .map(OrderingRequirements::Soft)
+            })
+            .transpose()?;
 
         // If our aggregation has grouping sets then our base grouping exprs will
         // be expanded based on the flags in `group_by.groups` where for each
         // group we swap the grouping expr for `null` if the flag is `true`
         // That means that each index in `indices` is valid if and only if
         // it is not null in every group
-        let indices: Vec<usize> = indices
-            .into_iter()
-            .filter(|idx| group_by.groups.iter().all(|group| !group[*idx]))
-            .collect();
+        indices.retain(|idx| group_by.groups.iter().all(|group| !group[*idx]));
 
         let input_order_mode = if indices.len() == groupby_exprs.len()
             && !indices.is_empty()
@@ -1024,7 +1063,7 @@ impl AggregateExec {
         let group_expr_mapping = ProjectionMapping::try_new(
             group_by.expr.iter().map(|(e, n)| (Arc::clone(e), n)),
             &input.schema(),
-            &Funding::default(),
+            funding,
         )?;
 
         let cache = Self::compute_properties(
@@ -1035,12 +1074,16 @@ impl AggregateExec {
             &mode,
             &input_order_mode,
             aggr_expr.as_ref(),
+            funding,
         )?;
+        let cache = funding.arc(cache)?;
+        let aggr_expr = funding.arc_from_vec(aggr_expr)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
 
-        let mut exec = AggregateExec {
+        Ok(AggregateExec {
             mode,
             group_by,
-            aggr_expr: aggr_expr.into(),
+            aggr_expr,
             filter_expr,
             input,
             schema,
@@ -1049,13 +1092,15 @@ impl AggregateExec {
             required_input_ordering,
             limit_options: None,
             input_order_mode,
-            cache: Arc::new(cache),
+            cache,
             dynamic_filter: None,
-        };
+            funding: funding.clone(),
+        })
+    }
 
-        exec.init_dynamic_filter();
-
-        Ok(exec)
+    /// What this node and the nodes rebuilt from it are charged to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Aggregation mode (full, partial)
@@ -1346,7 +1391,9 @@ impl AggregateExec {
         true
     }
 
-    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.,
+    /// what it makes charged to `funding` before it is allocated.
+    #[expect(clippy::too_many_arguments)]
     pub fn compute_properties(
         input: &Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
@@ -1355,6 +1402,7 @@ impl AggregateExec {
         mode: &AggregateMode,
         input_order_mode: &InputOrderMode,
         aggr_exprs: &[Arc<AggregateFunctionExpr>],
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Construct equivalence properties:
         let mut eq_properties = input
@@ -1367,32 +1415,38 @@ impl AggregateExec {
         // their output schema can include grouping-set columns before the
         // aggregate columns, so this aggregate-column mapping does not apply.
         if is_true_no_grouping {
-            let new_constants = aggr_exprs.iter().enumerate().map(|(idx, func)| {
-                let column = Arc::new(Column::new(func.name(), idx));
-                ConstExpr::from(column as Arc<dyn PhysicalExpr>)
-            });
-            eq_properties.add_constants(new_constants)?;
+            let mut new_constants = funding.held::<Vec<ConstExpr>>();
+            new_constants.reserve_exact(aggr_exprs.len())?;
+            for (idx, func) in aggr_exprs.iter().enumerate() {
+                let column: Arc<dyn PhysicalExpr> =
+                    funding.arc(Column::new(funding.string(func.name())?, idx))?;
+                new_constants.push(ConstExpr::from(column))?;
+            }
+            eq_properties.add_constants(new_constants.drain(..))?;
         }
 
         // Group by expression will be a distinct value after the aggregation.
         // Add it into the constraint set.
-        let mut constraints = eq_properties.constraints().to_vec();
-        let new_constraint = Constraint::Unique(
-            group_expr_mapping
-                .iter()
-                .flat_map(|(_, target_cols)| {
-                    target_cols.iter().flat_map(|(expr, _)| {
-                        expr.downcast_ref::<Column>().map(|c| c.index())
-                    })
+        let existing = eq_properties.constraints();
+        let mut constraints = funding.vec_with_capacity(existing.len() + 1)?;
+        for constraint in existing.iter() {
+            constraints.push(funding.cloned(constraint)?);
+        }
+        let target_columns = || {
+            group_expr_mapping.iter().flat_map(|(_, target_cols)| {
+                target_cols.iter().flat_map(|(expr, _)| {
+                    expr.downcast_ref::<Column>().map(|c| c.index())
                 })
-                .collect(),
-        );
-        constraints.push(new_constraint);
+            })
+        };
+        let mut unique = funding.vec_with_capacity(target_columns().count())?;
+        unique.extend(target_columns());
+        constraints.push(Constraint::Unique(unique));
         eq_properties =
             eq_properties.with_constraints(Constraints::new_unverified(constraints));
 
         // Get output partitioning:
-        let input_partitioning = input.output_partitioning().clone();
+        let input_partitioning = input.output_partitioning();
         let output_partitioning = match mode.input_mode() {
             AggregateInputMode::Raw => {
                 // First stage aggregation will not change the output partitioning,
@@ -1401,7 +1455,12 @@ impl AggregateExec {
                 let input_eq_properties = input.equivalence_properties();
                 input_partitioning.project(group_expr_mapping, input_eq_properties)
             }
-            AggregateInputMode::Partial => input_partitioning.clone(),
+            AggregateInputMode::Partial => {
+                if let Partitioning::Hash(exprs, _) = input_partitioning {
+                    funding.charge(exprs.clone_bytes())?;
+                }
+                input_partitioning.clone()
+            }
         };
 
         // TODO: Emission type and boundedness information can be enhanced here
@@ -1735,28 +1794,29 @@ impl AggregateExec {
     /// Check if dynamic filter is possible for the current plan node.
     /// - If yes, init one inside `AggregateExec`'s `dynamic_filter` field.
     /// - If not supported, `self.dynamic_filter` should be kept `None`
-    fn init_dynamic_filter(&mut self) {
+    fn init_dynamic_filter(&mut self) -> Result<()> {
         if (!self.group_by.is_empty()) || (self.mode != AggregateMode::Partial) {
             debug_assert!(
                 self.dynamic_filter.is_none(),
                 "The current operator node does not support dynamic filter"
             );
-            return;
+            return Ok(());
         }
 
         // Already initialized.
         if self.dynamic_filter.is_some() {
-            return;
+            return Ok(());
         }
 
+        let funding = &self.funding;
         // Collect supported accumulators
         // It is assumed the order of aggregate expressions are not changed from `AggregateExec`
         // to `AggregateStream`
-        let mut aggr_dyn_filters = Vec::new();
+        let mut aggr_dyn_filters = funding.held::<Vec<PerAccumulatorDynFilter>>();
         // All column references in the dynamic filter, used when initializing the dynamic
         // filter, and it's used to decide if this dynamic filter is able to get push
         // through certain node during optimization.
-        let mut all_cols: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut all_cols = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
         for (i, aggr_expr) in self.aggr_expr.iter().enumerate() {
             // 1. Only `min` or `max` aggregate function
             let fun_name = aggr_expr.fun().name();
@@ -1767,28 +1827,33 @@ impl AggregateExec {
             } else if fun_name.eq_ignore_ascii_case("max") {
                 DynamicFilterAggregateType::Max
             } else {
-                return;
+                return Ok(());
             };
 
             // 2. arg should be only 1 column reference
             if let [arg] = aggr_expr.expressions().as_slice()
                 && arg.is::<Column>()
             {
-                all_cols.push(Arc::clone(arg));
+                all_cols.push(Arc::clone(arg))?;
                 aggr_dyn_filters.push(PerAccumulatorDynFilter {
                     aggr_type,
                     aggr_index: i,
-                    shared_bound: Arc::new(Mutex::new(ScalarValue::Null)),
-                });
+                    shared_bound: funding.arc(Mutex::new(ScalarValue::Null))?,
+                })?;
             }
         }
 
         if !aggr_dyn_filters.is_empty() {
-            self.dynamic_filter = Some(Arc::new(AggrDynFilter {
-                filter: Arc::new(DynamicFilterPhysicalExpr::new(all_cols, lit(true))),
-                supported_accumulators_info: aggr_dyn_filters,
-            }))
+            let always: Arc<dyn PhysicalExpr> =
+                funding.arc(Literal::new(ScalarValue::Boolean(Some(true)), funding)?)?;
+            let filter =
+                funding.arc(DynamicFilterPhysicalExpr::new(all_cols.keep(), always))?;
+            self.dynamic_filter = Some(funding.arc(AggrDynFilter {
+                filter,
+                supported_accumulators_info: aggr_dyn_filters.keep(),
+            })?);
         }
+        Ok(())
     }
 
     // Collect column references for the dynamic filter expression from the supported accumulators.
@@ -2043,24 +2108,29 @@ impl ExecutionPlan for AggregateExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })? as _)
+            }
             ChildrenPropertiesMode::Recompute => {
+                let funding = &self.funding;
                 let mut me = AggregateExec::try_new_with_schema(
                     self.mode,
                     Arc::clone(&self.group_by),
-                    self.aggr_expr.to_vec(),
+                    funding.vec_from_slice(&self.aggr_expr)?,
                     Arc::clone(&self.filter_expr),
                     Arc::clone(&children[0]),
                     Arc::clone(&self.input_schema),
                     Arc::clone(&self.schema),
+                    funding,
                 )?;
                 me.limit_options = self.limit_options;
                 me.dynamic_filter.clone_from(&self.dynamic_filter);
-                Ok(Arc::new(me))
+                Ok(funding.arc(me)? as _)
             }
         }
     }
@@ -2604,13 +2674,18 @@ impl AggregateExec {
             let schema = SchemaRef::new(schema.try_into()?);
             AggregateExec::try_new_with_schema(
                 mode,
-                group_by,
+                Arc::new(group_by),
                 aggr_expr,
-                filter_expr,
+                filter_expr.into(),
                 input,
                 Arc::clone(&input_schema),
                 schema,
+                &Funding::default(),
             )
+            .and_then(|mut exec| {
+                exec.init_dynamic_filter()?;
+                Ok(exec)
+            })
         } else {
             AggregateExec::try_new(
                 mode,
@@ -2619,6 +2694,7 @@ impl AggregateExec {
                 filter_expr,
                 input,
                 Arc::clone(&input_schema),
+                &Funding::default(),
             )
         }?;
         let aggregate = if let Some(limit) = limit {
@@ -2655,35 +2731,76 @@ impl AggregateExec {
 }
 
 /// Creates the output schema for an [`AggregateExec`] containing the group by columns followed
-/// by the aggregate columns.
+/// by the aggregate columns, what it makes charged to `funding` before it is allocated.
 fn create_schema(
     input_schema: &Schema,
     group_by: &PhysicalGroupBy,
     aggr_expr: &[Arc<AggregateFunctionExpr>],
     mode: AggregateMode,
+    funding: &Funding,
 ) -> Result<Schema> {
-    let mut fields = Vec::with_capacity(group_by.num_output_exprs() + aggr_expr.len());
-    fields.extend(group_by.output_fields(input_schema)?);
+    let mut fields = funding.held::<Vec<FieldRef>>();
+    fields.reserve_exact(group_by.num_output_exprs() + aggr_expr.len())?;
+    for (index, (expr, name)) in group_by.expr.iter().enumerate() {
+        let returned = expr.return_field(input_schema)?;
+        let nullable = group_by.groups.iter().any(|group| group[index])
+            || expr.nullable(input_schema)?;
+        fields.push(funded_field(
+            name,
+            returned.data_type(),
+            nullable,
+            returned.metadata(),
+            funding,
+        )?)?;
+    }
+    if group_by.has_grouping_set {
+        fields.push(funded_field(
+            Aggregate::INTERNAL_GROUPING_ID,
+            &group_by.grouping_id_data_type(),
+            false,
+            &HashMap::new(),
+            funding,
+        )?)?;
+    }
 
     match mode.output_mode() {
         AggregateOutputMode::Final => {
             // in final mode, the field with the final result of the accumulator
             for expr in aggr_expr {
-                fields.push(expr.field())
+                let field = Arc::clone(expr.return_field());
+                fields.push(funding.renamed_field(field, expr.name())?)?;
             }
         }
         AggregateOutputMode::Partial => {
             // in partial mode, the fields of the accumulator's state
             for expr in aggr_expr {
-                fields.extend(expr.state_fields()?.iter().cloned());
+                let state_fields = expr.state_fields()?;
+                fields.reserve(state_fields.len())?;
+                fields.extend(state_fields);
             }
         }
     }
 
     Ok(Schema::new_with_metadata(
-        fields,
+        funding.fields(&fields)?,
         input_schema.metadata().clone(),
     ))
+}
+
+/// A field named `name` of a copy of `data_type`, in a counted block of its own: its
+/// block, name and type charged to `funding` before they are allocated. A non-empty
+/// `metadata` map is copied uncharged: its table's size is not measured.
+fn funded_field(
+    name: &str,
+    data_type: &DataType,
+    nullable: bool,
+    metadata: &HashMap<String, String>,
+    funding: &Funding,
+) -> Result<FieldRef> {
+    funding.charge(arc_bytes::<Field>())?;
+    let field = Field::new(funding.string(name)?, funding.cloned(data_type)?, nullable)
+        .with_metadata(metadata.clone());
+    Ok(Arc::new(field))
 }
 
 /// Determines the lexical ordering requirement for an aggregate expression.
@@ -3187,6 +3304,7 @@ mod tests {
     use datafusion_physical_expr::Partitioning;
     use datafusion_physical_expr::PhysicalSortExpr;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+    use datafusion_physical_expr::expressions::lit;
     use datafusion_physical_expr::expressions::{Literal, NotExpr};
 
     use crate::projection::ProjectionExec;
@@ -3396,6 +3514,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&input_schema),
+            &Funding::default(),
         )?);
 
         let result =
@@ -3461,7 +3580,7 @@ mod tests {
 
         let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
 
-        let final_grouping_set = grouping_set.as_final();
+        let final_grouping_set = grouping_set.as_final(&Funding::default())?;
 
         let task_ctx = if spill {
             new_spill_ctx(4, 3160)
@@ -3476,6 +3595,7 @@ mod tests {
             vec![None],
             merge,
             input_schema,
+            &Funding::default(),
         )?);
 
         let result = collect(merged_aggregate.execute(0, Arc::clone(&task_ctx))?).await?;
@@ -3546,6 +3666,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&input_schema),
+            &Funding::default(),
         )?);
 
         let result =
@@ -3582,7 +3703,7 @@ mod tests {
 
         let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
 
-        let final_grouping_set = grouping_set.as_final();
+        let final_grouping_set = grouping_set.as_final(&Funding::default())?;
 
         let merged_aggregate = Arc::new(AggregateExec::try_new(
             AggregateMode::Final,
@@ -3591,6 +3712,7 @@ mod tests {
             vec![None],
             merge,
             input_schema,
+            &Funding::default(),
         )?);
 
         // Verify statistics are preserved proportionally through aggregation
@@ -3909,6 +4031,7 @@ mod tests {
                 vec![None; n_aggr],
                 Arc::clone(&input),
                 Arc::clone(&input_schema),
+                &Funding::default(),
             )?);
 
             let stream = partial_aggregate.execute_typed(0, &task_ctx)?;
@@ -3966,6 +4089,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
         let task_ctx = Arc::new(
             TaskContext::default().with_session_config(
@@ -4002,11 +4126,12 @@ mod tests {
         let merge = Arc::new(CoalescePartitionsExec::new(partial_aggregate));
         let final_aggregate = AggregateExec::try_new(
             AggregateMode::Final,
-            group_by.as_final(),
+            group_by.as_final(&Funding::default())?,
             aggregates,
             vec![None],
             merge,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         let final_stream = final_aggregate.execute_typed(0, &task_ctx)?;
@@ -4060,6 +4185,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
         let task_ctx = Arc::new(
             TaskContext::default().with_session_config(
@@ -4135,6 +4261,7 @@ mod tests {
                 vec![],
                 partial_input,
                 Arc::clone(&schema),
+                &Funding::default(),
             )?
             .with_limit_options(Some(LimitOptions::new(2))),
         );
@@ -4164,11 +4291,12 @@ mod tests {
         let final_aggregate = Arc::new(
             AggregateExec::try_new(
                 AggregateMode::Final,
-                group_by.as_final(),
+                group_by.as_final(&Funding::default())?,
                 vec![],
                 vec![],
                 final_input,
                 Arc::clone(&schema),
+                &Funding::default(),
             )?
             .with_limit_options(Some(LimitOptions::new(2))),
         );
@@ -4229,6 +4357,7 @@ mod tests {
             vec![None],
             input,
             schema,
+            &Funding::default(),
         )
     }
 
@@ -4292,6 +4421,7 @@ mod tests {
             vec![None],
             empty_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         let partial_schema = partial.schema();
         let partial_state_batch = RecordBatch::try_new(
@@ -4314,6 +4444,7 @@ mod tests {
             vec![None],
             partial_reduce_input,
             partial_schema,
+            &Funding::default(),
         )
     }
 
@@ -4414,6 +4545,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert!(matches!(
             aggregate.input_order_mode(),
@@ -4470,6 +4602,7 @@ mod tests {
             vec![None],
             empty_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         let partial_schema = partial_aggregate.schema();
         let partial_state_batch = RecordBatch::try_new(
@@ -4490,11 +4623,12 @@ mod tests {
 
         let final_aggregate = AggregateExec::try_new(
             AggregateMode::Final,
-            group_by.as_final(),
+            group_by.as_final(&Funding::default())?,
             aggr_expr,
             vec![None],
             final_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert_eq!(final_aggregate.input_order_mode(), &InputOrderMode::Sorted);
 
@@ -4567,6 +4701,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert!(matches!(
             aggregate.input_order_mode(),
@@ -4625,6 +4760,7 @@ mod tests {
             vec![None],
             blocking_exec,
             schema,
+            &Funding::default(),
         )?);
 
         let fut = crate::collect(aggregate_exec, task_ctx);
@@ -4664,6 +4800,7 @@ mod tests {
             vec![None],
             blocking_exec,
             schema,
+            &Funding::default(),
         )?);
 
         let fut = crate::collect(aggregate_exec, task_ctx);
@@ -4920,6 +5057,7 @@ mod tests {
             vec![None],
             memory_exec,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
         let coalesce = Arc::new(CoalescePartitionsExec::new(aggregate_exec))
             as Arc<dyn ExecutionPlan>;
@@ -4930,6 +5068,7 @@ mod tests {
             vec![None],
             coalesce,
             schema,
+            &Funding::default(),
         )?) as Arc<dyn ExecutionPlan>;
 
         let result = crate::collect(aggregate_final, task_ctx).await?;
@@ -5062,6 +5201,7 @@ mod tests {
             vec![None, None],
             Arc::clone(&blocking_exec) as Arc<dyn ExecutionPlan>,
             schema,
+            &Funding::default(),
         )?);
         let new_agg = Arc::clone(&aggregate_exec).replace_children(
             vec![blocking_exec],
@@ -5150,6 +5290,7 @@ mod tests {
             vec![None],
             input,
             schema,
+            &Funding::default(),
         )?);
 
         let output =
@@ -5264,6 +5405,7 @@ mod tests {
             vec![None],
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             batch.schema(),
+            &Funding::default(),
         )?);
 
         let session_config = SessionConfig::default();
@@ -5332,6 +5474,7 @@ mod tests {
             vec![None],
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             schema,
+            &Funding::default(),
         )?);
 
         let mut session_config = SessionConfig::default();
@@ -5424,6 +5567,7 @@ mod tests {
             vec![None],
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             schema,
+            &Funding::default(),
         )?);
 
         let mut session_config = SessionConfig::default();
@@ -5507,6 +5651,7 @@ mod tests {
             vec![None],
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             schema,
+            &Funding::default(),
         )?);
 
         let session_config = SessionConfig::default()
@@ -5602,6 +5747,7 @@ mod tests {
             vec![None],
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             schema,
+            &Funding::default(),
         )?);
 
         let session_config = SessionConfig::default()
@@ -5699,6 +5845,7 @@ mod tests {
             vec![None],
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             schema,
+            &Funding::default(),
         )?);
 
         let session_config = SessionConfig::default()
@@ -5763,6 +5910,7 @@ mod tests {
             &grouping_set,
             &aggr_expr,
             AggregateMode::Final,
+            &Funding::default(),
         )?;
         let expected_schema = Schema::new(vec![
             Field::new("a", DataType::Float32, false),
@@ -5836,6 +5984,7 @@ mod tests {
             vec![None, None],
             plan,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         let batch_size = 2;
@@ -5979,6 +6128,7 @@ mod tests {
             vec![None, None],
             plan,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         let batch_size = 2;
@@ -6070,6 +6220,7 @@ mod tests {
             vec![None],
             single_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert_eq!(
             single_agg_zero
@@ -6147,6 +6298,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert_eq!(agg.properties().output_partitioning().partition_count(), 4);
 
@@ -6280,6 +6432,7 @@ mod tests {
             vec![None],
             input,
             Arc::clone(schema),
+            &Funding::default(),
         )?;
 
         if let Some(limit) = limit {
@@ -6728,6 +6881,7 @@ mod tests {
             vec![None],
             single_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert_eq!(
             StatisticsContext::new()
@@ -6749,6 +6903,7 @@ mod tests {
             vec![None],
             partial_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         assert_eq!(
@@ -6894,6 +7049,7 @@ mod tests {
             vec![None],
             Arc::new(scan) as Arc<dyn ExecutionPlan>,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         let task_ctx = new_spill_ctx(1, 600);
@@ -7024,6 +7180,7 @@ mod tests {
             vec![None, None, None, None, None],
             Arc::new(scan) as Arc<dyn ExecutionPlan>,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         // Pool must be large enough for accumulation to start but too small for
@@ -7076,6 +7233,7 @@ mod tests {
             vec![None; aggregates.len()],
             input1,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         // Step 2: Partial aggregation on partition 2
@@ -7088,6 +7246,7 @@ mod tests {
             vec![None; aggregates.len()],
             input2,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         // Collect partial results
@@ -7116,6 +7275,7 @@ mod tests {
             vec![None; aggregates.len()],
             coalesced,
             Arc::clone(&partial_schema),
+            &Funding::default(),
         )?);
 
         // Verify PartialReduce output schema matches Partial output schema
@@ -7140,6 +7300,7 @@ mod tests {
             vec![None; aggregates.len()],
             final_input,
             Arc::clone(&partial_schema),
+            &Funding::default(),
         )?);
 
         let result = crate::collect(final_agg, Arc::clone(&task_ctx)).await?;
@@ -7873,6 +8034,7 @@ mod tests {
             vec![None],
             child,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         // Assertion 1: A filter with the same children can override the existing
@@ -7968,6 +8130,7 @@ mod tests {
             vec![None],
             child,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert!(agg.dynamic_expressions_produced().is_empty());
 
@@ -7998,6 +8161,7 @@ mod tests {
             vec![None],
             child,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         let df = Arc::new(DynamicFilterPhysicalExpr::new(

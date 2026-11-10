@@ -884,6 +884,7 @@ mod test {
                 vec![None],
                 Arc::clone(&scan),
                 scan_schema.clone(),
+                &Funding::default(),
             )?) as _;
 
         let plan_string = get_plan_string(&aggregate_exec_partial).swap_remove(0);
@@ -957,6 +958,7 @@ mod test {
             vec![None],
             aggregate_exec_partial.clone(),
             aggregate_exec_partial.schema(),
+            &Funding::default(),
         )?);
 
         let p0_statistics = StatisticsContext::new().compute(
@@ -996,6 +998,7 @@ mod test {
             vec![None],
             empty_table.clone(),
             scan_schema.clone(),
+            &Funding::default(),
         )?) as _;
 
         let agg_plan = get_plan_string(&agg_partial).remove(0);
@@ -1045,6 +1048,7 @@ mod test {
             vec![None],
             empty_table.clone(),
             scan_schema.clone(),
+            &Funding::default(),
         )?);
 
         let agg_final = Arc::new(AggregateExec::try_new(
@@ -1054,6 +1058,7 @@ mod test {
             vec![None],
             agg_partial.clone(),
             agg_partial.schema(),
+            &Funding::default(),
         )?);
 
         assert_eq!(
@@ -1086,6 +1091,7 @@ mod test {
             vec![None],
             empty_table.clone(),
             scan_schema.clone(),
+            &Funding::default(),
         )?);
 
         let expect_partial_stat = Statistics {
@@ -1141,6 +1147,7 @@ mod test {
             vec![None],
             coalesce.clone(),
             coalesce.schema(),
+            &Funding::default(),
         )?);
 
         let expect_stat = Statistics {

@@ -22,6 +22,7 @@
 //!
 //! See issue for details: <https://github.com/apache/datafusion/issues/22710>
 
+use datafusion_common::funding::Funding;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -209,7 +210,7 @@ impl SingleSpillContext {
                 );
             }
         };
-        final_agg.group_by = Arc::new(agg.group_by.as_final());
+        final_agg.group_by = Arc::new(agg.group_by.as_final(&Funding::default())?);
         final_agg.input_order_mode = InputOrderMode::Sorted;
 
         Ok(Self {
@@ -332,6 +333,7 @@ impl SingleHashAggregateStream {
             &agg.group_by,
             &agg.aggr_expr,
             AggregateMode::Partial,
+            &Funding::default(),
         )?);
 
         let hash_table = AggregateHashTable::<SingleMarker>::new(

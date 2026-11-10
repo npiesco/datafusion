@@ -20,6 +20,7 @@
 //! Note these tests are not in the same module as the optimizer pass because
 //! they rely on `DataSourceExec` which is in the core crate.
 
+use datafusion_common::funding::Funding;
 use insta::assert_snapshot;
 use std::sync::Arc;
 
@@ -80,6 +81,7 @@ fn partial_aggregate_exec(
             vec![None; n_aggr],
             input,
             schema,
+            &Funding::default(),
         )
         .unwrap(),
     )
@@ -100,6 +102,7 @@ fn final_aggregate_exec(
             vec![None; n_aggr],
             input,
             schema,
+            &Funding::default(),
         )
         .unwrap(),
     )
@@ -258,6 +261,7 @@ fn aggregations_with_limit_combined() -> datafusion_common::Result<()> {
             vec![],
             partial_agg,
             schema,
+            &Funding::default(),
         )
         .unwrap()
         .with_limit_options(Some(LimitOptions::new(5))),

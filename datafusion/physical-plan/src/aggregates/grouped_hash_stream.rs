@@ -17,6 +17,7 @@
 
 //! Hash aggregation
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::vec;
@@ -444,6 +445,7 @@ impl GroupedHashAggregateStream {
             &agg_group_by,
             &aggregate_exprs,
             AggregateMode::Partial,
+            &Funding::default(),
         )?);
 
         // Need to update the GROUP BY expressions to point to the correct column after schema change
@@ -1402,6 +1404,7 @@ mod tests {
     use crate::test::TestMemoryExec;
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
@@ -1489,6 +1492,7 @@ mod tests {
             vec![None],
             exec,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         // Execute and collect results
@@ -1581,6 +1585,7 @@ mod tests {
             vec![None],
             exec,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
         assert!(matches!(
             aggregate_exec.input_order_mode(),

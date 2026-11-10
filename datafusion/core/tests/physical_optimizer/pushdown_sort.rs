@@ -29,6 +29,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::SessionContext;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, assert_batches_eq};
 use datafusion_physical_expr::expressions;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -717,6 +718,7 @@ fn test_pushdown_through_blocking_node() {
             vec![None],
             inner_sort,
             Arc::clone(&schema),
+            &Funding::default(),
         )
         .unwrap(),
     );

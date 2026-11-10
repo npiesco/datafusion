@@ -62,6 +62,7 @@ async fn test_partial_final() -> Result<()> {
         vec![],         /* filter_expr */
         source,         /* input */
         schema.clone(), /* input_schema */
+        &Funding::default(),
     )?;
     let final_agg = AggregateExec::try_new(
         AggregateMode::Final,
@@ -70,6 +71,7 @@ async fn test_partial_final() -> Result<()> {
         vec![],                /* filter_expr */
         Arc::new(partial_agg), /* input */
         schema.clone(),        /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(final_agg),
@@ -233,6 +235,7 @@ async fn test_single_local() -> Result<()> {
         vec![],         /* filter_expr */
         source,         /* input */
         schema.clone(), /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
@@ -280,6 +283,7 @@ async fn test_single_global() -> Result<()> {
         vec![],         /* filter_expr */
         source,         /* input */
         schema.clone(), /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = GlobalLimitExec::new(
         Arc::new(single_agg),
@@ -327,6 +331,7 @@ async fn test_distinct_cols_different_than_group_by_cols() -> Result<()> {
         vec![],         /* filter_expr */
         source,         /* input */
         schema.clone(), /* input_schema */
+        &Funding::default(),
     )?;
     let distinct_agg = AggregateExec::try_new(
         AggregateMode::Single,
@@ -335,6 +340,7 @@ async fn test_distinct_cols_different_than_group_by_cols() -> Result<()> {
         vec![],                 /* filter_expr */
         Arc::new(group_by_agg), /* input */
         schema.clone(),         /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(distinct_agg),
@@ -389,6 +395,7 @@ fn test_has_order_by() -> Result<()> {
         vec![], /* filter_expr */
         source, /* input */
         schema, /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
@@ -422,6 +429,7 @@ fn test_no_group_by() -> Result<()> {
         vec![], /* filter_expr */
         source, /* input */
         schema, /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
@@ -456,6 +464,7 @@ fn test_has_aggregate_expression() -> Result<()> {
         vec![None],                              /* filter_expr */
         source,                                  /* input */
         schema.clone(),                          /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
@@ -498,6 +507,7 @@ fn test_has_filter() -> Result<()> {
         vec![filter_expr],                       /* filter_expr */
         source,                                  /* input */
         schema.clone(),                          /* input_schema */
+        &Funding::default(),
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),

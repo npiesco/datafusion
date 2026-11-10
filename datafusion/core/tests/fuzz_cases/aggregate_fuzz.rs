@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use super::record_batch_generator::get_supported_types_columns;
@@ -348,6 +349,7 @@ async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str
             vec![None],
             running_source,
             schema.clone(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -365,6 +367,7 @@ async fn run_aggregate_test(input1: Vec<RecordBatch>, group_by_columns: Vec<&str
             vec![None],
             usual_source,
             schema.clone(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -751,6 +754,7 @@ async fn test_single_mode_aggregate_single_mode_aggregate_with_spill() -> Result
         vec![None; aggregate_expressions.len()],
         plan,
         Arc::clone(&scan_schema),
+        &Funding::default(),
     )?);
 
     let memory_pool = Arc::new(FairSpillPool::new(250000));

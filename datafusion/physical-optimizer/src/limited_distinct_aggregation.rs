@@ -47,23 +47,25 @@ impl LimitedDistinctAggregation {
     fn transform_agg(
         aggr: &AggregateExec,
         limit: usize,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         // rules for transforming this Aggregate are held in this method
         if !aggr.is_unordered_unfiltered_group_by_distinct() {
-            return None;
+            return Ok(None);
         }
 
         // We found what we want: clone, copy the limit down, and return modified node
-        let new_aggr = aggr.with_new_limit_options(Some(LimitOptions::new(limit)));
+        let new_aggr = aggr.with_new_limit_options(Some(LimitOptions::new(limit)))?;
 
-        Some(Arc::new(new_aggr))
+        Ok(Some(aggr.funding().arc(new_aggr)?))
     }
 
     /// transform_limit matches an `AggregateExec` as the child of a `LocalLimitExec`
     /// or `GlobalLimitExec` and pushes the limit into the aggregation as a soft limit when
     /// there is a group by, but no sorting, no aggregate expressions, and no filters in the
     /// aggregation
-    fn transform_limit(plan: Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    fn transform_limit(
+        plan: Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         let limit: usize;
         let mut global_fetch: Option<usize> = None;
         let mut global_skip: usize = 0;
@@ -73,23 +75,29 @@ impl LimitedDistinctAggregation {
             limit = local_limit.fetch();
             children = local_limit.children().into_iter().cloned().collect();
         } else {
-            let global_limit = plan.downcast_ref::<GlobalLimitExec>()?;
+            let Some(global_limit) = plan.downcast_ref::<GlobalLimitExec>() else {
+                return Ok(None);
+            };
             global_fetch = global_limit.fetch();
-            global_fetch?;
+            if global_fetch.is_none() {
+                return Ok(None);
+            }
             global_skip = global_limit.skip();
             // the aggregate must read at least fetch+skip number of rows
             limit = global_fetch.unwrap() + global_skip;
             children = global_limit.children().into_iter().cloned().collect();
             is_global_limit = true
         }
-        let child = children.iter().exactly_one().ok()?;
+        let Ok(child) = children.iter().exactly_one() else {
+            return Ok(None);
+        };
         // ensure there is no output ordering; can this rule be relaxed?
         if plan.output_ordering().is_some() {
-            return None;
+            return Ok(None);
         }
         // ensure no ordering is required on the input
         if plan.required_input_ordering()[0].is_some() {
-            return None;
+            return Ok(None);
         }
 
         // if found_match_aggr is true, match_aggr holds a parent aggregation whose group_by
@@ -114,7 +122,7 @@ impl LimitedDistinctAggregation {
                 }
                 // either we run into an Aggregate and transform it, or disable the rewrite
                 // for subsequent children
-                match Self::transform_agg(aggr, limit) {
+                match Self::transform_agg(aggr, limit)? {
                     None => {}
                     Some(new_aggr) => {
                         match_aggr = plan;
@@ -126,15 +134,15 @@ impl LimitedDistinctAggregation {
             rewrite_applicable = false;
             Ok(Transformed::no(plan))
         };
-        let child = child.to_owned().transform_down(closure).data().ok()?;
+        let child = child.to_owned().transform_down(closure).data()?;
         if is_global_limit {
-            return Some(Arc::new(GlobalLimitExec::new(
+            return Ok(Some(Arc::new(GlobalLimitExec::new(
                 child,
                 global_skip,
                 global_fetch,
-            )));
+            ))));
         }
-        Some(Arc::new(LocalLimitExec::new(child, limit)))
+        Ok(Some(Arc::new(LocalLimitExec::new(child, limit))))
     }
 }
 
@@ -154,7 +162,7 @@ impl PhysicalOptimizerRule for LimitedDistinctAggregation {
             plan.transform_down(|plan| {
                 Ok(
                     if let Some(plan) =
-                        LimitedDistinctAggregation::transform_limit(plan.to_owned())
+                        LimitedDistinctAggregation::transform_limit(plan.to_owned())?
                     {
                         Transformed::yes(plan)
                     } else {

@@ -1588,6 +1588,7 @@ mod tests {
             vec![],
             Arc::clone(&input),
             input.schema(),
+            &Funding::default(),
         )?))
     }
 
@@ -1760,6 +1761,7 @@ mod tests {
             vec![],
             Arc::clone(&source),
             source.schema(),
+            &Funding::default(),
         )?);
 
         let registry = StatisticsRegistry::with_providers(vec![

@@ -385,6 +385,7 @@ pub fn aggregate_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
             vec![],
             input,
             schema,
+            &Funding::default(),
         )
         .unwrap(),
     )

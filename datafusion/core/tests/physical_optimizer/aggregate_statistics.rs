@@ -133,6 +133,7 @@ async fn test_count_partial_direct_child() -> Result<()> {
         vec![None],
         source,
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     let final_agg = AggregateExec::try_new(
@@ -142,6 +143,7 @@ async fn test_count_partial_direct_child() -> Result<()> {
         vec![None],
         Arc::new(partial_agg),
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     assert_count_optim_success(final_agg, agg).await?;
@@ -163,6 +165,7 @@ async fn test_count_partial_with_nulls_direct_child() -> Result<()> {
         vec![None],
         source,
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     let final_agg = AggregateExec::try_new(
@@ -172,6 +175,7 @@ async fn test_count_partial_with_nulls_direct_child() -> Result<()> {
         vec![None],
         Arc::new(partial_agg),
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     assert_count_optim_success(final_agg, agg).await?;
@@ -192,6 +196,7 @@ async fn test_count_partial_indirect_child() -> Result<()> {
         vec![None],
         source,
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     // We introduce an intermediate optimization step between the partial and final aggregator
@@ -204,6 +209,7 @@ async fn test_count_partial_indirect_child() -> Result<()> {
         vec![None],
         Arc::new(coalesce),
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     assert_count_optim_success(final_agg, agg).await?;
@@ -224,6 +230,7 @@ async fn test_count_partial_with_nulls_indirect_child() -> Result<()> {
         vec![None],
         source,
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     // We introduce an intermediate optimization step between the partial and final aggregator
@@ -236,6 +243,7 @@ async fn test_count_partial_with_nulls_indirect_child() -> Result<()> {
         vec![None],
         Arc::new(coalesce),
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     assert_count_optim_success(final_agg, agg).await?;
@@ -269,6 +277,7 @@ async fn test_count_inexact_stat() -> Result<()> {
         vec![None],
         filter,
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     let final_agg = AggregateExec::try_new(
@@ -278,6 +287,7 @@ async fn test_count_inexact_stat() -> Result<()> {
         vec![None],
         Arc::new(partial_agg),
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     let conf = ConfigOptions::new();
@@ -315,6 +325,7 @@ async fn test_count_with_nulls_inexact_stat() -> Result<()> {
         vec![None],
         filter,
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     let final_agg = AggregateExec::try_new(
@@ -324,6 +335,7 @@ async fn test_count_with_nulls_inexact_stat() -> Result<()> {
         vec![None],
         Arc::new(partial_agg),
         Arc::clone(&schema),
+        &Funding::default(),
     )?;
 
     let conf = ConfigOptions::new();
@@ -516,6 +528,7 @@ async fn test_count_distinct_optimization() -> Result<()> {
             vec![None],
             source,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         let final_agg = AggregateExec::try_new(
@@ -525,6 +538,7 @@ async fn test_count_distinct_optimization() -> Result<()> {
             vec![None],
             Arc::new(partial_agg),
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         let conf = ConfigOptions::new();
@@ -815,6 +829,7 @@ async fn test_sum_from_statistics() -> Result<()> {
             vec![None],
             source,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         let final_agg = AggregateExec::try_new(
@@ -824,6 +839,7 @@ async fn test_sum_from_statistics() -> Result<()> {
             vec![None],
             Arc::new(partial_agg),
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         let conf = ConfigOptions::new();

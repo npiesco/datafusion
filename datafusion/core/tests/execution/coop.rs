@@ -192,6 +192,7 @@ async fn agg_no_grouping_yields(
         vec![None],
         inf.clone(),
         inf.schema(),
+        &Funding::default(),
     )?);
 
     query_yields(aggr, session_ctx.task_ctx()).await
@@ -229,6 +230,7 @@ async fn agg_grouping_yields(
         vec![None],
         inf.clone(),
         inf.schema(),
+        &Funding::default(),
     )?);
 
     query_yields(aggr, session_ctx.task_ctx()).await
@@ -273,6 +275,7 @@ async fn agg_grouped_topk_yields(
             vec![None],
             inf.clone(),
             inf.schema(),
+            &Funding::default(),
         )?
         .with_limit_options(Some(LimitOptions::new(100))),
     );
@@ -600,6 +603,7 @@ async fn interleave_then_aggregate_yields(
         vec![None], // no “distinct” flags
         interleave,
         interleave_schema,
+        &Funding::default(),
     )?);
 
     query_yields(aggr, session_ctx.task_ctx()).await
@@ -739,6 +743,7 @@ async fn join_agg_yields(
         vec![None],
         projection,
         projection_schema,
+        &Funding::default(),
     )?);
 
     query_yields(aggr, session_ctx.task_ctx()).await

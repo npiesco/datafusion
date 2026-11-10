@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use datafusion_common::error::Result;
+use datafusion_common::error::{DataFusionError, Result};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
@@ -90,19 +90,25 @@ impl PhysicalOptimizerRule for CombinePartialFinalAggregate {
                 } else {
                     AggregateMode::SinglePartitioned
                 };
-                AggregateExec::try_new(
+                let funding = input_agg_exec.funding();
+                match AggregateExec::try_new(
                     mode,
-                    input_agg_exec.group_expr().clone(),
-                    input_agg_exec.aggr_expr().to_vec(),
-                    input_agg_exec.filter_expr().to_vec(),
+                    funding.cloned(input_agg_exec.group_expr())?,
+                    funding.vec_from_slice(input_agg_exec.aggr_expr())?,
+                    funding.vec_from_slice(input_agg_exec.filter_expr())?,
                     Arc::clone(input_agg_exec.input()),
                     input_agg_exec.input_schema(),
-                )
-                .map(|combined_agg| {
-                    combined_agg.with_limit_options(agg_exec.limit_options())
-                })
-                .ok()
-                .map(Arc::new)
+                    funding,
+                ) {
+                    Ok(combined_agg) => Some(funding.arc(
+                        combined_agg.with_limit_options(agg_exec.limit_options()),
+                    )?),
+                    // Refused, planning fails; any other error leaves the pair as it is.
+                    Err(refused @ DataFusionError::Refused { .. }) => {
+                        return Err(refused);
+                    }
+                    Err(_) => None,
+                }
             } else {
                 None
             };

@@ -97,6 +97,7 @@ fn roundtrip_aggregate() -> Result<()> {
             vec![None],
             Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
             schema,
+            &Funding::default(),
         )?))?;
     }
 
@@ -134,6 +135,7 @@ fn roundtrip_aggregate_preserves_optimizer_schema_and_reversed_state() -> Result
         vec![None],
         input,
         input_schema,
+        &Funding::default(),
     )?;
 
     let optimized = OptimizeAggregateOrder::new()
@@ -180,6 +182,7 @@ fn decode_aggregate_without_output_schema() -> Result<()> {
         vec![None],
         Arc::new(EmptyExec::new(Arc::clone(&input_schema), &Funding::default()).unwrap()),
         input_schema,
+        &Funding::default(),
     )?);
 
     let codec = DefaultPhysicalExtensionCodec {};
@@ -221,6 +224,7 @@ fn roundtrip_aggregate_with_limit() -> Result<()> {
         vec![None],
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         schema,
+        &Funding::default(),
     )?;
     let agg = agg.with_limit_options(Some(LimitOptions::new_with_order(12, false)));
     roundtrip_test(Arc::new(agg))
@@ -253,6 +257,7 @@ fn roundtrip_aggregate_with_approx_pencentile_cont() -> Result<()> {
         vec![None],
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         schema,
+        &Funding::default(),
     )?;
     roundtrip_test(Arc::new(agg))
 }
@@ -289,6 +294,7 @@ fn roundtrip_aggregate_with_sort() -> Result<()> {
         vec![None],
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
         schema,
+        &Funding::default(),
     )?;
     roundtrip_test(Arc::new(agg))
 }
@@ -356,6 +362,7 @@ fn roundtrip_aggregate_udaf() -> Result<()> {
             vec![None],
             Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
             schema,
+            &Funding::default(),
         )?),
         &ctx,
     )

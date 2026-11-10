@@ -742,6 +742,7 @@ fn test_pushdown_through_aggregates_on_grouping_columns() {
             vec![None],
             filter,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -800,6 +801,7 @@ fn test_pushdown_through_aggregates_preserves_parent_filter_order() {
             vec![None],
             scan,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2071,6 +2073,7 @@ fn test_aggregate_dynamic_filter_not_created_for_single_mode() {
             vec![None],
             scan,
             Arc::clone(&schema),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2119,6 +2122,7 @@ fn test_pushdown_filter_on_non_first_grouping_column() {
             vec![None],
             scan,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2192,6 +2196,7 @@ fn test_no_pushdown_grouping_sets_filter_on_missing_column() {
             vec![None],
             scan,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2267,6 +2272,7 @@ fn test_pushdown_grouping_sets_filter_on_common_column() {
             vec![None],
             scan,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2316,6 +2322,7 @@ async fn test_no_pushdown_through_global_aggregate_with_name_collision() {
             vec![None],
             scan,
             input_schema,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2370,6 +2377,7 @@ fn test_no_pushdown_constant_false_through_global_aggregate() {
             vec![None],
             scan,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2410,6 +2418,7 @@ fn test_no_pushdown_constant_false_through_empty_grouping_set() {
             vec![None],
             scan,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2471,6 +2480,7 @@ fn test_pushdown_through_aggregate_with_reordered_input_columns() {
             vec![None],
             projection,
             reordered_schema,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2567,6 +2577,7 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
             vec![None],
             projection,
             reordered_schema,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2669,6 +2680,7 @@ fn test_pushdown_with_computed_grouping_key() {
             vec![None],
             filter,
             schema(),
+            &Funding::default(),
         )
         .unwrap(),
     );

@@ -42,13 +42,14 @@ impl TopKAggregation {
         Self {}
     }
 
-    fn transform_agg(
+    /// The limit to push into `aggr`, or `None` when TopK cannot apply to it.
+    fn topk_limit(
         aggr: &AggregateExec,
         order_by: &str,
         order_desc: bool,
         nulls_first: bool,
         limit: usize,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
+    ) -> Option<LimitOptions> {
         // Current only support single group key
         let (group_key, group_key_alias) =
             aggr.group_expr().expr().iter().exactly_one().ok()?;
@@ -105,26 +106,30 @@ impl TopKAggregation {
             return None;
         }
 
-        // We found what we want: clone, copy the limit down, and return modified node
-        let new_aggr = AggregateExec::with_new_limit_options(
-            aggr,
-            Some(LimitOptions::new_with_order(limit, order_desc)),
-        );
-        Some(Arc::new(new_aggr))
+        Some(LimitOptions::new_with_order(limit, order_desc))
     }
 
-    fn transform_sort(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
-        let sort = plan.downcast_ref::<SortExec>()?;
-
-        let children = sort.children();
-        let child = children.into_iter().exactly_one().ok()?;
-        let order = sort.properties().output_ordering()?;
-        let order = order.iter().exactly_one().ok()?;
-        let order_desc = order.options.descending;
-        let nulls_first = order.options.nulls_first;
-        let order = order.expr.downcast_ref::<Column>()?;
+    fn transform_sort(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let Some((sort, child, order_desc, nulls_first, order, limit)) = (|| {
+            let sort = plan.downcast_ref::<SortExec>()?;
+            let child = sort.children().into_iter().exactly_one().ok()?;
+            let order = sort.properties().output_ordering()?;
+            let order = order.iter().exactly_one().ok()?;
+            let column = order.expr.downcast_ref::<Column>()?;
+            Some((
+                sort,
+                child,
+                order.options.descending,
+                order.options.nulls_first,
+                column,
+                sort.fetch()?,
+            ))
+        })() else {
+            return Ok(None);
+        };
         let mut cur_col_name = order.name().to_string();
-        let limit = sort.fetch()?;
 
         let mut cardinality_preserved = true;
         let closure = |plan: Arc<dyn ExecutionPlan>| {
@@ -133,7 +138,7 @@ impl TopKAggregation {
             }
             if let Some(aggr) = plan.downcast_ref::<AggregateExec>() {
                 // either we run into an Aggregate and transform it
-                match Self::transform_agg(
+                match Self::topk_limit(
                     aggr,
                     &cur_col_name,
                     order_desc,
@@ -141,7 +146,12 @@ impl TopKAggregation {
                     limit,
                 ) {
                     None => cardinality_preserved = false,
-                    Some(plan) => return Ok(Transformed::yes(plan)),
+                    // We found what we want: clone, copy the limit down, and return modified node
+                    Some(limit_options) => {
+                        let new_aggr =
+                            aggr.with_new_limit_options(Some(limit_options))?;
+                        return Ok(Transformed::yes(aggr.funding().arc(new_aggr)? as _));
+                    }
                 }
             } else if let Some(proj) = plan.downcast_ref::<ProjectionExec>() {
                 // track renames due to successive projections
@@ -164,11 +174,11 @@ impl TopKAggregation {
             }
             Ok(Transformed::no(plan))
         };
-        let child = Arc::clone(child).transform_down(closure).data().ok()?;
+        let child = Arc::clone(child).transform_down(closure).data()?;
         let sort = SortExec::new(sort.expr().clone(), child)
             .with_fetch(sort.fetch())
             .with_preserve_partitioning(sort.preserve_partitioning());
-        Some(Arc::new(sort))
+        Ok(Some(Arc::new(sort)))
     }
 }
 
@@ -186,11 +196,13 @@ impl PhysicalOptimizerRule for TopKAggregation {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if config.optimizer.enable_topk_aggregation {
             plan.transform_down(|plan| {
-                Ok(if let Some(plan) = TopKAggregation::transform_sort(&plan) {
-                    Transformed::yes(plan)
-                } else {
-                    Transformed::no(plan)
-                })
+                Ok(
+                    if let Some(plan) = TopKAggregation::transform_sort(&plan)? {
+                        Transformed::yes(plan)
+                    } else {
+                        Transformed::no(plan)
+                    },
+                )
             })
             .data()
         } else {

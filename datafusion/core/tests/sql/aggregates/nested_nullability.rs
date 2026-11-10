@@ -31,6 +31,7 @@
 //!
 //! [`Schema::contains`]: arrow::datatypes::Schema::contains
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::{BooleanArray, RecordBatch, StructArray, UInt32Array};
@@ -235,6 +236,7 @@ async fn test_aggregate_exec_direct_input_adaptation() -> Result<()> {
         vec![None],
         input_plan,
         Arc::clone(&declared_schema),
+        &Funding::default(),
     )?);
 
     let task_ctx = Arc::new(TaskContext::default());

@@ -117,7 +117,7 @@ use datafusion_physical_plan::unnest::ListUnnest;
 use datafusion_session::{PhysicalOptimizerContext, PhysicalOptimizerRule, Session};
 
 use datafusion_physical_plan::async_func::{AsyncFuncExec, AsyncMapper};
-use itertools::{Itertools, multiunzip};
+use itertools::Itertools;
 use log::debug;
 use tokio::sync::Mutex;
 
@@ -1187,29 +1187,29 @@ impl DefaultPhysicalPlanner {
                     funding,
                 )?;
 
-                let agg_filter = aggr_expr
-                    .iter()
-                    .map(|e| {
-                        LoweredAggregateBuilder::new(
-                            e,
-                            logical_input_schema,
-                            &physical_input_schema,
-                            execution_props,
-                            planning_ctx,
-                            funding,
-                        )
-                        .build()
-                        .map(lowered_aggregate_to_tuple)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut aggregates = funding.held::<Vec<Arc<AggregateFunctionExpr>>>();
+                let mut filters = funding.held::<Vec<Option<Arc<dyn PhysicalExpr>>>>();
+                aggregates.reserve_exact(aggr_expr.len())?;
+                filters.reserve_exact(aggr_expr.len())?;
+                for e in aggr_expr {
+                    let lowered = LoweredAggregateBuilder::new(
+                        e,
+                        logical_input_schema,
+                        &physical_input_schema,
+                        execution_props,
+                        planning_ctx,
+                        funding,
+                    )
+                    .build()?;
+                    aggregates.push(lowered.aggregate)?;
+                    filters.push(lowered.filter)?;
+                    funding.released(lowered.order_bys);
+                }
 
-                let (mut aggregates, filters, _order_bys): (Vec<_>, Vec<_>, Vec<_>) =
-                    multiunzip(agg_filter);
-
-                let mut async_exprs = Vec::new();
+                let mut async_exprs = funding.held::<Vec<_>>();
                 let num_input_columns = physical_input_schema.fields().len();
 
-                for agg_func in &mut aggregates {
+                for agg_func in aggregates.iter_mut() {
                     let expressions = agg_func.expressions();
                     let mut charged = funding.vec_with_capacity(expressions.len())?;
                     charged.extend(expressions);
@@ -1223,18 +1223,18 @@ impl DefaultPhysicalPlanner {
                             async_map,
                             PlannedExprResult::Expr(physical_exprs),
                         ) => {
+                            async_exprs.reserve(async_map.async_exprs.len())?;
                             async_exprs.extend(async_map.async_exprs);
 
-                            if let Some(new_agg_func) = agg_func.with_new_expressions(
-                                physical_exprs,
-                                agg_func
-                                    .order_bys()
-                                    .iter()
-                                    .cloned()
-                                    .map(|x| x.expr)
-                                    .collect(),
-                            ) {
-                                *agg_func = Arc::new(new_agg_func);
+                            let order_bys = agg_func.order_bys();
+                            let mut order_by_exprs =
+                                funding.vec_with_capacity(order_bys.len())?;
+                            order_by_exprs
+                                .extend(order_bys.iter().map(|x| Arc::clone(&x.expr)));
+                            if let Some(new_agg_func) = agg_func
+                                .with_new_expressions(physical_exprs, order_by_exprs)
+                            {
+                                *agg_func = funding.arc(new_agg_func)?;
                             } else {
                                 return internal_err!("Failed to plan async expression");
                             }
@@ -1250,21 +1250,25 @@ impl DefaultPhysicalPlanner {
                     }
                 }
                 let input_exec = if !async_exprs.is_empty() {
-                    Arc::new(AsyncFuncExec::try_new(async_exprs, input_exec)?)
+                    funding
+                        .arc(AsyncFuncExec::try_new(async_exprs.keep(), input_exec)?)?
+                        as Arc<dyn ExecutionPlan>
                 } else {
                     input_exec
                 };
 
-                let initial_aggr = Arc::new(AggregateExec::try_new(
+                let is_grouped = !groups.is_empty();
+                let initial_aggr = funding.arc(AggregateExec::try_new(
                     AggregateMode::Partial,
-                    groups.clone(),
-                    aggregates,
-                    filters.clone(),
+                    groups,
+                    aggregates.keep(),
+                    funding.vec_from_slice(&filters)?,
                     input_exec,
                     Arc::clone(&physical_input_schema),
-                )?);
+                    funding,
+                )?)?;
 
-                let can_repartition = !groups.is_empty()
+                let can_repartition = is_grouped
                     && session_state.config().target_partitions() > 1
                     && session_state.config().repartition_aggregations();
 
@@ -1273,7 +1277,8 @@ impl DefaultPhysicalPlanner {
                 // into a LAST_VALUE with the reverse ordering requirement.
                 // To reflect such changes to subsequent stages, use the updated
                 // `AggregateFunctionExpr`/`PhysicalSortExpr` objects.
-                let updated_aggregates = initial_aggr.aggr_expr().to_vec();
+                let updated_aggregates =
+                    funding.vec_from_slice(initial_aggr.aggr_expr())?;
 
                 let next_partition_mode = if can_repartition {
                     // construct a second aggregation with 'AggregateMode::FinalPartitioned'
@@ -1284,16 +1289,17 @@ impl DefaultPhysicalPlanner {
                     AggregateMode::Final
                 };
 
-                let final_grouping_set = initial_aggr.group_expr().as_final();
+                let final_grouping_set = initial_aggr.group_expr().as_final(funding)?;
 
-                Arc::new(AggregateExec::try_new(
+                funding.arc(AggregateExec::try_new(
                     next_partition_mode,
                     final_grouping_set,
                     updated_aggregates,
-                    filters,
+                    filters.keep(),
                     initial_aggr,
                     Arc::clone(&physical_input_schema),
-                )?)
+                    funding,
+                )?)?
             }
             LogicalPlan::Projection(Projection { input, expr, .. }) => self
                 .create_project_physical_exec_with_props(

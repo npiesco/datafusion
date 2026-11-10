@@ -1568,6 +1568,7 @@ impl RecordBatchStream for FinalHashAggregateStream {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use super::*;
@@ -1663,6 +1664,7 @@ mod tests {
             vec![None],
             exec,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         // Execute and collect results
@@ -1807,6 +1809,7 @@ mod tests {
             vec![None],
             exec,
             Arc::clone(&schema),
+            &Funding::default(),
         )?;
 
         // Execute and collect results

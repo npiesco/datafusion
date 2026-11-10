@@ -714,6 +714,7 @@ mod tests {
     use crate::common::collect;
     use crate::statistics::{StatisticsArgs, StatisticsContext};
     use crate::test;
+    use datafusion_common::funding::Funding;
 
     use crate::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use arrow::array::RecordBatchOptions;
@@ -1055,6 +1056,7 @@ mod tests {
             vec![],
             Arc::clone(&csv),
             Arc::clone(&csv.schema()),
+            &Funding::default(),
         )?;
         let agg_exec: Arc<dyn ExecutionPlan> = Arc::new(agg);
 

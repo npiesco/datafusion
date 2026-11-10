@@ -59,6 +59,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::Result;
+    use datafusion_common::funding::Funding;
     use datafusion_execution::TaskContext;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_functions_aggregate::count::count_udaf;
@@ -135,6 +136,7 @@ mod tests {
             vec![None, None],
             input,
             schema,
+            &Funding::default(),
         )?);
 
         // This test is for `GroupByMetrics`, which are maintained by
@@ -198,16 +200,18 @@ mod tests {
             vec![None],
             partial_input,
             Arc::clone(&schema),
+            &Funding::default(),
         )?);
 
         // Create final aggregate
         let final_aggregate = Arc::new(AggregateExec::try_new(
             AggregateMode::Final,
-            group_by.as_final(),
+            group_by.as_final(&Funding::default())?,
             aggregates,
             vec![None],
             partial_aggregate,
             schema,
+            &Funding::default(),
         )?);
 
         let task_ctx = Arc::new(TaskContext::default());

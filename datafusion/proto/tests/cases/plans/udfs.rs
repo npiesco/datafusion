@@ -303,6 +303,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
         vec![None],
         window,
         schema,
+        &Funding::default(),
     )?);
 
     let ctx = SessionContext::new();
@@ -519,6 +520,7 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
         vec![None],
         window,
         schema,
+        &Funding::default(),
     )?);
 
     let ctx = SessionContext::new();

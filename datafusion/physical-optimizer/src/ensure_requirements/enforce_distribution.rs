@@ -28,7 +28,6 @@
 //! If increasing parallelism is beneficial (and also desirable according to
 //! configuration), they increase partition counts in the physical plan.
 
-use datafusion_common::funding::Funding;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -318,92 +317,100 @@ pub fn reorder_aggregate_keys(
     mut agg_node: PlanWithKeyRequirements,
     agg_exec: &AggregateExec,
 ) -> Result<PlanWithKeyRequirements> {
+    let funding = agg_exec.funding();
     let parent_required = &agg_node.data;
-    let output_columns = agg_exec
-        .group_expr()
-        .expr()
-        .iter()
-        .enumerate()
-        .map(|(index, (_, name))| Column::new(name, index))
-        .collect::<Vec<_>>();
+    let group_by = agg_exec.group_expr().expr();
+    if parent_required.len() != group_by.len()
+        || !agg_exec.group_expr().null_expr().is_empty()
+    {
+        return Ok(agg_node);
+    }
+    let mut output_columns = funding.held::<Vec<Column>>();
+    output_columns.reserve_exact(group_by.len())?;
+    let mut output_exprs = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+    output_exprs.reserve_exact(group_by.len())?;
+    for (index, (_, name)) in group_by.iter().enumerate() {
+        let column = Column::new(funding.string(name)?, index);
+        output_exprs.push(funding.arc(funding.cloned(&column)?)? as _)?;
+        output_columns.push(column)?;
+    }
 
-    let output_exprs = output_columns
-        .iter()
-        .map(|c| Arc::new(c.clone()) as _)
-        .collect::<Vec<_>>();
-
-    if parent_required.len() == output_exprs.len()
-        && agg_exec.group_expr().null_expr().is_empty()
-        && !physical_exprs_equal(&output_exprs, parent_required)
+    if !physical_exprs_equal(&output_exprs, parent_required)
         && let Some(positions) = expected_expr_positions(&output_exprs, parent_required)
         && let Some(agg_exec) = agg_exec.input().downcast_ref::<AggregateExec>()
         && *agg_exec.mode() == AggregateMode::Partial
     {
+        let funding = agg_exec.funding();
         let group_exprs = agg_exec.group_expr().expr();
-        let new_group_exprs = positions
-            .into_iter()
-            .map(|idx| group_exprs[idx].clone())
-            .collect();
-        let partial_agg = Arc::new(AggregateExec::try_new(
+        let mut new_group_exprs = funding.vec_with_capacity(positions.len())?;
+        for idx in positions {
+            new_group_exprs.push(funding.cloned(&group_exprs[idx])?);
+        }
+        let partial_agg = funding.arc(AggregateExec::try_new(
             AggregateMode::Partial,
             PhysicalGroupBy::new_single(new_group_exprs),
-            agg_exec.aggr_expr().to_vec(),
-            agg_exec.filter_expr().to_vec(),
+            funding.vec_from_slice(agg_exec.aggr_expr())?,
+            funding.vec_from_slice(agg_exec.filter_expr())?,
             Arc::clone(agg_exec.input()),
             Arc::clone(&agg_exec.input_schema),
-        )?);
+            funding,
+        )?)?;
         // Build new group expressions that correspond to the output
         // of the "reordered" aggregator:
         let group_exprs = partial_agg.group_expr().expr();
-        let new_group_by = PhysicalGroupBy::new_single(
-            partial_agg
-                .output_group_expr()
-                .into_iter()
-                .enumerate()
-                .map(|(idx, expr)| (expr, group_exprs[idx].1.clone()))
-                .collect(),
-        );
-        let new_final_agg = Arc::new(AggregateExec::try_new(
+        let mut new_group_exprs = funding.vec_with_capacity(group_exprs.len())?;
+        for (idx, (_, name)) in group_exprs.iter().enumerate() {
+            let column: Arc<dyn PhysicalExpr> =
+                funding.arc(Column::new(funding.string(name)?, idx))?;
+            new_group_exprs.push((column, funding.string(name)?));
+        }
+        let new_group_by = PhysicalGroupBy::new_single(new_group_exprs);
+        let new_final_agg = funding.arc(AggregateExec::try_new(
             AggregateMode::FinalPartitioned,
             new_group_by,
-            agg_exec.aggr_expr().to_vec(),
-            agg_exec.filter_expr().to_vec(),
+            funding.vec_from_slice(agg_exec.aggr_expr())?,
+            funding.vec_from_slice(agg_exec.filter_expr())?,
             Arc::clone(&partial_agg) as _,
             agg_exec.input_schema(),
-        )?);
+            funding,
+        )?)?;
 
         agg_node.plan = Arc::clone(&new_final_agg) as _;
         agg_node.data.clear();
-        agg_node.children = vec![PlanWithKeyRequirements::new(
+        let grandchildren = agg_node.children.swap_remove(0).children;
+        agg_node.children = funding.vec_of([PlanWithKeyRequirements::new(
             partial_agg as _,
             vec![],
-            agg_node.children.swap_remove(0).children,
-        )];
+            grandchildren,
+        )])?;
 
         // Need to create a new projection to change the expr ordering back
         let agg_schema = new_final_agg.schema();
-        let mut proj_exprs = output_columns
-            .iter()
-            .map(|col| {
-                let name = col.name();
-                let index = agg_schema.index_of(name)?;
-                Ok(ProjectionExpr {
-                    expr: Arc::new(Column::new(name, index)) as _,
-                    alias: name.to_owned(),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
         let agg_fields = agg_schema.fields();
+        let mut proj_exprs = funding.held::<Vec<ProjectionExpr>>();
+        proj_exprs.reserve_exact(agg_fields.len())?;
+        for col in output_columns.iter() {
+            let name = col.name();
+            let index = agg_schema.index_of(name)?;
+            proj_exprs.push(ProjectionExpr {
+                expr: funding.arc(Column::new(funding.string(name)?, index))? as _,
+                alias: funding.string(name)?,
+            })?;
+        }
         for (idx, field) in agg_fields.iter().enumerate().skip(output_columns.len()) {
             let name = field.name();
-            let plan = Arc::new(Column::new(name, idx)) as _;
             proj_exprs.push(ProjectionExpr {
-                expr: plan,
-                alias: name.clone(),
-            })
+                expr: funding.arc(Column::new(funding.string(name)?, idx))? as _,
+                alias: funding.string(name)?,
+            })?;
         }
-        return ProjectionExec::try_new(proj_exprs, new_final_agg, &Funding::default())
-            .map(|p| PlanWithKeyRequirements::new(Arc::new(p), vec![], vec![agg_node]));
+        let projection =
+            ProjectionExec::try_new(proj_exprs.drain(..), new_final_agg, funding)?;
+        return Ok(PlanWithKeyRequirements::new(
+            funding.arc(projection)?,
+            vec![],
+            funding.vec_of([agg_node])?,
+        ));
     }
     Ok(agg_node)
 }

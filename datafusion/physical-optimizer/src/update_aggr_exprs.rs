@@ -21,13 +21,12 @@
 use std::sync::Arc;
 
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::{Funding, Held};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Result, plan_datafusion_err};
 use datafusion_physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortRequirement};
-use datafusion_physical_plan::aggregates::{
-    AggregateExec, AggregateInputMode, concat_slices,
-};
+use datafusion_physical_plan::aggregates::{AggregateExec, AggregateInputMode};
 use datafusion_physical_plan::windows::get_ordered_partition_by_indices;
 use datafusion_physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 
@@ -75,8 +74,9 @@ impl PhysicalOptimizerRule for OptimizeAggregateOrder {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let funding = &config.funding;
         plan.transform_up(|plan| {
             if let Some(aggr_exec) = plan.downcast_ref::<AggregateExec>() {
                 // Final stage implementations do not rely on ordering -- those
@@ -87,32 +87,31 @@ impl PhysicalOptimizerRule for OptimizeAggregateOrder {
                     return Ok(Transformed::no(plan));
                 }
                 let input = aggr_exec.input();
-                let mut aggr_exprs = aggr_exec.aggr_expr().to_vec();
 
                 let groupby_exprs = aggr_exec.group_expr().input_exprs();
                 // If the existing ordering satisfies a prefix of the GROUP BY
                 // expressions, prefix requirements with this section. In this
                 // case, aggregation will work more efficiently.
                 let indices = get_ordered_partition_by_indices(&groupby_exprs, input)?;
-                let requirement = indices
-                    .iter()
-                    .map(|&idx| {
-                        PhysicalSortRequirement::new(
-                            Arc::clone(&groupby_exprs[idx]),
-                            None,
-                        )
-                    })
-                    .collect::<Vec<_>>();
+                let mut requirement = funding.held::<Vec<PhysicalSortRequirement>>();
+                requirement.reserve_exact(indices.len())?;
+                for &idx in &indices {
+                    requirement.push(PhysicalSortRequirement::new(
+                        Arc::clone(&groupby_exprs[idx]),
+                        None,
+                    ))?;
+                }
 
-                aggr_exprs = try_convert_aggregate_if_better(
-                    aggr_exprs,
+                let aggr_exprs = try_convert_aggregate_if_better(
+                    aggr_exec.aggr_expr(),
                     &requirement,
                     input.equivalence_properties(),
+                    funding,
                 )?;
 
-                let aggr_exec = aggr_exec.with_new_aggr_exprs(aggr_exprs);
+                let aggr_exec = aggr_exec.with_new_aggr_exprs(aggr_exprs)?;
 
-                Ok(Transformed::yes(Arc::new(aggr_exec) as _))
+                Ok(Transformed::yes(funding.arc(aggr_exec)? as _))
             } else {
                 Ok(Transformed::no(plan))
             }
@@ -147,58 +146,67 @@ impl PhysicalOptimizerRule for OptimizeAggregateOrder {
 /// successfully. Any errors occurring during the conversion process are
 /// passed through.
 fn try_convert_aggregate_if_better(
-    aggr_exprs: Vec<Arc<AggregateFunctionExpr>>,
+    aggr_exprs: &[Arc<AggregateFunctionExpr>],
     prefix_requirement: &[PhysicalSortRequirement],
     eq_properties: &EquivalenceProperties,
-) -> Result<Vec<Arc<AggregateFunctionExpr>>> {
-    aggr_exprs
-        .into_iter()
-        .map(|aggr_expr| {
-            let order_bys = aggr_expr.order_bys();
-            // If the aggregate expression benefits from input ordering, and
-            // there is an actual ordering enabling this, try to update the
-            // aggregate expression to benefit from the existing ordering.
-            // Otherwise, leave it as is.
-            if !aggr_expr.order_sensitivity().is_beneficial() {
-                Ok(aggr_expr)
-            } else if !order_bys.is_empty() {
-                if eq_properties.ordering_satisfy_requirement(concat_slices(
-                    prefix_requirement,
-                    &order_bys
-                        .iter()
-                        .map(|e| e.clone().into())
-                        .collect::<Vec<_>>(),
-                ))? {
-                    // Existing ordering satisfies the aggregator requirements:
-                    aggr_expr.with_beneficial_ordering(true)?.map(Arc::new)
-                } else if eq_properties.ordering_satisfy_requirement(concat_slices(
-                    prefix_requirement,
-                    &order_bys
-                        .iter()
-                        .map(|e| e.reverse().into())
-                        .collect::<Vec<_>>(),
-                ))? {
-                    // Converting to reverse enables more efficient execution
-                    // given the existing ordering (if possible):
-                    aggr_expr
-                        .reverse_expr()
-                        .map(Arc::new)
-                        .unwrap_or(aggr_expr)
-                        .with_beneficial_ordering(true)?
-                        .map(Arc::new)
-                } else {
-                    // There is no beneficial ordering present -- aggregation
-                    // will still work albeit in a less efficient mode.
-                    aggr_expr.with_beneficial_ordering(false)?.map(Arc::new)
+    funding: &Funding,
+) -> Result<Arc<[Arc<AggregateFunctionExpr>]>> {
+    let mut converted = funding.vec_with_capacity(aggr_exprs.len())?;
+    for aggr_expr in aggr_exprs {
+        let aggr_expr = Arc::clone(aggr_expr);
+        let order_bys = aggr_expr.order_bys();
+        // If the aggregate expression benefits from input ordering, and
+        // there is an actual ordering enabling this, try to update the
+        // aggregate expression to benefit from the existing ordering.
+        // Otherwise, leave it as is.
+        let aggr_expr = if !aggr_expr.order_sensitivity().is_beneficial()
+            || order_bys.is_empty()
+        {
+            aggr_expr
+        } else {
+            let requirement = |reverse: bool| -> Result<Held<Vec<_>>> {
+                let mut requirement = funding.held::<Vec<PhysicalSortRequirement>>();
+                requirement.reserve_exact(prefix_requirement.len() + order_bys.len())?;
+                requirement.extend(prefix_requirement.iter().cloned());
+                requirement.extend(order_bys.iter().map(|e| {
+                    PhysicalSortRequirement::from(if reverse {
+                        e.reverse()
+                    } else {
+                        e.clone()
+                    })
+                }));
+                Ok(requirement)
+            };
+            if eq_properties
+                .ordering_satisfy_requirement(requirement(false)?.drain(..))?
+            {
+                // Existing ordering satisfies the aggregator requirements:
+                aggr_expr.with_beneficial_ordering(true)?
+            } else if eq_properties
+                .ordering_satisfy_requirement(requirement(true)?.drain(..))?
+            {
+                // Converting to reverse enables more efficient execution
+                // given the existing ordering (if possible):
+                match aggr_expr.reverse_expr() {
+                    Some(reversed) => {
+                        funding.arc(reversed)?.with_beneficial_ordering(true)?
+                    }
+                    None => aggr_expr.with_beneficial_ordering(true)?,
                 }
-                .ok_or_else(|| {
-                    plan_datafusion_err!(
+            } else {
+                // There is no beneficial ordering present -- aggregation
+                // will still work albeit in a less efficient mode.
+                aggr_expr.with_beneficial_ordering(false)?
+            }
+            .map(|expr| funding.arc(expr))
+            .transpose()?
+            .ok_or_else(|| {
+                plan_datafusion_err!(
                     "Expects an aggregate expression that can benefit from input ordering"
                 )
-                })
-            } else {
-                Ok(aggr_expr)
-            }
-        })
-        .collect()
+            })?
+        };
+        converted.push(aggr_expr);
+    }
+    funding.arc_from_vec(converted)
 }

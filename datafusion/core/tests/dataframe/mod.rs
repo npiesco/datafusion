@@ -7438,6 +7438,7 @@ async fn test_duplicate_state_fields_for_dfschema_construct() -> Result<()> {
         vec![None, None],
         mock_exec,
         file_schema,
+        &Funding::default(),
     )
     .expect("Failed to build partial agg");
 

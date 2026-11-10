@@ -513,10 +513,12 @@ fn aggregate_exec_with_alias(
                     vec![],
                     input,
                     schema.clone(),
+                    &Funding::default(),
                 )
                 .unwrap(),
             ),
             schema,
+            &Funding::default(),
         )
         .unwrap(),
     )
@@ -570,6 +572,7 @@ fn partitioned_count_aggregate_exec(
             vec![None],
             input,
             Arc::clone(&input_schema),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -582,6 +585,7 @@ fn partitioned_count_aggregate_exec(
             vec![None],
             Arc::clone(&partial) as _,
             partial.schema(),
+            &Funding::default(),
         )
         .unwrap(),
     )
@@ -929,14 +933,16 @@ fn range_grouping_set_aggregate_rehashes_with_grouping_id() -> Result<()> {
         vec![],
         input,
         Arc::clone(&input_schema),
+        &Funding::default(),
     )?);
     let aggregate = Arc::new(AggregateExec::try_new(
         AggregateMode::FinalPartitioned,
-        group_by.as_final(),
+        group_by.as_final(&Funding::default())?,
         vec![],
         vec![],
         Arc::clone(&partial) as _,
         partial.schema(),
+        &Funding::default(),
     )?);
 
     let plan = TestConfig::default()

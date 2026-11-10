@@ -17,6 +17,7 @@
 
 //! Fuzz Test for different operators in memory constrained environment
 
+use datafusion_common::funding::Funding;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -905,6 +906,7 @@ async fn run_test_aggregate_with_high_cardinality(
         vec![None; aggregate_expressions.len()],
         plan,
         Arc::clone(&scan_schema),
+        &Funding::default(),
     )?);
     let aggregate_final = Arc::new(AggregateExec::try_new(
         AggregateMode::Final,
@@ -913,6 +915,7 @@ async fn run_test_aggregate_with_high_cardinality(
         vec![None; aggregate_expressions.len()],
         aggregate_exec,
         Arc::clone(&scan_schema),
+        &Funding::default(),
     )?);
 
     let result = aggregate_final.execute(0, Arc::clone(&args.task_ctx))?;
