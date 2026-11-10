@@ -17,6 +17,7 @@
 
 //! Test utilities for physical optimizer tests
 
+use datafusion_common::funding::Funding;
 use std::fmt::{Display, Formatter};
 use std::sync::{Arc, LazyLock};
 
@@ -431,7 +432,11 @@ pub fn projection_exec(
         .into_iter()
         .map(|(expr, alias)| ProjectionExpr { expr, alias })
         .collect();
-    Ok(Arc::new(ProjectionExec::try_new(proj_exprs, input)?))
+    Ok(Arc::new(ProjectionExec::try_new(
+        proj_exprs,
+        input,
+        &Funding::default(),
+    )?))
 }
 
 /// A test [`ExecutionPlan`] whose requirements can be configured.

@@ -287,7 +287,7 @@ mod test {
             alias: "id".to_string(),
         }];
         let projection: Arc<dyn ExecutionPlan> =
-            Arc::new(ProjectionExec::try_new(exprs, scan)?);
+            Arc::new(ProjectionExec::try_new(exprs, scan, &Funding::default())?);
         let statistics = (0..projection.output_partitioning().partition_count())
             .map(|idx| {
                 StatisticsContext::new().compute(

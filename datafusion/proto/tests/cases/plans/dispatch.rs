@@ -148,6 +148,7 @@ fn serialize_uses_downcast_delegate_for_self_serializing_plan() -> Result<()> {
             alias: "a".to_string(),
         }],
         input,
+        &Funding::default(),
     )?);
     let plan: Arc<dyn ExecutionPlan> = Arc::new(DowncastDelegatingExec::new(inner));
     let codec = DefaultPhysicalExtensionCodec {};

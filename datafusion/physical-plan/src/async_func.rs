@@ -26,6 +26,7 @@ use crate::{
 use arrow::array::RecordBatch;
 use arrow_schema::{FieldRef, Fields, Schema, SchemaRef};
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::ScalarFunctionExpr;
@@ -79,7 +80,8 @@ impl AsyncFuncExec {
             .iter()
             .map(|expr| (Arc::clone(&expr.func), expr.name().to_string()))
             .collect::<Vec<_>>();
-        let async_expr_mapping = ProjectionMapping::try_new(tuples, &input.schema())?;
+        let async_expr_mapping =
+            ProjectionMapping::try_new(tuples, &input.schema(), &Funding::default())?;
         let cache =
             AsyncFuncExec::compute_properties(&input, schema, &async_expr_mapping)?;
         Ok(Self {

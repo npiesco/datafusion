@@ -28,6 +28,7 @@ use datafusion::physical_plan::aggregates::{
 };
 use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::prelude::SessionContext;
+use datafusion_common::funding::Funding;
 use datafusion_common::{DataFusionError, JoinType, ScalarValue, exec_datafusion_err};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_expr_common::operator::Operator;
@@ -668,7 +669,11 @@ async fn join_agg_yields(
         "value",
     )];
 
-    let projection = Arc::new(ProjectionExec::try_new(proj_expr, join)?);
+    let projection = Arc::new(ProjectionExec::try_new(
+        proj_expr,
+        join,
+        &Funding::default(),
+    )?);
     let projection_schema = projection.schema();
 
     let output_fields = vec![Field::new("total", DataType::Int64, true)];

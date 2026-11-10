@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -465,7 +466,8 @@ impl FilterExec {
         // If contains projection, update the PlanProperties.
         if let Some(projection) = projection {
             let schema = eq_properties.schema();
-            let projection_mapping = ProjectionMapping::from_indices(projection, schema)?;
+            let projection_mapping =
+                ProjectionMapping::from_indices(projection, schema, &Funding::default())?;
             let out_schema = project_schema(schema, Some(&projection))?;
             output_partitioning =
                 output_partitioning.project(&projection_mapping, &eq_properties);
@@ -778,8 +780,11 @@ impl ExecutionPlan for FilterExec {
                             }
                         })
                         .collect::<Vec<_>>();
-                    Some(Arc::new(ProjectionExec::try_new(proj_exprs, filter_input)?)
-                        as Arc<dyn ExecutionPlan>)
+                    Some(Arc::new(ProjectionExec::try_new(
+                        proj_exprs,
+                        filter_input,
+                        &Funding::default(),
+                    )?) as Arc<dyn ExecutionPlan>)
                 }
                 None => {
                     // No projection needed, just return the input
@@ -3723,6 +3728,7 @@ mod tests {
         let projection = Arc::new(ProjectionExec::try_new(
             proj_exprs,
             Arc::clone(&filter) as _,
+            &Funding::default(),
         )?);
 
         // This must not panic

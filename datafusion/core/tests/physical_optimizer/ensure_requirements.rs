@@ -324,7 +324,9 @@ fn test_projection_over_multi_partition_sort_limit() {
         (Arc::new(Column::new("a", 0)), "a".to_string()),
         (Arc::new(Column::new("b", 1)), "b".to_string()),
     ];
-    let projection = Arc::new(ProjectionExec::try_new(proj_exprs, source as _).unwrap());
+    let projection = Arc::new(
+        ProjectionExec::try_new(proj_exprs, source as _, &Funding::default()).unwrap(),
+    );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
@@ -606,8 +608,9 @@ fn test_sort_pushdown_through_projection_adds_spm() {
         (Arc::new(Column::new("a", 0)), "a".to_string()),
         (Arc::new(Column::new("b", 1)), "b".to_string()),
     ];
-    let projection: Arc<dyn ExecutionPlan> =
-        Arc::new(ProjectionExec::try_new(proj_exprs, source).unwrap());
+    let projection: Arc<dyn ExecutionPlan> = Arc::new(
+        ProjectionExec::try_new(proj_exprs, source, &Funding::default()).unwrap(),
+    );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
@@ -671,8 +674,9 @@ fn test_idempotent_projection_over_multi_partition_with_single_partition_require
         (Arc::new(Column::new("a", 0)), "a".to_string()),
         (Arc::new(Column::new("b", 1)), "b".to_string()),
     ];
-    let projection: Arc<dyn ExecutionPlan> =
-        Arc::new(ProjectionExec::try_new(proj_exprs, source).unwrap());
+    let projection: Arc<dyn ExecutionPlan> = Arc::new(
+        ProjectionExec::try_new(proj_exprs, source, &Funding::default()).unwrap(),
+    );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
@@ -1222,8 +1226,9 @@ fn test_idempotent_nested_subqueries_sort_limit() {
         (Arc::new(Column::new("a", 0)), "a".to_string()),
         (Arc::new(Column::new("b", 1)), "b".to_string()),
     ];
-    let projection: Arc<dyn ExecutionPlan> =
-        Arc::new(ProjectionExec::try_new(proj_exprs, inner_limit).unwrap());
+    let projection: Arc<dyn ExecutionPlan> = Arc::new(
+        ProjectionExec::try_new(proj_exprs, inner_limit, &Funding::default()).unwrap(),
+    );
 
     // Outer sort (a DESC) + outer limit
     let outer_sort: Arc<dyn ExecutionPlan> =
@@ -1315,8 +1320,9 @@ fn test_idempotent_union_projection_sort() {
         (Arc::new(Column::new("a", 0)), "a".to_string()),
         (Arc::new(Column::new("b", 1)), "b".to_string()),
     ];
-    let projection: Arc<dyn ExecutionPlan> =
-        Arc::new(ProjectionExec::try_new(proj_exprs, union).unwrap());
+    let projection: Arc<dyn ExecutionPlan> = Arc::new(
+        ProjectionExec::try_new(proj_exprs, union, &Funding::default()).unwrap(),
+    );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 

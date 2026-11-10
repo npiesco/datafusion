@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::fmt::Debug;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -472,7 +473,7 @@ fn projection_exec_with_alias(
             alias: alias.to_string(),
         });
     }
-    Arc::new(ProjectionExec::try_new(exprs, input).unwrap())
+    Arc::new(ProjectionExec::try_new(exprs, input, &Funding::default()).unwrap())
 }
 
 fn aggregate_exec_with_alias(
@@ -2970,7 +2971,11 @@ fn repartition_transitively_with_projection() -> Result<()> {
         alias: "sum".to_string(),
     }];
     // non sorted input
-    let proj = Arc::new(ProjectionExec::try_new(proj_exprs, parquet_exec())?);
+    let proj = Arc::new(ProjectionExec::try_new(
+        proj_exprs,
+        parquet_exec(),
+        &Funding::default(),
+    )?);
     let sort_key = [PhysicalSortExpr {
         expr: col("sum", &proj.schema())?,
         options: SortOptions::default(),

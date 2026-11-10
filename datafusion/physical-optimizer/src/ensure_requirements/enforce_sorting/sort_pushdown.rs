@@ -1146,6 +1146,7 @@ mod tests {
                     (col("b", &schema).unwrap(), "value".to_string()),
                 ],
                 input,
+                &Funding::default(),
             )
             .unwrap(),
         )
@@ -1169,6 +1170,7 @@ mod tests {
                     (b_plus_c, "computed".to_string()),
                 ],
                 input,
+                &Funding::default(),
             )
             .unwrap(),
         )

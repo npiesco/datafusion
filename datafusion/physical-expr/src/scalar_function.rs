@@ -154,7 +154,7 @@ impl ScalarFunctionExpr {
         self.return_field.is_nullable()
     }
 
-    pub fn config_options(&self) -> &ConfigOptions {
+    pub fn config_options(&self) -> &Arc<ConfigOptions> {
         &self.config_options
     }
 

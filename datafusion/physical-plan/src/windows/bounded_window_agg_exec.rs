@@ -1608,6 +1608,7 @@ pub(crate) fn get_last_row_batch(batch: &RecordBatch) -> Result<RecordBatch> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -1802,7 +1803,11 @@ mod tests {
             .into_iter()
             .map(|(expr, alias)| ProjectionExpr { expr, alias })
             .collect();
-        Ok(Arc::new(ProjectionExec::try_new(proj_exprs, input)?))
+        Ok(Arc::new(ProjectionExec::try_new(
+            proj_exprs,
+            input,
+            &Funding::default(),
+        )?))
     }
 
     fn task_context_helper() -> TaskContext {

@@ -25,6 +25,7 @@ mod expression;
 mod value;
 
 use datafusion_common::HashMap;
+use datafusion_common::funding::arc_bytes;
 pub use datafusion_common::format::{MetricCategory, MetricType};
 use parking_lot::Mutex;
 use std::{
@@ -498,6 +499,10 @@ pub struct ExecutionPlanMetricsSet {
 }
 
 impl ExecutionPlanMetricsSet {
+    /// The block [`Self::new`] allocates, to charge to a
+    /// [`Funding`](datafusion_common::funding::Funding) before making one.
+    pub const BLOCK: usize = arc_bytes::<Mutex<MetricsSet>>();
+
     /// Create a new empty shared metrics set
     pub fn new() -> Self {
         Self {

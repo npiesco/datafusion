@@ -60,6 +60,7 @@ fn projection_exec(
             (col("c3", schema.as_ref()).unwrap(), "c3".to_string()),
         ],
         input,
+        &Funding::default(),
     )?))
 }
 

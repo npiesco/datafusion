@@ -450,6 +450,7 @@ fn test_csv_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("d", 0)), "d"),
         ],
         csv.clone(),
+        &Funding::default(),
     )?);
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -488,6 +489,7 @@ fn test_memory_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("a", 1)), "a"),
         ],
         memory.clone(),
+        &Funding::default(),
     )?);
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -591,6 +593,7 @@ fn test_streaming_table_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a"),
         ],
         Arc::new(streaming_table) as _,
+        &Funding::default(),
     )?) as _;
 
     let after_optimize =
@@ -656,6 +659,7 @@ fn test_projection_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "new_b"),
         ],
         csv.clone(),
+        &Funding::default(),
     )?);
     let top_projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
@@ -671,6 +675,7 @@ fn test_projection_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("new_b", 3)), "newest_b"),
         ],
         child_projection.clone(),
+        &Funding::default(),
     )?);
 
     let initial = displayable(top_projection.as_ref())
@@ -742,6 +747,7 @@ fn test_output_req_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
         ],
         sort_req.clone(),
+        &Funding::default(),
     )?);
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -834,6 +840,7 @@ fn test_coalesce_partitions_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("d", 3)), "d"),
         ],
         coalesce_partitions,
+        &Funding::default(),
     )?);
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -890,6 +897,7 @@ fn test_filter_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("d", 3)), "d"),
         ],
         filter.clone(),
+        &Funding::default(),
     )?) as _;
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -986,6 +994,7 @@ fn test_join_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("c", 7)), "c_from_right"),
         ],
         join,
+        &Funding::default(),
     )?) as _;
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -1113,6 +1122,7 @@ fn test_join_after_required_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("e", 4)), "e"),
         ],
         join,
+        &Funding::default(),
     )?) as _;
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -1192,6 +1202,7 @@ fn test_nested_loop_join_after_projection() -> Result<()> {
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![ProjectionExpr::new(col_left_c, "c")],
         Arc::clone(&join),
+        &Funding::default(),
     )?) as _;
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -1287,6 +1298,7 @@ fn test_hash_join_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("c", 7)), "c_from_right"),
         ],
         join.clone(),
+        &Funding::default(),
     )?) as _;
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -1326,6 +1338,7 @@ fn test_hash_join_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("c", 7)), "c"),
         ],
         join.clone(),
+        &Funding::default(),
     )?);
 
     let after_optimize =
@@ -1369,6 +1382,7 @@ fn test_repartition_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("d", 3)), "d_new"),
         ],
         repartition,
+        &Funding::default(),
     )?) as _;
     let initial = displayable(projection.as_ref()).indent(true).to_string();
     let actual = initial.trim();
@@ -1437,6 +1451,7 @@ fn test_sort_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
         ],
         Arc::new(sort_exec),
+        &Funding::default(),
     )?) as _;
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -1490,6 +1505,7 @@ fn test_sort_preserving_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
         ],
         Arc::new(sort_exec),
+        &Funding::default(),
     )?) as _;
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -1532,6 +1548,7 @@ fn test_union_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
         ],
         union.clone(),
+        &Funding::default(),
     )?) as _;
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -1618,6 +1635,7 @@ fn test_partition_col_projection_pushdown() -> Result<()> {
             ProjectionExpr::new(col("int_col", partitioned_schema.as_ref())?, "int_col"),
         ],
         source,
+        &Funding::default(),
     )?);
 
     let after_optimize =
@@ -1658,6 +1676,7 @@ fn test_partition_col_projection_pushdown_expr() -> Result<()> {
             ProjectionExpr::new(col("int_col", partitioned_schema.as_ref())?, "int_col"),
         ],
         source,
+        &Funding::default(),
     )?);
 
     let after_optimize =
@@ -1685,6 +1704,7 @@ fn test_cooperative_exec_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
         ],
         cooperative,
+        &Funding::default(),
     )?);
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -1740,6 +1760,7 @@ fn test_hash_join_empty_projection_embeds() -> Result<()> {
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![] as Vec<ProjectionExpr>,
         join,
+        &Funding::default(),
     )?);
 
     let after_optimize =
@@ -1795,6 +1816,7 @@ fn test_filter_with_embedded_projection_after_projection() -> Result<()> {
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
         ],
         filter,
+        &Funding::default(),
     )?);
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();
@@ -1851,6 +1873,7 @@ fn test_filter_with_embedded_projection_after_renaming_projection() -> Result<()
             ProjectionExpr::new(Arc::new(Column::new("b", 1)), "y"),
         ],
         filter,
+        &Funding::default(),
     )?);
 
     let initial = displayable(projection.as_ref()).indent(true).to_string();

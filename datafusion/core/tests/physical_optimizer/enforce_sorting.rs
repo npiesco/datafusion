@@ -3449,7 +3449,11 @@ async fn test_passthrough_wrapper_projection_keeps_ordering() -> Result<()> {
             .into_iter()
             .map(|(expr, alias)| ProjectionExpr { expr, alias })
             .collect();
-        Ok(Arc::new(ProjectionExec::try_new(proj_exprs, input)?))
+        Ok(Arc::new(ProjectionExec::try_new(
+            proj_exprs,
+            input,
+            &Funding::default(),
+        )?))
     }
 
     let batch = record_batch!(

@@ -103,6 +103,7 @@ fn roundtrip_scalar_udf() -> Result<()> {
             alias: "a".to_string(),
         }],
         input,
+        &Funding::default(),
     )?;
 
     let ctx = SessionContext::new();
@@ -344,6 +345,7 @@ fn roundtrip_higher_order_udf() -> Result<()> {
             alias: "a".to_string(),
         }],
         input,
+        &Funding::default(),
     )?;
 
     let ctx = SessionContext::new();
@@ -382,6 +384,7 @@ fn roundtrip_higher_order_udf_extension_codec() -> Result<()> {
             alias: "out".to_string(),
         }],
         input,
+        &Funding::default(),
     )?;
 
     let ctx = SessionContext::new();

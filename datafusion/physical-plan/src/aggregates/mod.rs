@@ -142,6 +142,7 @@
 //! See the issue for details: <https://github.com/apache/datafusion/issues/22710>
 #![expect(rustdoc::private_intra_doc_links)]
 
+use datafusion_common::funding::Funding;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -1020,8 +1021,11 @@ impl AggregateExec {
         };
 
         // construct a map from the input expression to the output expression of the Aggregation group by
-        let group_expr_mapping =
-            ProjectionMapping::try_new(group_by.expr.clone(), &input.schema())?;
+        let group_expr_mapping = ProjectionMapping::try_new(
+            group_by.expr.iter().map(|(e, n)| (Arc::clone(e), n)),
+            &input.schema(),
+            &Funding::default(),
+        )?;
 
         let cache = Self::compute_properties(
             &input,
@@ -5926,6 +5930,7 @@ mod tests {
                 ProjectionExpr::new_from_expression(col("b", &schema)?, &schema)?,
             ],
             plan,
+            &Funding::default(),
         )?;
         let plan: Arc<dyn ExecutionPlan> = Arc::new(proj);
         let schema = plan.schema();
@@ -7921,6 +7926,7 @@ mod tests {
                 &schema,
             )?],
             filter,
+            &Funding::default(),
         )?);
 
         assert!(plan_contains_expression_id(&projection, expression_id)?);

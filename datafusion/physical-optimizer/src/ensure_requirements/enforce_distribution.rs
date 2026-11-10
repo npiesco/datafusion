@@ -28,6 +28,7 @@
 //! If increasing parallelism is beneficial (and also desirable according to
 //! configuration), they increase partition counts in the physical plan.
 
+use datafusion_common::funding::Funding;
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -401,7 +402,7 @@ pub fn reorder_aggregate_keys(
                 alias: name.clone(),
             })
         }
-        return ProjectionExec::try_new(proj_exprs, new_final_agg)
+        return ProjectionExec::try_new(proj_exprs, new_final_agg, &Funding::default())
             .map(|p| PlanWithKeyRequirements::new(Arc::new(p), vec![], vec![agg_node]));
     }
     Ok(agg_node)

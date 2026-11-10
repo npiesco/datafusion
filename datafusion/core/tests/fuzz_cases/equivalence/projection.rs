@@ -22,6 +22,7 @@ use crate::fuzz_cases::equivalence::utils::{
 use arrow::compute::SortOptions;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_expr::{Operator, ScalarUDF};
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::{BinaryExpr, col};
@@ -154,8 +155,11 @@ fn ordering_satisfy_after_projection_random() -> Result<()> {
                     &eq_properties,
                 )?;
 
-                let projection_mapping =
-                    ProjectionMapping::try_new(proj_exprs, &test_schema)?;
+                let projection_mapping = ProjectionMapping::try_new(
+                    proj_exprs,
+                    &test_schema,
+                    &Funding::default(),
+                )?;
 
                 let projected_exprs = projection_mapping
                     .iter()

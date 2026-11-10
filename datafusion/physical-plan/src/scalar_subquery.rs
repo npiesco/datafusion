@@ -560,6 +560,7 @@ mod tests {
                 alias: "sq".to_string(),
             }],
             placeholder_input(),
+            &Funding::default(),
         )?))
     }
 

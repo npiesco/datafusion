@@ -761,6 +761,8 @@ impl Display for Distribution {
 #[cfg(test)]
 mod tests {
 
+    use datafusion_common::funding::Funding;
+
     use super::*;
     use crate::expressions::Column;
     use crate::projection::ProjectionTargets;
@@ -1198,7 +1200,8 @@ mod tests {
             vec![int_split_point([10])],
         );
 
-        let keep_b_mapping = ProjectionMapping::from_indices(&[1], &fixture.schema)?;
+        let keep_b_mapping =
+            ProjectionMapping::from_indices(&[1], &fixture.schema, &Funding::default())?;
         let projected =
             range_partitioning.project(&keep_b_mapping, &fixture.eq_properties);
         assert_eq!(
@@ -1206,7 +1209,8 @@ mod tests {
             "Range([b@0 DESC NULLS LAST], [(10)], 2)"
         );
 
-        let drop_b_mapping = ProjectionMapping::from_indices(&[0], &fixture.schema)?;
+        let drop_b_mapping =
+            ProjectionMapping::from_indices(&[0], &fixture.schema, &Funding::default())?;
         let projected =
             range_partitioning.project(&drop_b_mapping, &fixture.eq_properties);
         let Partitioning::UnknownPartitioning(partition_count) = projected else {

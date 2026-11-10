@@ -17,6 +17,7 @@
 
 //! Join related functionality used both on logical and physical plans
 
+use datafusion_common::funding::Funding;
 use std::cmp::{Ordering, min};
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
@@ -2040,6 +2041,7 @@ pub fn reorder_output_after_swap(
     let proj = ProjectionExec::try_new(
         swap_reverting_projection(left_schema, right_schema),
         plan,
+        &Funding::default(),
     )?;
     Ok(Arc::new(proj))
 }

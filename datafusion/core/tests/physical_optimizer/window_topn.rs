@@ -384,8 +384,11 @@ fn with_projection_between() -> Result<()> {
             })
             .collect();
 
-    let projection: Arc<dyn ExecutionPlan> =
-        Arc::new(ProjectionExec::try_new(proj_exprs, window)?);
+    let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        proj_exprs,
+        window,
+        &Funding::default(),
+    )?);
 
     // rn column is still at index 2 in the projected schema
     let rn_col = Arc::new(Column::new("row_number", 2));

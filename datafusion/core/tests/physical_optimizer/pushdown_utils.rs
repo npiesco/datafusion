@@ -18,6 +18,7 @@
 use arrow::datatypes::SchemaRef;
 use arrow::{array::RecordBatch, compute::concat_batches};
 use datafusion::{datasource::object_store::ObjectStoreUrl, physical_plan::PhysicalExpr};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, config::ConfigOptions, internal_err};
 use datafusion_datasource::{
@@ -86,7 +87,7 @@ impl FileOpener for TestOpener {
         batches = new_batches;
 
         if let Some(projection) = &self.projection {
-            let projector = projection.make_projector(&schema)?;
+            let projector = projection.make_projector(&schema, &Funding::default())?;
             batches = batches
                 .into_iter()
                 .map(|batch| projector.project_batch(&batch).unwrap())

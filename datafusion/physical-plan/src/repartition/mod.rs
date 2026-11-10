@@ -3191,7 +3191,7 @@ mod tests {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        ProjectionExec::try_new(exprs, Arc::clone(input))
+        ProjectionExec::try_new(exprs, Arc::clone(input), &Funding::default())
     }
 
     fn expect_range_partitioning(partitioning: &Partitioning) -> &RangePartitioning {

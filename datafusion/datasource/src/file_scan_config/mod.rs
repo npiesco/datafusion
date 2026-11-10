@@ -37,6 +37,7 @@ use crate::{
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Constraints, Result, ScalarValue, Statistics, internal_datafusion_err, internal_err,
@@ -852,7 +853,7 @@ impl DataSource for FileScanConfig {
 
         if let Some(projection) = self.file_source.projection() {
             let schema = self.file_source.table_schema().table_schema();
-            return match projection.projection_mapping(schema) {
+            return match projection.projection_mapping(schema, &Funding::default()) {
                 Ok(mapping) => project_output_partitioning(
                     &output_partitioning,
                     &mapping,
@@ -897,8 +898,8 @@ impl DataSource for FileScanConfig {
 
         if let Some(projection) = self.file_source.projection() {
             match (
-                projection.project_schema(schema),
-                projection.projection_mapping(schema),
+                projection.project_schema(schema, &Funding::default()),
+                projection.projection_mapping(schema, &Funding::default()),
             ) {
                 (Ok(output_schema), Ok(mapping)) => {
                     eq_properties =
@@ -1277,7 +1278,7 @@ impl FileScanConfig {
     pub fn projected_schema(&self) -> Result<Arc<Schema>> {
         let schema = self.file_source.table_schema().table_schema();
         match self.file_source.projection() {
-            Some(proj) => Ok(Arc::new(proj.project_schema(schema)?)),
+            Some(proj) => Ok(Arc::new(proj.project_schema(schema, &Funding::default())?)),
             None => Ok(Arc::clone(schema)),
         }
     }

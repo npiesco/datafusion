@@ -197,6 +197,7 @@ async fn roundtrip_union_with_mismatched_nullability_executes() -> Result<()> {
                 PlaceholderRowExec::new(Arc::new(Schema::empty()), &Funding::default())
                     .unwrap(),
             ),
+            &Funding::default(),
         )?))
     };
     let non_nullable_leg = literal_leg(ScalarValue::Int64(Some(1)))?;
@@ -397,6 +398,7 @@ async fn roundtrip_interleave_with_mismatched_nullability_executes() -> Result<(
                 PlaceholderRowExec::new(Arc::new(Schema::empty()), &Funding::default())
                     .unwrap(),
             ),
+            &Funding::default(),
         )?;
         Ok(Arc::new(RepartitionExec::try_new(
             Arc::new(projection),

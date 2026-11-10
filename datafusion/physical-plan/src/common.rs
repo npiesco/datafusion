@@ -17,6 +17,7 @@
 
 //! Defines common code used in execution plans
 
+use datafusion_common::funding::Funding;
 use std::fs;
 use std::fs::metadata;
 use std::sync::Arc;
@@ -175,7 +176,8 @@ pub fn project_plan_to_schema(
         })
         .collect::<Vec<_>>();
 
-    let projection = ProjectionExec::try_new(projection_exprs, input)?;
+    let projection =
+        ProjectionExec::try_new(projection_exprs, input, &Funding::default())?;
     debug_assert_eq!(projection.schema().as_ref(), expected_schema.as_ref());
     Ok(Arc::new(projection))
 }

@@ -19,6 +19,7 @@
 //! [`PhysicalExprAdapterFactory`], default implementations,
 //! and [`replace_columns_with_literals`].
 
+use datafusion_common::funding::Funding;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -445,7 +446,7 @@ impl DefaultPhysicalExprAdapterRewriter {
             Arc::new(get_field_expr.fun().clone()),
             args,
             &self.physical_file_schema,
-            Arc::new(get_field_expr.config_options().clone()),
+            Arc::clone(get_field_expr.config_options()),
         )?) as Arc<dyn PhysicalExpr>;
 
         if physical_struct_field == logical_struct_field {
@@ -761,7 +762,7 @@ impl BatchAdapterFactory {
 
         let adapted = projection
             .try_map_exprs(|e| simplifier.simplify(expr_adapter.rewrite(e)?))?;
-        let projector = adapted.make_projector(source_schema)?;
+        let projector = adapted.make_projector(source_schema, &Funding::default())?;
 
         Ok(BatchAdapter { projector })
     }

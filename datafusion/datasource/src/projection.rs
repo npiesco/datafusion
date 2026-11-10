@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::datatypes::{Schema, SchemaRef};
@@ -87,7 +88,8 @@ impl FileOpener for ProjectionOpener {
             projection,
             partitioned_file.object_meta.location.as_ref(),
         )?;
-        let projector = projection.make_projector(&self.input_schema)?;
+        let projector =
+            projection.make_projector(&self.input_schema, &Funding::default())?;
 
         let inner = self.inner.open(partitioned_file)?;
 
@@ -292,6 +294,7 @@ impl SplitProjection {
 
 #[cfg(test)]
 mod test {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use arrow::array::{AsArray, RecordBatch, record_batch};
@@ -474,7 +477,7 @@ mod test {
 
         // Now the projection should work on the file batch
         let projector = injected_projection
-            .make_projector(&file_batch.schema())
+            .make_projector(&file_batch.schema(), &Funding::default())
             .unwrap();
         let result = projector.project_batch(&file_batch).unwrap();
 
@@ -700,7 +703,9 @@ mod test {
         );
 
         // Apply projection
-        let projector = injected.make_projector(&data.schema()).unwrap();
+        let projector = injected
+            .make_projector(&data.schema(), &Funding::default())
+            .unwrap();
         let result = projector.project_batch(&data).unwrap();
 
         assert_eq!(result.num_columns(), 4);

@@ -23,6 +23,7 @@
 use crate::PhysicalOptimizerRule;
 use arrow::datatypes::{Fields, Schema, SchemaRef};
 use datafusion_common::alias::AliasGenerator;
+use datafusion_common::funding::Funding;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -199,8 +200,11 @@ fn try_push_down_projection(
     let new_expr = rewriter.rewrite(expr)?;
 
     if new_expr.transformed {
-        let new_join_side =
-            ProjectionExec::try_new(rewriter.join_side_projections, plan)?;
+        let new_join_side = ProjectionExec::try_new(
+            rewriter.join_side_projections,
+            plan,
+            &Funding::default(),
+        )?;
         let new_schema = Arc::clone(&new_join_side.schema());
 
         let (lhs_schema, rhs_schema) = match join_side {

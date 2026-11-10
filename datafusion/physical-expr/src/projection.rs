@@ -26,7 +26,8 @@ use crate::scalar_function::ScalarFunctionExpr;
 use crate::utils::collect_columns;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::{ColumnStatistics, Precision};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
@@ -251,16 +252,16 @@ impl ProjectionExprs {
         self.exprs.iter()
     }
 
-    /// Creates a ProjectionMapping from this projection
+    /// Creates a ProjectionMapping from this projection, what it makes charged to `funding`
     pub fn projection_mapping(
         &self,
         input_schema: &SchemaRef,
+        funding: &Funding,
     ) -> Result<ProjectionMapping> {
         ProjectionMapping::try_new(
-            self.exprs
-                .iter()
-                .map(|p| (Arc::clone(&p.expr), p.alias.clone())),
+            self.exprs.iter().map(|p| (Arc::clone(&p.expr), &p.alias)),
             input_schema,
+            funding,
         )
     }
 
@@ -460,32 +461,45 @@ impl ProjectionExprs {
     /// schema would be `[x: Int32, y: Int32]`.
     ///
     /// Note that [`Field`] metadata are preserved from the input schema.
-    pub fn project_schema(&self, input_schema: &Schema) -> Result<Schema> {
-        let fields: Result<Vec<Field>> = self
-            .exprs
-            .iter()
-            .map(|proj_expr| {
-                let metadata = proj_expr
-                    .expr
-                    .return_field(input_schema)?
-                    .metadata()
-                    .clone();
-
-                let field = Field::new(
-                    &proj_expr.alias,
-                    proj_expr.expr.data_type(input_schema)?,
-                    proj_expr.expr.nullable(input_schema)?,
-                )
-                .with_metadata(metadata);
-
-                Ok(field)
-            })
-            .collect();
-
+    ///
+    /// What it makes is charged to `funding` before it is allocated.
+    pub fn project_schema(
+        &self,
+        input_schema: &Schema,
+        funding: &Funding,
+    ) -> Result<Schema> {
         Ok(Schema::new_with_metadata(
-            fields?,
+            self.projected_fields(input_schema, None, funding)?,
             input_schema.metadata().clone(),
         ))
+    }
+
+    /// The fields this projection outputs from `input_schema`, each with the metadata of
+    /// the field at its position in `metadata_from` if given, else of the field its
+    /// expression returns: charged to `funding` before they are allocated.
+    fn projected_fields(
+        &self,
+        input_schema: &Schema,
+        metadata_from: Option<&Schema>,
+        funding: &Funding,
+    ) -> Result<Fields> {
+        let mut fields = funding.held::<Vec<FieldRef>>();
+        fields.reserve_exact(self.exprs.len())?;
+        for (index, proj_expr) in self.exprs.iter().enumerate() {
+            let returned = proj_expr.expr.return_field(input_schema)?;
+            let metadata = match metadata_from {
+                Some(schema) => schema.field(index).metadata(),
+                None => returned.metadata(),
+            };
+            let field = Field::new(
+                funding.string(&proj_expr.alias)?,
+                funding.cloned(returned.data_type())?,
+                returned.is_nullable(),
+            )
+            .with_metadata(metadata.clone());
+            fields.push(funding.arc(field)?)?;
+        }
+        funding.fields(&fields)
     }
 
     /// "unproject" an expression by applying this projection in reverse,
@@ -538,8 +552,14 @@ impl ProjectionExprs {
     /// This function returns an error if the output schema cannot be constructed from the input schema
     /// with the given projection expressions.
     /// For example, if an expression only works with integer columns but the input schema has a string column at that index.
-    pub fn make_projector(&self, input_schema: &Schema) -> Result<Projector> {
-        let output_schema = Arc::new(self.project_schema(input_schema)?);
+    ///
+    /// What it makes is charged to `funding` before it is allocated.
+    pub fn make_projector(
+        &self,
+        input_schema: &Schema,
+        funding: &Funding,
+    ) -> Result<Projector> {
+        let output_schema = funding.arc(self.project_schema(input_schema, funding)?)?;
         Ok(Projector {
             projection: self.clone(),
             output_schema,
@@ -558,37 +578,28 @@ impl ProjectionExprs {
     ///
     /// Returns an error if the projection cannot be applied to `input_schema`, or if
     /// `projected_schema` has a different number of fields than the projection.
+    ///
+    /// What it makes is charged to `funding` before it is allocated.
     pub fn make_projector_with_schema_metadata(
         &self,
         input_schema: &Schema,
         projected_schema: &Schema,
+        funding: &Funding,
     ) -> Result<Projector> {
-        let output_schema = self.project_schema(input_schema)?;
-        if output_schema.fields().len() != projected_schema.fields().len() {
+        if self.exprs.len() != projected_schema.fields().len() {
             return Err(internal_datafusion_err!(
                 "Projection has {} output fields but metadata schema has {} fields",
-                output_schema.fields().len(),
+                self.exprs.len(),
                 projected_schema.fields().len()
             ));
         }
 
-        let fields = output_schema
-            .fields()
-            .iter()
-            .zip(projected_schema.fields())
-            .map(|(field, projected_field)| {
-                Arc::new(
-                    field
-                        .as_ref()
-                        .clone()
-                        .with_metadata(projected_field.metadata().clone()),
-                )
-            })
-            .collect::<Vec<_>>();
-        let output_schema = Arc::new(Schema::new_with_metadata(
+        let fields =
+            self.projected_fields(input_schema, Some(projected_schema), funding)?;
+        let output_schema = funding.arc(Schema::new_with_metadata(
             fields,
             projected_schema.metadata().clone(),
-        ));
+        ))?;
 
         Ok(Projector {
             projection: self.clone(),
@@ -669,7 +680,8 @@ impl ProjectionExprs {
     ///     let projection = ProjectionExprs::from_indices(&[2, 0], &input_schema);
     ///
     ///     // Compute output schema
-    ///     let output_schema = projection.project_schema(&input_schema)?;
+    ///     let output_schema =
+    ///         projection.project_schema(&input_schema, &datafusion_common::funding::Funding::default())?;
     ///
     ///     // Project the statistics
     ///     let output_stats = projection.project_statistics(input_stats, &output_schema)?;
@@ -1216,14 +1228,18 @@ impl ProjectionMapping {
     /// ```
     ///
     /// where `col("c + d")` means the column named `"c + d"`.
-    pub fn try_new(
-        expr: impl IntoIterator<Item = (Arc<dyn PhysicalExpr>, String)>,
+    ///
+    /// The columns and target lists it makes are charged to `funding` before they are
+    /// allocated.
+    pub fn try_new<N: AsRef<str>>(
+        expr: impl IntoIterator<Item = (Arc<dyn PhysicalExpr>, N)>,
         input_schema: &SchemaRef,
+        funding: &Funding,
     ) -> Result<Self> {
         // Construct a map from the input expressions to the output expression of the projection:
         let mut map = IndexMap::<_, ProjectionTargets>::new();
         for (expr_idx, (expr, name)) in expr.into_iter().enumerate() {
-            let target_expr = Arc::new(Column::new(&name, expr_idx)) as _;
+            let target_expr = funded_column(name.as_ref(), expr_idx, funding)?;
             let source_expr = expr.transform_down(|e| match e.downcast_ref::<Column>() {
                 Some(col) => {
                     // Sometimes, an expression and its name in the input_schema
@@ -1238,15 +1254,16 @@ impl ProjectionMapping {
                         "Input field name {matching_name} does not match with the projection expression {}",
                         col.name()
                     );
-                    let matching_column = Column::new(matching_name, idx);
-                    Ok(Transformed::yes(Arc::new(matching_column)))
+                    Ok(Transformed::yes(funded_column(matching_name, idx, funding)?))
                 }
                 None => Ok(Transformed::no(e)),
             })
             .data()?;
-            map.entry(Arc::clone(&source_expr))
-                .or_default()
-                .push((Arc::clone(&target_expr), expr_idx));
+            let targets = map.entry(Arc::clone(&source_expr)).or_default();
+            funding.push(
+                &mut targets.exprs_indices,
+                (Arc::clone(&target_expr), expr_idx),
+            )?;
 
             // For struct-producing functions (e.g. named_struct), decompose
             // into field-level mapping entries so that orderings propagate
@@ -1256,11 +1273,12 @@ impl ProjectionMapping {
             // enabling the optimizer to know that sorting by
             // `details.ticker` is equivalent to sorting by `p.ticker`.
             if let Some(func_expr) = source_expr.downcast_ref::<ScalarFunctionExpr>() {
-                let literal_args: Vec<Option<ScalarValue>> = func_expr
-                    .args()
-                    .iter()
-                    .map(|arg| arg.downcast_ref::<Literal>().map(|l| l.value().clone()))
-                    .collect();
+                let mut literal_args = funding.held::<Vec<Option<ScalarValue>>>();
+                literal_args.reserve_exact(func_expr.args().len())?;
+                for arg in func_expr.args() {
+                    let value = arg.downcast_ref::<Literal>().map(Literal::value);
+                    literal_args.push(value.map(|v| funding.cloned(v)).transpose()?)?;
+                }
 
                 if let Some(field_mapping) =
                     func_expr.fun().struct_field_mapping(&literal_args)
@@ -1271,10 +1289,12 @@ impl ProjectionMapping {
 
                         // Build accessor args: [target_col, ...field_name_literals]
                         let mut accessor_fn_args: Vec<Arc<dyn PhysicalExpr>> =
-                            vec![Arc::clone(&target_expr)];
-                        accessor_fn_args.extend(accessor_args.iter().map(|sv| {
-                            Arc::new(Literal::new(sv.clone())) as Arc<dyn PhysicalExpr>
-                        }));
+                            funding.vec_with_capacity(1 + accessor_args.len())?;
+                        accessor_fn_args.push(Arc::clone(&target_expr));
+                        for sv in accessor_args {
+                            accessor_fn_args
+                                .push(funding.arc(Literal::new(funding.cloned(sv)?))?);
+                        }
 
                         // Look up the field's return type from the struct schema
                         let return_field = accessor_args
@@ -1288,18 +1308,21 @@ impl ProjectionMapping {
                             });
 
                         if let Some(return_field) = return_field {
-                            let field_access_expr = Arc::new(ScalarFunctionExpr::new(
-                                field_mapping.field_accessor.name(),
-                                Arc::clone(&field_mapping.field_accessor),
-                                accessor_fn_args,
-                                return_field,
-                                Arc::new(func_expr.config_options().clone()),
-                            ))
-                                as Arc<dyn PhysicalExpr>;
+                            let config_options = Arc::clone(func_expr.config_options());
+                            let field_access_expr: Arc<dyn PhysicalExpr> =
+                                funding.arc(ScalarFunctionExpr::new(
+                                    field_mapping.field_accessor.name(),
+                                    Arc::clone(&field_mapping.field_accessor),
+                                    accessor_fn_args,
+                                    return_field,
+                                    config_options,
+                                ))?;
 
-                            map.entry(value_expr)
-                                .or_default()
-                                .push((field_access_expr, expr_idx));
+                            let targets = map.entry(value_expr).or_default();
+                            funding.push(
+                                &mut targets.exprs_indices,
+                                (field_access_expr, expr_idx),
+                            )?;
                         }
                     }
                 }
@@ -1312,13 +1335,37 @@ impl ProjectionMapping {
     ///
     /// This is used when the output is a subset of the input without any
     /// other transformations. The indices are for columns in the schema.
-    pub fn from_indices(indices: &[usize], schema: &SchemaRef) -> Result<Self> {
-        let projection_exprs = indices.iter().map(|index| {
-            let field = schema.field(*index);
-            let column = Arc::new(Column::new(field.name(), *index));
-            (column as _, field.name().clone())
-        });
-        ProjectionMapping::try_new(projection_exprs, schema)
+    ///
+    /// What it makes is charged to `funding` before it is allocated.
+    pub fn from_indices(
+        indices: &[usize],
+        schema: &SchemaRef,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let mut projection_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, &str)>>();
+        projection_exprs.reserve_exact(indices.len())?;
+        for index in indices {
+            let name = schema.field(*index).name().as_str();
+            projection_exprs.push((funded_column(name, *index, funding)?, name))?;
+        }
+        ProjectionMapping::try_new(projection_exprs.iter().cloned(), schema, funding)
+    }
+}
+
+/// The column `name` at `index`, its name and block charged to `funding` before they are
+/// allocated.
+fn funded_column(
+    name: &str,
+    index: usize,
+    funding: &Funding,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    funding.charge(name.len())?;
+    match funding.arc(Column::new(name, index)) {
+        Ok(column) => Ok(column),
+        Err(refused) => {
+            funding.discharge(name.len());
+            Err(refused)
+        }
     }
 }
 
@@ -1433,6 +1480,7 @@ pub fn project_ordering(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use datafusion_common::funding::Funding;
     use std::collections::HashMap;
 
     use super::*;
@@ -1903,7 +1951,8 @@ pub(crate) mod tests {
             let proj_exprs = proj_exprs
                 .into_iter()
                 .map(|(expr, name)| (Arc::clone(expr), name));
-            let projection_mapping = ProjectionMapping::try_new(proj_exprs, &schema)?;
+            let projection_mapping =
+                ProjectionMapping::try_new(proj_exprs, &schema, &Funding::default())?;
             let output_schema = output_schema(&projection_mapping, &schema)?;
 
             let expected = expected
@@ -1977,7 +2026,8 @@ pub(crate) mod tests {
         let proj_exprs = proj_exprs
             .into_iter()
             .map(|(expr, name)| (Arc::clone(expr), name));
-        let projection_mapping = ProjectionMapping::try_new(proj_exprs, &schema)?;
+        let projection_mapping =
+            ProjectionMapping::try_new(proj_exprs, &schema, &Funding::default())?;
         let output_schema = output_schema(&projection_mapping, &schema)?;
 
         let col_a_new = &col("a_new", &output_schema)?;
@@ -2156,7 +2206,8 @@ pub(crate) mod tests {
         let proj_exprs = proj_exprs
             .into_iter()
             .map(|(expr, name)| (Arc::clone(expr), name));
-        let projection_mapping = ProjectionMapping::try_new(proj_exprs, &schema)?;
+        let projection_mapping =
+            ProjectionMapping::try_new(proj_exprs, &schema, &Funding::default())?;
         let output_schema = output_schema(&projection_mapping, &schema)?;
 
         let col_c_new = &col("c_new", &output_schema)?;
@@ -2343,7 +2394,12 @@ pub(crate) mod tests {
         ]);
 
         let result = projection
-            .project_statistics(source, &projection.project_schema(&schema).unwrap())
+            .project_statistics(
+                source,
+                &projection
+                    .project_schema(&schema, &Funding::default())
+                    .unwrap(),
+            )
             .unwrap();
 
         let expected = Statistics {
@@ -2391,7 +2447,12 @@ pub(crate) mod tests {
         ]);
 
         let result = projection
-            .project_statistics(source, &projection.project_schema(&schema).unwrap())
+            .project_statistics(
+                source,
+                &projection
+                    .project_schema(&schema, &Funding::default())
+                    .unwrap(),
+            )
             .unwrap();
 
         let expected = Statistics {
@@ -2771,7 +2832,8 @@ pub(crate) mod tests {
             },
         ]);
 
-        let output_schema = projection.project_schema(&input_schema)?;
+        let output_schema =
+            projection.project_schema(&input_schema, &Funding::default())?;
 
         // Should have 2 fields
         assert_eq!(output_schema.fields().len(), 2);
@@ -2802,7 +2864,8 @@ pub(crate) mod tests {
             alias: "incremented".to_string(),
         }]);
 
-        let output_schema = projection.project_schema(&input_schema)?;
+        let output_schema =
+            projection.project_schema(&input_schema, &Funding::default())?;
 
         // Should have 1 field
         assert_eq!(output_schema.fields().len(), 1);
@@ -2832,7 +2895,8 @@ pub(crate) mod tests {
             alias: "renamed".to_string(),
         }]);
 
-        let output_schema = projection.project_schema(&input_schema)?;
+        let output_schema =
+            projection.project_schema(&input_schema, &Funding::default())?;
 
         // Should have 1 field
         assert_eq!(output_schema.fields().len(), 1);
@@ -2849,7 +2913,8 @@ pub(crate) mod tests {
         let input_schema = get_schema();
         let projection = ProjectionExprs::new(vec![]);
 
-        let output_schema = projection.project_schema(&input_schema)?;
+        let output_schema =
+            projection.project_schema(&input_schema, &Funding::default())?;
 
         assert_eq!(output_schema.fields().len(), 0);
 
@@ -2875,7 +2940,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved
@@ -2930,7 +2995,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved
@@ -2979,7 +3044,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         assert_eq!(output_stats.column_statistics[0], col0_stats);
@@ -3004,7 +3069,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         assert_eq!(
@@ -3028,7 +3093,8 @@ pub(crate) mod tests {
             ProjectionExpr::new(Arc::new(Column::new("col0", 0)), "b"),
         ]);
 
-        let output_schema = projection.project_schema(&get_schema())?;
+        let output_schema =
+            projection.project_schema(&get_schema(), &Funding::default())?;
         let output_stats = projection.project_statistics(input_stats, &output_schema)?;
 
         assert_eq!(output_stats.column_statistics, vec![col0.clone(), col0]);
@@ -3051,7 +3117,8 @@ pub(crate) mod tests {
             ),
         ]);
 
-        let output_schema = projection.project_schema(&get_schema())?;
+        let output_schema =
+            projection.project_schema(&get_schema(), &Funding::default())?;
         let output_stats = projection.project_statistics(input_stats, &output_schema)?;
 
         assert_eq!(output_stats.column_statistics[0], col0);
@@ -3100,7 +3167,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         assert_eq!(output_stats.column_statistics.len(), 3);
@@ -3139,7 +3206,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved
@@ -3164,7 +3231,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved
@@ -3199,7 +3266,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved
@@ -3267,7 +3334,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         assert_eq!(
@@ -3298,7 +3365,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved
@@ -3368,7 +3435,7 @@ pub(crate) mod tests {
 
         let output_stats = projection.project_statistics(
             input_stats,
-            &projection.project_schema(&input_schema)?,
+            &projection.project_schema(&input_schema, &Funding::default())?,
         )?;
 
         // Row count should be preserved

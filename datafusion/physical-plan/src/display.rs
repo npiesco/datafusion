@@ -1724,7 +1724,9 @@ mod tests {
             let proj_expr: Vec<(Arc<dyn PhysicalExpr>, String)> =
                 vec![(col("a", &schema).unwrap(), "a".to_string())];
             let _ = Partitioning::UnknownPartitioning(1);
-            Arc::new(ProjectionExec::try_new(proj_expr, filter).unwrap())
+            Arc::new(
+                ProjectionExec::try_new(proj_expr, filter, &Funding::default()).unwrap(),
+            )
         }
 
         #[test]

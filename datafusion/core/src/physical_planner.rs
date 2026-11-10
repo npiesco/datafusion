@@ -1293,6 +1293,7 @@ impl DefaultPhysicalPlanner {
                     input,
                     expr,
                     node.schema(),
+                    funding,
                 )?,
             LogicalPlan::Filter(Filter {
                 predicate, input, ..
@@ -1517,6 +1518,7 @@ impl DefaultPhysicalPlanner {
                             input,
                             expr,
                             left.schema(),
+                            funding,
                         )?,
                         _ => physical_left,
                     };
@@ -1532,6 +1534,7 @@ impl DefaultPhysicalPlanner {
                             input,
                             expr,
                             right.schema(),
+                            funding,
                         )?,
                         _ => physical_right,
                     };
@@ -1917,6 +1920,7 @@ impl DefaultPhysicalPlanner {
                         input,
                         expr,
                         new_logical.schema(),
+                        funding,
                     )?
                 } else {
                     join
@@ -3158,85 +3162,86 @@ impl DefaultPhysicalPlanner {
         input: &Arc<LogicalPlan>,
         expr: &[Expr],
         output_schema: &DFSchema,
+        funding: &Funding,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input_logical_schema = input.as_ref().schema();
         let input_physical_schema = input_exec.schema();
-        let physical_exprs = expr
-            .iter()
-            .map(|e| {
-                // For projections, SQL planner and logical plan builder may convert user
-                // provided expressions into logical Column expressions if their results
-                // are already provided from the input plans. Because we work with
-                // qualified columns in logical plane, derived columns involve operators or
-                // functions will contain qualifiers as well. This will result in logical
-                // columns with names like `SUM(t1.c1)`, `t1.c1 + t1.c2`, etc.
-                //
-                // If we run these logical columns through physical_name function, we will
-                // get physical names with column qualifiers, which violates DataFusion's
-                // field name semantics. To account for this, we need to derive the
-                // physical name from physical input instead.
-                //
-                // This depends on the invariant that logical schema field index MUST match
-                // with physical schema field index.
-                let physical_name = if let Expr::Column(col) = e {
-                    match input_logical_schema.index_of_column(col) {
-                        Ok(idx) => {
-                            // index physical field using logical field index
-                            Ok(input_exec.schema().field(idx).name().to_string())
-                        }
-                        // logical column is not a derived column, safe to pass along to
-                        // physical_name
-                        Err(_) => physical_name(e),
+        let mut physical_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+        physical_exprs.reserve_exact(expr.len())?;
+        for e in expr {
+            // For projections, SQL planner and logical plan builder may convert user
+            // provided expressions into logical Column expressions if their results
+            // are already provided from the input plans. Because we work with
+            // qualified columns in logical plane, derived columns involve operators or
+            // functions will contain qualifiers as well. This will result in logical
+            // columns with names like `SUM(t1.c1)`, `t1.c1 + t1.c2`, etc.
+            //
+            // If we run these logical columns through physical_name function, we will
+            // get physical names with column qualifiers, which violates DataFusion's
+            // field name semantics. To account for this, we need to derive the
+            // physical name from physical input instead.
+            //
+            // This depends on the invariant that logical schema field index MUST match
+            // with physical schema field index.
+            let physical_name = if let Expr::Column(col) = e {
+                match input_logical_schema.index_of_column(col) {
+                    Ok(idx) => {
+                        // index physical field using logical field index
+                        funding.string(input_physical_schema.field(idx).name())
                     }
-                } else {
-                    physical_name(e)
-                };
+                    // logical column is not a derived column, safe to pass along to
+                    // physical_name
+                    Err(_) => physical_name(e),
+                }
+            } else {
+                physical_name(e)
+            };
 
-                let physical_expr = create_physical_expr(
-                    e,
-                    input_logical_schema,
-                    execution_props,
-                    planning_ctx,
-                );
+            let physical_expr = create_physical_expr(
+                e,
+                input_logical_schema,
+                execution_props,
+                planning_ctx,
+            );
 
-                tuple_err((physical_expr, physical_name))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            physical_exprs.push(tuple_err((physical_expr, physical_name))?)?;
+        }
 
-        let num_input_columns = input_exec.schema().fields().len();
+        let num_input_columns = input_physical_schema.fields().len();
 
         match self.try_plan_async_exprs(
             num_input_columns,
-            PlannedExprResult::ExprWithName(physical_exprs),
+            PlannedExprResult::ExprWithName(physical_exprs.keep()),
             input_physical_schema.as_ref(),
         )? {
-            PlanAsyncExpr::Sync(PlannedExprResult::ExprWithName(physical_exprs)) => {
-                let proj_exprs: Vec<ProjectionExpr> = physical_exprs
-                    .into_iter()
-                    .map(|(expr, alias)| ProjectionExpr { expr, alias })
-                    .collect();
-                Ok(Arc::new(ProjectionExec::try_new_with_schema_metadata(
-                    proj_exprs,
+            PlanAsyncExpr::Sync(PlannedExprResult::ExprWithName(mut physical_exprs)) => {
+                let projection = ProjectionExec::try_new_with_schema_metadata(
+                    physical_exprs
+                        .drain(..)
+                        .map(|(expr, alias)| ProjectionExpr { expr, alias }),
                     input_exec,
                     output_schema.as_arrow(),
-                )?))
+                    funding,
+                )?;
+                funding.released(physical_exprs);
+                Ok(funding.arc(projection)?)
             }
             PlanAsyncExpr::Async(
                 async_map,
-                PlannedExprResult::ExprWithName(physical_exprs),
+                PlannedExprResult::ExprWithName(mut physical_exprs),
             ) => {
                 let async_exec =
                     AsyncFuncExec::try_new(async_map.async_exprs, input_exec)?;
-                let proj_exprs: Vec<ProjectionExpr> = physical_exprs
-                    .into_iter()
-                    .map(|(expr, alias)| ProjectionExpr { expr, alias })
-                    .collect();
-                let new_proj_exec = ProjectionExec::try_new_with_schema_metadata(
-                    proj_exprs,
-                    Arc::new(async_exec),
+                let projection = ProjectionExec::try_new_with_schema_metadata(
+                    physical_exprs
+                        .drain(..)
+                        .map(|(expr, alias)| ProjectionExpr { expr, alias }),
+                    funding.arc(async_exec)?,
                     output_schema.as_arrow(),
+                    funding,
                 )?;
-                Ok(Arc::new(new_proj_exec))
+                funding.released(physical_exprs);
+                Ok(funding.arc(projection)?)
             }
             _ => internal_err!("Unexpected PlanAsyncExpressions variant"),
         }

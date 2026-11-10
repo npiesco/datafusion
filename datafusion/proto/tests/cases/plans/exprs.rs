@@ -69,6 +69,7 @@ fn roundtrip_date_time_interval() -> Result<()> {
             alias: "result".to_string(),
         }],
         input,
+        &Funding::default(),
     )?);
     roundtrip_test(plan)
 }
@@ -94,6 +95,7 @@ fn roundtrip_like() -> Result<()> {
             alias: "result".to_string(),
         }],
         input,
+        &Funding::default(),
     )?);
     roundtrip_test(plan)
 }

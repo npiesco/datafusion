@@ -17,6 +17,7 @@
 
 //! Utilities for testing datafusion-physical-plan
 
+use datafusion_common::funding::Funding;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
@@ -346,8 +347,11 @@ impl TestMemoryExec {
                 let name = base_schema.field(*idx).name();
                 (Arc::new(Column::new(name, *idx)) as _, name.to_string())
             });
-            let projection_mapping =
-                ProjectionMapping::try_new(proj_exprs, &base_schema)?;
+            let projection_mapping = ProjectionMapping::try_new(
+                proj_exprs,
+                &base_schema,
+                &Funding::default(),
+            )?;
             let base_eqp = EquivalenceProperties::new_with_orderings(
                 Arc::clone(&base_schema),
                 sort_information,

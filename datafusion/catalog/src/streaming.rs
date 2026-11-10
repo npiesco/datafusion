@@ -17,6 +17,7 @@
 
 //! A simplified [`TableProvider`] for streaming partitioned datasets
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -104,8 +105,11 @@ impl StreamingTable {
             return Ok(output_partitioning.clone());
         };
 
-        let projection_mapping =
-            ProjectionMapping::from_indices(projection, &self.schema)?;
+        let projection_mapping = ProjectionMapping::from_indices(
+            projection,
+            &self.schema,
+            &Funding::default(),
+        )?;
         let eq_properties = EquivalenceProperties::new(Arc::clone(&self.schema));
         Ok(output_partitioning.project(&projection_mapping, &eq_properties))
     }

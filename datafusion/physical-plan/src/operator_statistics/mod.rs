@@ -1032,6 +1032,7 @@ mod tests {
         ReplaceChildrenOptions,
     };
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, ScalarValue};
     use datafusion_expr::Operator;
@@ -1443,6 +1444,7 @@ mod tests {
         let proj: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
             vec![(col("a", &schema)?, "a".to_string())],
             source,
+            &Funding::default(),
         )?);
 
         let stats = engine.compute(proj.as_ref())?;

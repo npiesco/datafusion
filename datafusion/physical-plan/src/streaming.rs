@@ -17,6 +17,7 @@
 
 //! Generic plans for deferred execution: [`StreamingTableExec`] and [`PartitionStream`]
 
+use datafusion_common::funding::Funding;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -363,6 +364,7 @@ impl ExecutionPlan for StreamingTableExec {
                 .iter()
                 .map(|expr| (Arc::clone(&expr.expr), expr.alias.clone())),
             &self.schema(),
+            &Funding::default(),
         )?;
         let output_partitioning = self
             .cache

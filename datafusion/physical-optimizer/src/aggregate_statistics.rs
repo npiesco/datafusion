@@ -20,16 +20,17 @@ use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::scalar::ScalarValue;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateInputMode, AggregateMode,
 };
+use datafusion_physical_plan::expressions::Literal;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 use datafusion_physical_plan::udaf::{
     AggregateFunctionExpr, StatisticsArgs as PlanStatisticsArgs,
 };
-use datafusion_physical_plan::{ExecutionPlan, expressions};
 use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
@@ -60,7 +61,8 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 .expect("take_optimizable() ensures that this is a AggregateExec");
             let stats = StatisticsContext::new()
                 .compute(partial_agg_exec.input().as_ref(), &StatisticsArgs::new())?;
-            let mut projections = vec![];
+            let funding = &config.funding;
+            let mut projections = funding.held::<Vec<ProjectionExpr>>();
             for expr in partial_agg_exec.aggr_expr() {
                 let field = expr.field();
                 let args = expr.expressions();
@@ -73,10 +75,11 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 if let Some((optimizable_statistic, name)) =
                     take_optimizable_value_from_statistics(&statistics_args, expr)
                 {
+                    let expr = funding.arc(Literal::new(optimizable_statistic))?;
                     projections.push(ProjectionExpr {
-                        expr: expressions::lit(optimizable_statistic),
-                        alias: name.to_owned(),
-                    });
+                        expr,
+                        alias: funding.string(name)?,
+                    })?;
                 } else {
                     // TODO: we need all aggr_expr to be resolved (cf TODO fullres)
                     break;
@@ -86,10 +89,11 @@ impl PhysicalOptimizerRule for AggregateStatistics {
             // TODO fullres: use statistics even if not all aggr_expr could be resolved
             if projections.len() == partial_agg_exec.aggr_expr().len() {
                 // input can be entirely removed
-                Ok(Arc::new(ProjectionExec::try_new(
-                    projections,
-                    Arc::new(PlaceholderRowExec::new(plan.schema(), &config.funding)?),
-                )?))
+                let input =
+                    funding.arc(PlaceholderRowExec::new(plan.schema(), funding)?)?;
+                let projection =
+                    ProjectionExec::try_new(projections.drain(..), input, funding)?;
+                Ok(funding.arc(projection)?)
             } else {
                 plan.map_children(|child| {
                     self.optimize(child, config).map(Transformed::yes)

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::{Arc, LazyLock};
 
 use arrow::{
@@ -2380,6 +2381,7 @@ fn test_pushdown_through_aggregate_with_reordered_input_columns() {
                 (col("b", &schema()).unwrap(), "b".to_string()),
             ],
             scan,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2456,6 +2458,7 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
                 (col("b", &schema()).unwrap(), "b".to_string()),
             ],
             scan,
+            &Funding::default(),
         )
         .unwrap(),
     );

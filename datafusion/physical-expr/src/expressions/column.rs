@@ -26,6 +26,7 @@ use arrow::{
     datatypes::{DataType, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
@@ -69,6 +70,12 @@ pub struct Column {
     name: String,
     /// The index of the column in its schema
     index: usize,
+}
+
+impl CloneBytes for Column {
+    fn clone_bytes(&self) -> usize {
+        self.name.clone_bytes()
+    }
 }
 
 impl Column {

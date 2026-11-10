@@ -21,6 +21,7 @@
 
 //! The Union operator combines multiple inputs with the same schema
 
+use datafusion_common::funding::Funding;
 use std::borrow::Borrow;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -127,7 +128,11 @@ fn coerce_schema(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Arc::new(ProjectionExec::try_new(exprs, input)?))
+    Ok(Arc::new(ProjectionExec::try_new(
+        exprs,
+        input,
+        &Funding::default(),
+    )?))
 }
 
 /// `UnionExec`: `UNION ALL` execution plan.

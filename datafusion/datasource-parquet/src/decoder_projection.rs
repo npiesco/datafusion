@@ -31,6 +31,7 @@
 //! [`DecoderProjection::try_new`] and hands it to the push-decoder stream,
 //! which calls [`map`](DecoderProjection::map) on every decoded batch.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
@@ -118,7 +119,8 @@ impl DecoderProjection {
         let rebased_projection = projection
             .clone()
             .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
-        let projector = rebased_projection.make_projector(&stream_schema)?;
+        let projector =
+            rebased_projection.make_projector(&stream_schema, &Funding::default())?;
 
         // Compare against the projector's *output* schema rather than the
         // stream schema, so future widening of the mask (e.g. for post-scan

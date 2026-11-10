@@ -38,6 +38,7 @@ use crate::{
 };
 use arrow::array::RecordBatch;
 use arrow::datatypes::DataType;
+use datafusion_common::funding::Funding;
 use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
@@ -752,7 +753,7 @@ impl ParquetMorselizer {
         let logical_file_schema = Arc::clone(self.table_schema.file_schema());
         let output_schema = Arc::new(
             self.projection
-                .project_schema(self.table_schema.table_schema())?,
+                .project_schema(self.table_schema.table_schema(), &Funding::default())?,
         );
 
         // Build a combined map for replacing column references with literal values.

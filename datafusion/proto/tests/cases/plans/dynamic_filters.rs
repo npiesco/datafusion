@@ -187,6 +187,7 @@ fn roundtrip_dynamic_filter_plan_pair() -> Result<(
             alias: "a".to_string(),
         }],
         data_source_exec,
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
     let filter_exec = Arc::new(FilterExec::try_new(
         Arc::clone(&filter_expr_1),
