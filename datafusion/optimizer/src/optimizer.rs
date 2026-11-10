@@ -136,6 +136,12 @@ pub trait OptimizerConfig {
 
     fn options(&self) -> Arc<ConfigOptions>;
 
+    /// The funding optimization charges what it allocates to: the options' own. The handle is
+    /// cloned, a count bumped.
+    fn funding(&self) -> datafusion_common::funding::Funding {
+        self.options().funding.clone()
+    }
+
     fn function_registry(&self) -> Option<&dyn FunctionRegistry> {
         None
     }

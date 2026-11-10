@@ -122,6 +122,11 @@ pub trait ContextProvider {
     /// Return overall configuration options
     fn options(&self) -> &ConfigOptions;
 
+    /// The funding SQL planning charges what it allocates to: the options' own.
+    fn funding(&self) -> &datafusion_common::funding::Funding {
+        &self.options().funding
+    }
+
     /// Return all scalar function names
     fn udf_names(&self) -> Vec<String>;
 

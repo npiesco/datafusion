@@ -470,6 +470,11 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         }
     }
 
+    /// The funding what this planner allocates is charged to ([`ContextProvider::funding`]).
+    pub fn funding(&self) -> &datafusion_common::funding::Funding {
+        self.context_provider.funding()
+    }
+
     pub(crate) fn add_warning(&self, warning: Diagnostic) {
         self.warnings
             .lock()

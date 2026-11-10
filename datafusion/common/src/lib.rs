@@ -35,6 +35,7 @@ pub mod extensions;
 pub mod file_options;
 pub mod float_semantics;
 pub mod format;
+pub mod funding;
 pub mod hash_utils;
 pub mod heap_size;
 pub mod instant;
