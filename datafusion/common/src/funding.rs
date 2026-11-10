@@ -309,10 +309,16 @@ impl Funding {
 
     /// `items`, a list made through this handle, moved into a counted block of its own:
     /// the block charged before it is allocated, and the list's own block, freed then, given
-    /// back.
+    /// back. Refused, the list is freed with the refusal and its block given back too.
     pub fn arc_from_vec<T>(&self, items: Vec<T>) -> Result<Arc<[T]>> {
-        self.charge(arc_slice_bytes::<T>(items.len())?)?;
         let list = items.block_bytes();
+        if let Err(refused) =
+            arc_slice_bytes::<T>(items.len()).and_then(|block| self.charge(block))
+        {
+            drop(items);
+            self.discharge(list);
+            return Err(refused);
+        }
         let made = Arc::from(items);
         self.discharge(list);
         Ok(made)
@@ -634,6 +640,39 @@ mod tests {
         funding.unwound(before);
         assert_eq!(held(&source), kept.capacity());
         funding.released(kept);
+        assert_eq!(held(&source), 0);
+    }
+
+    /// A list refused its counted block is freed, and its own block given back, whether the
+    /// refusal is propagated directly or the attempt is unwound.
+    #[test]
+    fn a_list_refused_its_counted_block_gives_back_its_own() {
+        let list_bytes = 4 * size_of::<u64>();
+        let (source, funding) = limited(list_bytes);
+        let items: Vec<u64> = funding.vec_from_slice(&[1, 2, 3, 4]).unwrap();
+        assert_eq!(held(&source), list_bytes);
+        match funding.arc_from_vec(items) {
+            Err(DataFusionError::Refused { needed }) => {
+                assert_eq!(needed, arc_slice_bytes::<u64>(4).unwrap())
+            }
+            other => panic!("refused, not {other:?}"),
+        }
+        assert_eq!(held(&source), 0);
+        assert_eq!(funding.outstanding(), 0);
+
+        let before = funding.outstanding();
+        let items: Vec<u64> = funding.vec_from_slice(&[1, 2, 3, 4]).unwrap();
+        assert!(funding.arc_from_vec(items).is_err());
+        funding.unwound(before);
+        assert_eq!(held(&source), 0);
+        assert_eq!(funding.outstanding(), 0);
+
+        let (source, funding) = limited(list_bytes + arc_slice_bytes::<u64>(4).unwrap());
+        let items: Vec<u64> = funding.vec_from_slice(&[1, 2, 3, 4]).unwrap();
+        let made = funding.arc_from_vec(items).unwrap();
+        assert_eq!(held(&source), arc_slice_bytes::<u64>(4).unwrap());
+        drop(made);
+        funding.discharge(arc_slice_bytes::<u64>(4).unwrap());
         assert_eq!(held(&source), 0);
     }
 }
