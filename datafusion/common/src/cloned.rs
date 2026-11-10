@@ -30,7 +30,9 @@ use crate::error::Result;
 use crate::funding::Funding;
 use crate::metadata::FieldMetadata;
 use crate::spans::Spans;
-use crate::{Column, DFSchema, ScalarValue, TableReference};
+use crate::{
+    Column, DFSchema, RecursionUnnestOption, ScalarValue, TableReference, UnnestOptions,
+};
 
 /// A value whose clone is measured before it is made.
 pub trait CloneBytes: Clone {
@@ -196,6 +198,20 @@ impl CloneBytes for DFSchema {
         size_of::<Option<TableReference>>()
             .saturating_mul(self.fields().len())
             .saturating_add(self.functional_dependencies().clone_bytes())
+    }
+}
+
+impl CloneBytes for UnnestOptions {
+    fn clone_bytes(&self) -> usize {
+        self.recursions.clone_bytes()
+    }
+}
+
+impl CloneBytes for RecursionUnnestOption {
+    fn clone_bytes(&self) -> usize {
+        self.input_column
+            .clone_bytes()
+            .saturating_add(self.output_column.clone_bytes())
     }
 }
 
