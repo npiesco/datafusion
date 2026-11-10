@@ -847,7 +847,7 @@ impl DefaultPhysicalPlanner {
                 let input_exec = children.one()?;
                 let target_schema = DFSchema::try_from_qualified_schema(
                     table_name.clone(),
-                    &target.schema(),
+                    &target.schema(), &datafusion_common::funding::Funding::default(),
                 )?;
                 let merge_schema = Arc::new(target_schema.join(input.schema())?);
                 provider
@@ -3637,7 +3637,7 @@ mod tests {
         )])?;
         let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
         let source = Arc::new(DefaultTableSource::new(table));
-        let logical_plan = LogicalPlanBuilder::scan("test", source, None)?
+        let logical_plan = LogicalPlanBuilder::scan("test", source, None, &datafusion_common::funding::Funding::default())?
             .repartition(LogicalPartitioning::Range(RangePartitioning::try_new(
                 vec![col("a").sort(true, true)],
                 vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
@@ -5444,8 +5444,8 @@ digraph {
         let source = DefaultTableSource::new(table);
         let source = Arc::new(source);
 
-        let left = LogicalPlanBuilder::scan("left", source.clone(), None)?;
-        let right = LogicalPlanBuilder::scan("right", source, None)?.build()?;
+        let left = LogicalPlanBuilder::scan("left", source.clone(), None, &datafusion_common::funding::Funding::default())?;
+        let right = LogicalPlanBuilder::scan("right", source, None, &datafusion_common::funding::Funding::default())?.build()?;
 
         let join_keys = (
             vec![Column::new(Some("left"), "a")],
@@ -5747,7 +5747,7 @@ digraph {
         let table_source = Arc::new(MockTableSource {
             schema: Arc::clone(&schema),
         });
-        let logical_plan = LogicalPlanBuilder::scan("test", table_source, None)
+        let logical_plan = LogicalPlanBuilder::scan("test", table_source, None, &datafusion_common::funding::Funding::default())
             .unwrap()
             .build()
             .unwrap();

@@ -23,8 +23,8 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
 
-use crate::error::{_plan_err, _schema_err, DataFusionError, Result};
 use crate::cloned::CloneBytes;
+use crate::error::{_plan_err, _schema_err, DataFusionError, Result};
 use crate::funding::{Funding, arc_bytes, arc_slice_bytes};
 use crate::{
     Column, FunctionalDependencies, SchemaError, TableReference, field_not_found,
@@ -65,11 +65,12 @@ pub type DFSchemaRef = Arc<DFSchema>;
 ///
 /// ```rust
 /// use arrow::datatypes::{DataType, Field, Schema};
+/// use datafusion_common::funding::Funding;
 /// use datafusion_common::{Column, DFSchema};
 ///
 /// let arrow_schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
 ///
-/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema).unwrap();
+/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema, &Funding::default()).unwrap();
 /// let column = Column::from_qualified_name("t1.c1");
 /// assert!(df_schema.has_column(&column));
 ///
@@ -197,14 +198,21 @@ impl DFSchema {
     ///
     /// To create a schema from an Arrow schema without a qualifier, use
     /// `DFSchema::try_from`.
+    ///
+    /// Its Arrow schema's block and its qualifiers' list are charged to `funding` before they
+    /// are made; the fields are shared, the metadata map copied uncharged.
     pub fn try_from_qualified_schema(
         qualifier: impl Into<TableReference>,
         schema: &Schema,
+        funding: &Funding,
     ) -> Result<Self> {
         let qualifier = qualifier.into();
+        let mut field_qualifiers = funding.vec_with_capacity(schema.fields.len())?;
+        field_qualifiers
+            .extend(std::iter::repeat_n(Some(qualifier), schema.fields.len()));
         let schema = DFSchema {
-            inner: schema.clone().into(),
-            field_qualifiers: vec![Some(qualifier); schema.fields.len()],
+            inner: funding.arc(schema.clone())?,
+            field_qualifiers,
             functional_dependencies: FunctionalDependencies::empty(),
         };
         schema.check_names()?;
@@ -1500,7 +1508,11 @@ mod tests {
     #[test]
     fn qualifier_in_name() -> Result<()> {
         let col = Column::from_name("t1.c0");
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         // lookup with unqualified name "t1.c0"
         let err = schema.index_of_column(&col).unwrap_err();
         let expected = "Schema error: No field named \"t1.c0\". Did you mean 't1.c0'?\n\
@@ -1518,6 +1530,7 @@ mod tests {
                 Field::new("CapitalColumn", DataType::Boolean, true),
                 Field::new("field.with.period", DataType::Boolean, true),
             ]),
+            &Funding::default(),
         )?;
 
         // lookup with unqualified name "t1.c0"
@@ -1551,6 +1564,7 @@ mod tests {
                 Field::new("URL", DataType::Boolean, true),
                 Field::new("URLHash", DataType::Boolean, true),
             ]),
+            &Funding::default(),
         )?;
 
         let err = schema.field_with_unqualified_name("url").unwrap_err();
@@ -1572,7 +1586,11 @@ mod tests {
 
     #[test]
     fn from_qualified_schema() -> Result<()> {
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         assert_eq!("fields:[t1.c0, t1.c1], metadata:{}", schema.to_string());
         Ok(())
     }
@@ -1609,7 +1627,11 @@ mod tests {
 
     #[test]
     fn from_qualified_schema_into_arrow_schema() -> Result<()> {
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let arrow_schema = schema.as_arrow();
         insta::assert_snapshot!(arrow_schema.to_string(), @r#"Field { "c0": nullable Boolean }, Field { "c1": nullable Boolean }"#);
         Ok(())
@@ -1617,8 +1639,16 @@ mod tests {
 
     #[test]
     fn join_qualified() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
-        let right = DFSchema::try_from_qualified_schema("t2", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+        let right = DFSchema::try_from_qualified_schema(
+            "t2",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let join = left.join(&right)?;
         assert_eq!(
             "fields:[t1.c0, t1.c1, t2.c0, t2.c1], metadata:{}",
@@ -1642,8 +1672,16 @@ mod tests {
 
     #[test]
     fn join_qualified_duplicate() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
-        let right = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+        let right = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let join = left.join(&right);
         assert_eq!(
             join.unwrap_err().strip_backtrace(),
@@ -1666,7 +1704,11 @@ mod tests {
 
     #[test]
     fn join_mixed() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let right = DFSchema::try_from(test_schema_2())?;
         let join = left.join(&right)?;
         assert_eq!(
@@ -1693,7 +1735,11 @@ mod tests {
 
     #[test]
     fn join_mixed_duplicate() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let right = DFSchema::try_from(test_schema_1())?;
         let join = left.join(&right);
         assert_contains!(
@@ -1706,7 +1752,11 @@ mod tests {
 
     #[test]
     fn helpful_error_messages() -> Result<()> {
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let expected_help = "Valid fields are t1.c0, t1.c1.";
         assert_contains!(
             schema
@@ -1813,28 +1863,44 @@ mod tests {
         // qualified exists
         {
             let col = Column::from_qualified_name("t1.c0");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(schema.is_column_from_schema(&col));
         }
 
         // qualified not exists
         {
             let col = Column::from_qualified_name("t1.c2");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(!schema.is_column_from_schema(&col));
         }
 
         // unqualified exists
         {
             let col = Column::from_name("c0");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(schema.is_column_from_schema(&col));
         }
 
         // unqualified not exists
         {
             let col = Column::from_name("c2");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(!schema.is_column_from_schema(&col));
         }
 
@@ -2292,6 +2358,7 @@ mod tests {
                 Field::new("id", DataType::Int32, false),
                 Field::new("name", DataType::Utf8, true),
             ]),
+            &Funding::default(),
         )
         .unwrap();
 

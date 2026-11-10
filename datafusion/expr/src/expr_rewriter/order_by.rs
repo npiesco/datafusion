@@ -522,6 +522,7 @@ mod test {
             "t",
             Arc::new(LogicalTableSource::new(schema)),
             projection,
+            &datafusion_common::funding::Funding::default(),
         )
         .unwrap()
     }

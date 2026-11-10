@@ -886,9 +886,14 @@ mod tests {
         let target = session_ctx.table_provider("t").await?;
         let target = Arc::new(DefaultTableSource::new(target));
         // Create a table scan logical plan to read from the source table
-        let scan_plan = LogicalPlanBuilder::scan("source", source, None)?
-            .filter(filter_predicate)?
-            .build()?;
+        let scan_plan = LogicalPlanBuilder::scan(
+            "source",
+            source,
+            None,
+            &datafusion_common::funding::Funding::default(),
+        )?
+        .filter(filter_predicate)?
+        .build()?;
         // Since logical plan contains a filter, increasing parallelism is helpful.
         // Therefore, we will have 8 partitions in the final plan.
         // Create an insert plan to insert the source data into the initial table

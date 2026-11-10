@@ -1244,7 +1244,7 @@ mod tests {
             LogicalPlanBuilder::scan(
                 name,
                 table_source_with_constraints(schema, constraints),
-                None,
+                None, &datafusion_common::funding::Funding::default(),
             )?
             .build()
         }

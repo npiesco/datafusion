@@ -2761,7 +2761,7 @@ mod tests {
     fn in_subquery_expr(a_nullable: bool) -> Expr {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, a_nullable)]);
         let source = Arc::new(LogicalTableSource::new(Arc::new(schema)));
-        let subquery = LogicalPlanBuilder::scan("t", source, None)
+        let subquery = LogicalPlanBuilder::scan("t", source, None, &Funding::default())
             .unwrap()
             .project(vec![col("a")])
             .unwrap()

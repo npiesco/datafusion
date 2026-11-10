@@ -92,8 +92,13 @@ pub async fn memory_pool_execution_plan() -> Result<()> {
 
     // Build logical plan with a single scan that will yield multiple batches
     let table_source = Arc::new(DefaultTableSource::new(mem_table));
-    let logical_plan =
-        LogicalPlanBuilder::scan("multi_batch_table", table_source, None)?.build()?;
+    let logical_plan = LogicalPlanBuilder::scan(
+        "multi_batch_table",
+        table_source,
+        None,
+        &datafusion::common::funding::Funding::default(),
+    )?
+    .build()?;
 
     // Convert to physical plan
     let physical_plan = ctx.state().create_physical_plan(&logical_plan).await?;

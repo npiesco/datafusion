@@ -95,6 +95,7 @@ impl SimplifyExpressions {
             let target_schema = DFSchema::try_from_qualified_schema(
                 table_name.clone(),
                 &target.schema(),
+                &Funding::default(),
             )?;
             merged_with(f, merged_input_schema(f, &plan)?, &target_schema)?
         } else if apply_inputs(&plan, &mut |_| Ok(TreeNodeRecursion::Stop))?
@@ -116,6 +117,7 @@ impl SimplifyExpressions {
                 DFSchema::try_from_qualified_schema(
                     scan.table_name.clone(),
                     &scan.source.schema(),
+                    &Funding::default(),
                 )?,
                 0,
             )

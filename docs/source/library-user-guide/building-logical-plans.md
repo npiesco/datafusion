@@ -128,7 +128,7 @@ fn main() -> Result<(), DataFusionError> {
     let projection = None;
 
     // create a LogicalPlanBuilder for a table scan
-    let builder = LogicalPlanBuilder::scan("person", Arc::new(table_source), projection)?;
+    let builder = LogicalPlanBuilder::scan("person", Arc::new(table_source), projection, &datafusion::common::funding::Funding::default())?;
 
     // perform a filter operation and build the plan
     let plan = builder
@@ -186,7 +186,7 @@ async fn main() -> Result<(), DataFusionError> {
     let table_source = provider_as_source(table_provider);
 
     // create a LogicalPlanBuilder for a table scan without projection or filters
-    let logical_plan = LogicalPlanBuilder::scan("person", table_source, None)?.build()?;
+    let logical_plan = LogicalPlanBuilder::scan("person", table_source, None, &datafusion::common::funding::Funding::default())?.build()?;
 
     // Now create the physical plan by calling `create_physical_plan`
     let ctx = SessionContext::new();

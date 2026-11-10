@@ -145,6 +145,7 @@ fn analyze_internal(
         let source_schema = DFSchema::try_from_qualified_schema(
             ts.table_name.clone(),
             &ts.source.schema(),
+            &Funding::default(),
         )?;
         schema = merged_with(f, schema, &source_schema)?;
     }
@@ -159,8 +160,11 @@ fn analyze_internal(
         ..
     }) = &plan
     {
-        let target_schema =
-            DFSchema::try_from_qualified_schema(table_name.clone(), &target.schema())?;
+        let target_schema = DFSchema::try_from_qualified_schema(
+            table_name.clone(),
+            &target.schema(),
+            &Funding::default(),
+        )?;
         schema = merged_with(f, schema, &target_schema)?;
     }
 
@@ -269,6 +273,7 @@ impl<'a> TypeCoercionRewriter<'a> {
         let target_schema = DFSchema::try_from_qualified_schema(
             dml.table_name.clone(),
             &dml.target.schema(),
+            &Funding::default(),
         )?;
         let WriteOp::MergeInto(merge_op) = &mut dml.op else {
             return Ok(LogicalPlan::Dml(dml));
@@ -1750,6 +1755,7 @@ mod test {
                 DFSchema::try_from_qualified_schema(
                     TableReference::full("datafusion", "test", "foo"),
                     &Schema::new(vec![Field::new("a", DataType::Int32, false)]),
+                    &Funding::default(),
                 )
                 .unwrap(),
             ),
@@ -1760,6 +1766,7 @@ mod test {
                 DFSchema::try_from_qualified_schema(
                     TableReference::full("datafusion", "test", "foo"),
                     &Schema::new(vec![Field::new("a", DataType::Int64, false)]),
+                    &Funding::default(),
                 )
                 .unwrap(),
             ),

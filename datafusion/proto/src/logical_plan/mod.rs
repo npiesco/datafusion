@@ -399,7 +399,10 @@ fn from_table_source(
     target: Arc<dyn TableSource>,
     extension_codec: &dyn LogicalExtensionCodec,
 ) -> Result<LogicalPlanNode> {
-    let r = LogicalPlan::TableScan(TableScanBuilder::new(table_name, target).build()?);
+    let r = LogicalPlan::TableScan(
+        TableScanBuilder::new(table_name, target)
+            .build(&datafusion_common::funding::Funding::default())?,
+    );
 
     LogicalPlanNode::try_from_logical_plan(&r, extension_codec)
 }
@@ -703,6 +706,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     provider_as_source(Arc::new(provider)),
                     projection,
                     filters,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -737,6 +741,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     provider_as_source(provider),
                     projection,
                     filters,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -1149,6 +1154,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     table_name,
                     provider_as_source(Arc::new(provider)),
                     projection,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -1263,6 +1269,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     name.as_str(),
                     provider_as_source(Arc::new(cte_work_table)),
                     None,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -1292,6 +1299,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     provider_as_source(provider),
                     projection,
                     filters,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }

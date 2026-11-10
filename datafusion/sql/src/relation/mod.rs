@@ -180,6 +180,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         },
                         provider,
                         None,
+                        self.funding(),
                     )?
                     .build()?;
                     (plan, alias)
@@ -193,11 +194,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             cte,
                             self.context_provider.get_table_source(table_ref.clone()),
                         ) {
-                            (Some(cte_plan), _) => self.funding().cloned(cte_plan.as_ref()),
+                            (Some(cte_plan), _) => {
+                                self.funding().cloned(cte_plan.as_ref())
+                            }
                             (_, Ok(provider)) => LogicalPlanBuilder::scan(
                                 table_ref.clone(),
                                 provider,
                                 None,
+                                self.funding(),
                             )?
                             .build(),
                             (None, Err(e)) => {
@@ -289,9 +293,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let provider = self
                     .context_provider
                     .get_table_function_source(tbl_func_ref.table(), func_args)?;
-                let plan =
-                    LogicalPlanBuilder::scan(tbl_func_ref.table(), provider, None)?
-                        .build()?;
+                let plan = LogicalPlanBuilder::scan(
+                    tbl_func_ref.table(),
+                    provider,
+                    None,
+                    self.funding(),
+                )?
+                .build()?;
                 (plan, alias)
             }
             // @todo Support TableFactory::TableFunction?

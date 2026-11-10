@@ -1185,6 +1185,7 @@ impl DataFrame {
             UNNAMED_TABLE,
             provider_as_source(Arc::new(provider)),
             None,
+            &datafusion_common::funding::Funding::default(),
         )?
         .build()?;
 

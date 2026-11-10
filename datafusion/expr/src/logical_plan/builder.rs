@@ -415,6 +415,7 @@ impl LogicalPlanBuilder {
     /// # use std::sync::Arc;
     /// # use arrow::datatypes::{Schema, DataType, Field};
     /// # use datafusion_common::TableReference;
+    /// # use datafusion_common::funding::Funding;
     /// #
     /// # let employee_schema = Arc::new(Schema::new(vec![
     /// #           Field::new("id", DataType::Int32, false),
@@ -422,23 +423,27 @@ impl LogicalPlanBuilder {
     /// # let table_source = Arc::new(LogicalTableSource::new(employee_schema));
     /// // Scan table_source with the name "mytable" (after normalization)
     /// # let table = table_source.clone();
-    /// let scan = LogicalPlanBuilder::scan("MyTable", table, None);
+    /// let scan = LogicalPlanBuilder::scan("MyTable", table, None, &Funding::default());
     ///
     /// // Scan table_source with the name "MyTable" by enclosing in quotes
     /// # let table = table_source.clone();
-    /// let scan = LogicalPlanBuilder::scan(r#""MyTable""#, table, None);
+    /// let scan = LogicalPlanBuilder::scan(r#""MyTable""#, table, None, &Funding::default());
     ///
     /// // Scan table_source with the name "MyTable" by forming the table reference
     /// # let table = table_source.clone();
     /// let table_reference = TableReference::bare("MyTable");
-    /// let scan = LogicalPlanBuilder::scan(table_reference, table, None);
+    /// let scan = LogicalPlanBuilder::scan(table_reference, table, None, &Funding::default());
     /// ```
+    ///
+    /// The builder plans within `funding`: the scan, and every node built on it, is charged
+    /// to it. `projection` is the funding's: made through it, or not charged at all.
     pub fn scan(
         table_name: impl Into<TableReference>,
         table_source: Arc<dyn TableSource>,
         projection: Option<Vec<usize>>,
+        funding: &Funding,
     ) -> Result<Self> {
-        Self::scan_with_filters(table_name, table_source, projection, vec![])
+        Self::scan_with_filters(table_name, table_source, projection, vec![], funding)
     }
 
     /// Create a [CopyTo] for copying the contents of this builder to the specified file(s)
@@ -505,23 +510,34 @@ impl LogicalPlanBuilder {
         ))))
     }
 
-    /// Convert a table provider into a builder with a TableScan
+    /// Convert a table provider into a builder with a TableScan, planning within `funding`
+    /// as [`LogicalPlanBuilder::scan`] does; `filters` too are the funding's.
     pub fn scan_with_filters(
         table_name: impl Into<TableReference>,
         table_source: Arc<dyn TableSource>,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
+        funding: &Funding,
     ) -> Result<Self> {
-        Self::scan_with_filters_inner(table_name, table_source, projection, filters, None)
+        Self::scan_with_filters_inner(
+            table_name,
+            table_source,
+            projection,
+            filters,
+            None,
+            funding,
+        )
     }
 
-    /// Convert a table provider into a builder with a TableScan with filter and fetch
+    /// Convert a table provider into a builder with a TableScan with filter and fetch,
+    /// planning within `funding` as [`LogicalPlanBuilder::scan_with_filters`] does.
     pub fn scan_with_filters_fetch(
         table_name: impl Into<TableReference>,
         table_source: Arc<dyn TableSource>,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
         fetch: Option<usize>,
+        funding: &Funding,
     ) -> Result<Self> {
         Self::scan_with_filters_inner(
             table_name,
@@ -529,6 +545,7 @@ impl LogicalPlanBuilder {
             projection,
             filters,
             fetch,
+            funding,
         )
     }
 
@@ -538,38 +555,50 @@ impl LogicalPlanBuilder {
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
         fetch: Option<usize>,
+        funding: &Funding,
     ) -> Result<Self> {
+        let table_name = table_name.into();
+
+        // Inline TableScan
+        if filters.is_empty()
+            && let Some(p) = table_source.get_logical_plan()
+        {
+            if table_name.table().is_empty() {
+                return plan_err!("table_name cannot be empty");
+            }
+            let sub_plan = match p {
+                Cow::Borrowed(plan) => funding.cloned(plan)?,
+                Cow::Owned(plan) => plan,
+            };
+            let builder = Self::built(sub_plan, funding.clone())?;
+
+            if let Some(proj) = projection {
+                let mut projection_exprs = funding.vec_with_capacity(proj.len())?;
+                for &i in &proj {
+                    let (qualifier, field) = builder.schema().qualified_field(i);
+                    projection_exprs.push(Expr::Column(Column::new(
+                        qualifier.cloned(),
+                        funding.string(field.name())?,
+                    )));
+                }
+                funding.released(proj);
+                funding.released(filters);
+                return builder.project(projection_exprs)?.alias(table_name);
+            }
+
+            funding.released(filters);
+            // Ensures that the reference to the inlined table remains the
+            // same, meaning we don't have to change any of the parent nodes
+            // that reference this table.
+            return builder.alias(table_name);
+        }
+
         let table_scan = TableScanBuilder::new(table_name, table_source)
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(fetch)
-            .build()?;
-
-        // Inline TableScan
-        if table_scan.filters.is_empty()
-            && let Some(p) = table_scan.source.get_logical_plan()
-        {
-            let sub_plan = p.into_owned();
-
-            if let Some(proj) = table_scan.projection {
-                let projection_exprs = proj
-                    .into_iter()
-                    .map(|i| {
-                        Expr::Column(Column::from(sub_plan.schema().qualified_field(i)))
-                    })
-                    .collect::<Vec<_>>();
-                return Self::new(sub_plan)
-                    .project(projection_exprs)?
-                    .alias(table_scan.table_name);
-            }
-
-            // Ensures that the reference to the inlined table remains the
-            // same, meaning we don't have to change any of the parent nodes
-            // that reference this table.
-            return Self::new(sub_plan).alias(table_scan.table_name);
-        }
-
-        Ok(Self::new(LogicalPlan::TableScan(table_scan)))
+            .build(funding)?;
+        Self::built(LogicalPlan::TableScan(table_scan), funding.clone())
     }
 
     /// Wrap a plan in a window
@@ -1011,7 +1040,7 @@ impl LogicalPlanBuilder {
     /// let left_table = table_source.clone();
     /// let right_table = table_source.clone();
     ///
-    /// let right_plan = LogicalPlanBuilder::scan("right", right_table, None)?.build()?;
+    /// let right_plan = LogicalPlanBuilder::scan("right", right_table, None, &Funding::default())?.build()?;
     ///
     /// // Form the expression `(left.a != right.a)` AND `(left.b != right.b)`
     /// let exprs = vec![
@@ -1022,7 +1051,7 @@ impl LogicalPlanBuilder {
     /// // Perform the equivalent of `left INNER JOIN right ON (a != a2 AND b != b2)`
     /// // finding all pairs of rows from `left` and `right` where
     /// // where `a = a2` and `b != b2`.
-    /// let plan = LogicalPlanBuilder::scan("left", left_table, None)?
+    /// let plan = LogicalPlanBuilder::scan("left", left_table, None, &Funding::default())?
     ///     .join_on(right_plan, JoinType::Inner, exprs)?
     ///     .build()?;
     /// # Ok(())
@@ -2164,7 +2193,13 @@ pub fn table_scan_with_filters(
     let name = name
         .map(|n| n.into())
         .unwrap_or_else(|| TableReference::bare(UNNAMED_TABLE));
-    LogicalPlanBuilder::scan_with_filters(name, table_source, projection, filters)
+    LogicalPlanBuilder::scan_with_filters(
+        name,
+        table_source,
+        projection,
+        filters,
+        &Funding::default(),
+    )
 }
 
 /// Create a LogicalPlanBuilder representing a scan of a table with the provided name and schema,
@@ -2187,6 +2222,7 @@ pub fn table_scan_with_filter_and_fetch(
         projection,
         filters,
         fetch,
+        &Funding::default(),
     )
 }
 
@@ -2408,17 +2444,25 @@ mod tests {
     fn plan_builder_schema() {
         let schema = employee_schema();
         let projection = None;
-        let plan =
-            LogicalPlanBuilder::scan("employee_csv", table_source(&schema), projection)
-                .unwrap();
+        let plan = LogicalPlanBuilder::scan(
+            "employee_csv",
+            table_source(&schema),
+            projection,
+            &Funding::default(),
+        )
+        .unwrap();
         assert_snapshot!(plan.schema().as_ref(), @"fields:[employee_csv.id, employee_csv.first_name, employee_csv.last_name, employee_csv.state, employee_csv.salary], metadata:{}");
 
         // Note scan of "EMPLOYEE_CSV" is treated as a SQL identifier
         // (and thus normalized to "employee"csv") as well
         let projection = None;
-        let plan =
-            LogicalPlanBuilder::scan("EMPLOYEE_CSV", table_source(&schema), projection)
-                .unwrap();
+        let plan = LogicalPlanBuilder::scan(
+            "EMPLOYEE_CSV",
+            table_source(&schema),
+            projection,
+            &Funding::default(),
+        )
+        .unwrap();
         assert_snapshot!(plan.schema().as_ref(), @"fields:[employee_csv.id, employee_csv.first_name, employee_csv.last_name, employee_csv.state, employee_csv.salary], metadata:{}");
     }
 
@@ -2426,8 +2470,13 @@ mod tests {
     fn plan_builder_empty_name() {
         let schema = employee_schema();
         let projection = None;
-        let err =
-            LogicalPlanBuilder::scan("", table_source(&schema), projection).unwrap_err();
+        let err = LogicalPlanBuilder::scan(
+            "",
+            table_source(&schema),
+            projection,
+            &Funding::default(),
+        )
+        .unwrap_err();
         assert_snapshot!(
             err.strip_backtrace(),
             @"Error during planning: table_name cannot be empty"
@@ -2937,10 +2986,14 @@ mod tests {
             Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
         let table_source = table_source_with_constraints(&employee_schema(), constraints);
 
-        let plan =
-            LogicalPlanBuilder::scan("employee_csv", table_source, Some(vec![0, 3, 4]))?
-                .aggregate(vec![col("id")], vec![sum(col("salary"))])?
-                .build()?;
+        let plan = LogicalPlanBuilder::scan(
+            "employee_csv",
+            table_source,
+            Some(vec![0, 3, 4]),
+            &Funding::default(),
+        )?
+        .aggregate(vec![col("id")], vec![sum(col("salary"))])?
+        .build()?;
 
         assert_snapshot!(plan, @r"
         Aggregate: groupBy=[[employee_csv.id]], aggr=[[sum(employee_csv.salary)]]
@@ -2958,11 +3011,15 @@ mod tests {
 
         let options =
             LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(true);
-        let plan =
-            LogicalPlanBuilder::scan("employee_csv", table_source, Some(vec![0, 3, 4]))?
-                .with_options(options)
-                .aggregate(vec![col("id")], vec![sum(col("salary"))])?
-                .build()?;
+        let plan = LogicalPlanBuilder::scan(
+            "employee_csv",
+            table_source,
+            Some(vec![0, 3, 4]),
+            &Funding::default(),
+        )?
+        .with_options(options)
+        .aggregate(vec![col("id")], vec![sum(col("salary"))])?
+        .build()?;
 
         assert_snapshot!(plan, @r"
         Aggregate: groupBy=[[employee_csv.id, employee_csv.state, employee_csv.salary]], aggr=[[sum(employee_csv.salary)]]

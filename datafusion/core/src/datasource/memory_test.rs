@@ -336,7 +336,13 @@ mod tests {
         // Convert the source table into a provider so that it can be used in a query
         let source = provider_as_source(source_table);
         // Create a table scan logical plan to read from the source table
-        let scan_plan = LogicalPlanBuilder::scan("source", source, None)?.build()?;
+        let scan_plan = LogicalPlanBuilder::scan(
+            "source",
+            source,
+            None,
+            &datafusion_common::funding::Funding::default(),
+        )?
+        .build()?;
         // Create an insert plan to insert the source data into the initial table
         let insert_into_table =
             LogicalPlanBuilder::insert_into(scan_plan, "t", target, InsertOp::Append)?

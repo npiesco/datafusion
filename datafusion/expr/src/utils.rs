@@ -488,9 +488,12 @@ pub fn expand_qualified_wildcard(
         fields_with_qualified,
         schema.metadata().clone(),
     ));
-    let qualified_dfschema =
-        DFSchema::try_from_qualified_schema(qualifier.clone(), &qualified_schema)?
-            .with_functional_dependencies(projected_func_dependencies)?;
+    let qualified_dfschema = DFSchema::try_from_qualified_schema(
+        qualifier.clone(),
+        &qualified_schema,
+        &Funding::default(),
+    )?
+    .with_functional_dependencies(projected_func_dependencies)?;
     let excluded_columns = if let Some(WildcardOptions {
         exclude: opt_exclude,
         except: opt_except,

@@ -165,6 +165,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             cte_name.to_string(),
             Arc::clone(&work_table_source),
             None,
+            self.funding(),
         )?
         .build()?;
 

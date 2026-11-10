@@ -1342,7 +1342,7 @@ mod tests {
     fn scan_t(a_nullable: bool) -> LogicalPlanBuilder {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, a_nullable)]);
         let source = Arc::new(LogicalTableSource::new(Arc::new(schema)));
-        LogicalPlanBuilder::scan("t", source, None).unwrap()
+        LogicalPlanBuilder::scan("t", source, None, &Funding::default()).unwrap()
     }
 
     #[test]

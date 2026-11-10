@@ -70,6 +70,7 @@ impl RewriteSetComparison {
                 &DFSchema::try_from_qualified_schema(
                     table_name.clone(),
                     &target.schema(),
+                    &Funding::default(),
                 )?,
             )?;
         }

@@ -2417,7 +2417,11 @@ mod tests {
 
         // Setup sort expression
         let exec_props = ExecutionProps::new();
-        let df_schema = DFSchema::try_from_qualified_schema("test", schema.as_ref())?;
+        let df_schema = DFSchema::try_from_qualified_schema(
+            "test",
+            schema.as_ref(),
+            &datafusion_common::funding::Funding::default(),
+        )?;
         let sort_expr = [col("value").sort(true, false)];
         let sort_ordering = sort_expr
             .map(|expr| {

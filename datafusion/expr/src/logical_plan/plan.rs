@@ -2618,8 +2618,12 @@ impl SubqueryAlias {
         let schema = schema.as_arrow();
 
         let schema = DFSchemaRef::new(
-            DFSchema::try_from_qualified_schema(alias.clone(), schema)?
-                .with_functional_dependencies(func_dependencies)?,
+            DFSchema::try_from_qualified_schema(
+                alias.clone(),
+                schema,
+                &Funding::default(),
+            )?
+            .with_functional_dependencies(func_dependencies)?,
         );
         Ok(SubqueryAlias {
             input: plan,
@@ -3055,7 +3059,7 @@ impl TableScan {
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(fetch)
-            .build()
+            .build(&Funding::default())
     }
 }
 
@@ -3120,8 +3124,8 @@ impl TableScanBuilder {
     }
 
     /// Build the [`TableScan`], deriving its `projected_schema` from the
-    /// source schema and projection.
-    pub fn build(self) -> Result<TableScan> {
+    /// source schema and projection, all it allocates charged to `funding` before it is made.
+    pub fn build(self, funding: &Funding) -> Result<TableScan> {
         let TableScanBuilder {
             table_name,
             source,
@@ -3138,30 +3142,31 @@ impl TableScanBuilder {
         let func_dependencies = FunctionalDependencies::new_from_constraints(
             source.constraints(),
             schema.fields.len(),
-        );
-        let projected_schema = projection
-            .as_ref()
-            .map(|p| {
+            funding,
+        )?;
+        let projected_schema = match projection.as_ref() {
+            Some(p) => {
                 let projected_func_dependencies = func_dependencies
-                    .project_functional_dependencies(p, p.len(), &Funding::default())?;
-
+                    .project_functional_dependencies(p, p.len(), funding)?;
+                funding.released_clone(func_dependencies);
+                let mut qualified_fields = funding.vec_with_capacity(p.len())?;
+                qualified_fields.extend(p.iter().map(|i| {
+                    (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
+                }));
                 let df_schema = DFSchema::new_with_metadata(
-                    &p.iter()
-                        .map(|i| {
-                            (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
-                        })
-                        .collect::<Vec<_>>(),
+                    &qualified_fields,
                     schema.metadata.clone(),
-                    &Funding::default(),
+                    funding,
                 )?;
+                funding.released(qualified_fields);
                 df_schema.with_functional_dependencies(projected_func_dependencies)
-            })
-            .unwrap_or_else(|| {
-                let df_schema =
-                    DFSchema::try_from_qualified_schema(table_name.clone(), &schema)?;
-                df_schema.with_functional_dependencies(func_dependencies)
-            })?;
-        let projected_schema = Arc::new(projected_schema);
+            }
+            None => {
+                DFSchema::try_from_qualified_schema(table_name.clone(), &schema, funding)?
+                    .with_functional_dependencies(func_dependencies)
+            }
+        }?;
+        let projected_schema = funding.arc(projected_schema)?;
 
         Ok(TableScan {
             table_name,
@@ -5012,14 +5017,15 @@ mod tests {
             LogicalTableSource::new(Arc::new(employee_schema()))
                 .with_constraints(constraints),
         );
-        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
-            .project(vec![
-                lit(1i32).alias("__common_expr_1"),
-                col("id"),
-                col("first_name"),
-                col("salary"),
-            ])?
-            .build()?;
+        let plan =
+            LogicalPlanBuilder::scan("employee_csv", source, None, &Funding::default())?
+                .project(vec![
+                    lit(1i32).alias("__common_expr_1"),
+                    col("id"),
+                    col("first_name"),
+                    col("salary"),
+                ])?
+                .build()?;
 
         let deps = plan.schema().functional_dependencies();
         assert_eq!(deps.len(), 1);
@@ -5036,12 +5042,13 @@ mod tests {
             LogicalTableSource::new(Arc::new(employee_schema()))
                 .with_constraints(constraints),
         );
-        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
-            .project(vec![
-                SelectExpr::Expression(lit(1i32).alias("__common_expr_1")),
-                SelectExpr::Wildcard(Default::default()),
-            ])?
-            .build()?;
+        let plan =
+            LogicalPlanBuilder::scan("employee_csv", source, None, &Funding::default())?
+                .project(vec![
+                    SelectExpr::Expression(lit(1i32).alias("__common_expr_1")),
+                    SelectExpr::Wildcard(Default::default()),
+                ])?
+                .build()?;
 
         let deps = plan.schema().functional_dependencies();
         assert_eq!(plan.schema().fields().len(), 6);
@@ -5060,7 +5067,9 @@ mod tests {
             LogicalTableSource::new(Arc::new(employee_schema()))
                 .with_constraints(constraints),
         );
-        let input = LogicalPlanBuilder::scan("employee_csv", source, None)?.build()?;
+        let input =
+            LogicalPlanBuilder::scan("employee_csv", source, None, &Funding::default())?
+                .build()?;
         #[expect(deprecated)]
         let projection = Projection::try_new(
             vec![
@@ -5916,6 +5925,7 @@ mod tests {
             DFSchema::try_from_qualified_schema(
                 TableReference::bare("tab"),
                 &source.schema(),
+                &Funding::default(),
             )
             .unwrap(),
         );
@@ -5946,7 +5956,9 @@ mod tests {
                             vec![0],
                         )])),
                         1,
-                    ),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
         );
@@ -6273,8 +6285,10 @@ mod tests {
                 Field::new("b", DataType::Int32, false),
             ]);
 
-            let left_schema = DFSchema::try_from_qualified_schema("t1", &schema)?;
-            let right_schema = DFSchema::try_from_qualified_schema("t2", &schema)?;
+            let left_schema =
+                DFSchema::try_from_qualified_schema("t1", &schema, &Funding::default())?;
+            let right_schema =
+                DFSchema::try_from_qualified_schema("t2", &schema, &Funding::default())?;
 
             Ok(LogicalPlan::Join(Join {
                 left: Arc::new(
