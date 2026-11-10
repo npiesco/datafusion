@@ -36,6 +36,7 @@
 //! What is freed is given back through the handle the plan was charged through: a plan
 //! handed to the optimizer is charged on the handle it optimizes within.
 
+use std::borrow::Borrow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
@@ -707,7 +708,7 @@ pub(crate) fn deduplicated<T: Hash + Eq + Freed>(
     Ok(())
 }
 
-fn hash_of<T: Hash>(item: &T) -> u64 {
+fn hash_of<T: Hash + ?Sized>(item: &T) -> u64 {
     BuildHasherDefault::<DefaultHasher>::default().hash_one(item)
 }
 
@@ -734,28 +735,40 @@ impl<'a, T: Hash + Eq> HashIndex<'a, T> {
     }
 
     /// Where the first item equal to `item` is.
-    pub(crate) fn position(&self, item: &T) -> Option<usize> {
+    pub(crate) fn position<Q>(&self, item: &Q) -> Option<usize>
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let hash = hash_of(item);
         let start = self.hashes.partition_point(|(other, _)| *other < hash);
         self.hashes[start..]
             .iter()
             .take_while(|(other, _)| *other == hash)
             .map(|(_, at)| *at)
-            .find(|at| self.items[*at] == *item)
+            .find(|at| self.items[*at].borrow() == item)
     }
 
-    pub(crate) fn contains(&self, item: &T) -> bool {
+    pub(crate) fn contains<Q>(&self, item: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.position(item).is_some()
     }
 
     /// How many items are equal to `item`.
-    pub(crate) fn count(&self, item: &T) -> usize {
+    pub(crate) fn count<Q>(&self, item: &Q) -> usize
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let hash = hash_of(item);
         let start = self.hashes.partition_point(|(other, _)| *other < hash);
         self.hashes[start..]
             .iter()
             .take_while(|(other, _)| *other == hash)
-            .filter(|(_, at)| self.items[*at] == *item)
+            .filter(|(_, at)| self.items[*at].borrow() == item)
             .count()
     }
 
