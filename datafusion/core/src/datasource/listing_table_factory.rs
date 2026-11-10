@@ -846,7 +846,6 @@ mod tests {
         #[derive(Debug)]
         struct MockSession;
 
-        #[async_trait]
         impl Session for MockSession {
             fn session_id(&self) -> &str {
                 "mock_session"
@@ -857,10 +856,15 @@ mod tests {
             fn catalog_list(&self) -> Arc<dyn CatalogProviderList> {
                 Arc::new(EmptyCatalogProviderList)
             }
-            async fn create_physical_plan(
-                &self,
-                _logical_plan: &datafusion_expr::LogicalPlan,
-            ) -> Result<Arc<dyn ExecutionPlan>> {
+            fn create_physical_plan<'a>(
+                &'a self,
+                _logical_plan: &'a datafusion_expr::LogicalPlan,
+            ) -> Result<
+                datafusion_common::funding::HeldFuture<
+                    'a,
+                    Result<Arc<dyn ExecutionPlan>>,
+                >,
+            > {
                 unimplemented!()
             }
             fn create_physical_expr(

@@ -57,8 +57,8 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use async_ffi::{FfiFuture, FutureExt};
-use async_trait::async_trait;
 use datafusion_common::error::{DataFusionError, Result};
+use datafusion_common::funding::HeldFuture;
 use datafusion_expr::LogicalPlan;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_proto::bytes::{
@@ -160,11 +160,12 @@ unsafe extern "C" fn create_physical_plan_fn_wrapper(
             logical_codec.as_ref(),
         ));
 
-        let physical_plan = sresult_return!(
-            internal_planner
-                .create_physical_plan(&logical_plan, session)
-                .await
-        );
+        let physical_plan = sresult_return!(match internal_planner
+            .create_physical_plan(&logical_plan, session)
+        {
+            Ok(planning) => planning.await,
+            Err(refused) => Err(refused),
+        });
         let physical_plan = sresult_return!(physical_plan_to_bytes_with_extension_codec(
             physical_plan,
             physical_codec.as_ref(),
@@ -339,16 +340,16 @@ impl From<&FFI_QueryPlanner> for Arc<dyn QueryPlanner + Send + Sync> {
     }
 }
 
-#[async_trait]
 impl QueryPlanner for ForeignQueryPlanner {
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.0
-            .create_physical_plan_with_session_runtime(logical_plan, session, None)
-            .await
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        session.config_options().funding.held_future(
+            self.0
+                .create_physical_plan_with_session_runtime(logical_plan, session, None),
+        )
     }
 }
 
@@ -370,16 +371,17 @@ mod tests {
     #[derive(Debug)]
     struct EmptyQueryPlanner;
 
-    #[async_trait]
     impl QueryPlanner for EmptyQueryPlanner {
-        async fn create_physical_plan(
-            &self,
-            _logical_plan: &LogicalPlan,
-            _session: &dyn Session,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            let schema =
-                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-            Ok(Arc::new(EmptyExec::new(schema)))
+        fn create_physical_plan<'a>(
+            &'a self,
+            _logical_plan: &'a LogicalPlan,
+            session: &'a dyn Session,
+        ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+            session.config_options().funding.held_future(async move {
+                let schema =
+                    Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+                Ok(Arc::new(EmptyExec::new(schema)) as Arc<dyn ExecutionPlan>)
+            })
         }
     }
 
@@ -415,7 +417,7 @@ mod tests {
 
         let logical_plan = LogicalPlanBuilder::empty(false).build()?;
         let state = ctx.state();
-        let physical_plan = planner.create_physical_plan(&logical_plan, &state).await?;
+        let physical_plan = planner.create_physical_plan(&logical_plan, &state)?.await?;
         assert_eq!(physical_plan.name(), "EmptyExec");
         assert!(physical_plan.is::<EmptyExec>());
 

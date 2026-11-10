@@ -2380,7 +2380,7 @@ mod tests {
     use crate::catalog::SchemaProvider;
     use crate::execution::session_state::SessionStateBuilder;
     use crate::physical_planner::PhysicalPlanner;
-    use async_trait::async_trait;
+    use datafusion_common::funding::HeldFuture;
     use datafusion_expr::planner::TypePlanner;
     use datafusion_session::Session;
     use sqlparser::ast;
@@ -2824,14 +2824,16 @@ mod tests {
 
     struct MyPhysicalPlanner {}
 
-    #[async_trait]
     impl PhysicalPlanner for MyPhysicalPlanner {
-        async fn create_physical_plan(
-            &self,
-            _logical_plan: &LogicalPlan,
-            _session_state: &dyn Session,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            not_impl_err!("query not supported")
+        fn create_physical_plan<'a>(
+            &'a self,
+            _logical_plan: &'a LogicalPlan,
+            session_state: &'a dyn Session,
+        ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+            session_state
+                .config_options()
+                .funding
+                .held_future(async { not_impl_err!("query not supported") })
         }
 
         fn create_physical_expr(
@@ -2848,17 +2850,29 @@ mod tests {
     #[derive(Debug)]
     struct MyQueryPlanner {}
 
-    #[async_trait]
-    impl QueryPlanner for MyQueryPlanner {
-        async fn create_physical_plan(
+    impl MyQueryPlanner {
+        async fn plan(
             &self,
             logical_plan: &LogicalPlan,
             session_state: &dyn Session,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             let physical_planner = MyPhysicalPlanner {};
             physical_planner
-                .create_physical_plan(logical_plan, session_state)
+                .create_physical_plan(logical_plan, session_state)?
                 .await
+        }
+    }
+
+    impl QueryPlanner for MyQueryPlanner {
+        fn create_physical_plan<'a>(
+            &'a self,
+            logical_plan: &'a LogicalPlan,
+            session: &'a dyn Session,
+        ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+            session
+                .config_options()
+                .funding
+                .held_future(self.plan(logical_plan, session))
         }
     }
 

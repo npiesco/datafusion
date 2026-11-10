@@ -19,7 +19,10 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 
 use crate::datasource::file_format::file_type_to_format;
 use crate::datasource::listing::ListingTableUrl;
@@ -29,7 +32,8 @@ use crate::error::{DataFusionError, Result};
 use crate::execution::context::ExecutionProps;
 use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_expr::{
-    Aggregate, EmptyRelation, Join, Projection, Sort, TableScan, Unnest, Values, Window,
+    Aggregate, Distinct, DistinctOn, EmptyRelation, Join, Limit, Projection, Sort,
+    SubqueryAlias, TableScan, Union, Unnest, Values, Window,
 };
 use crate::logical_expr::{Expr, LogicalPlan, PlanType, Repartition};
 use crate::physical_expr::{
@@ -65,6 +69,7 @@ use datafusion_common::Column;
 use datafusion_common::HashMap as DFHashMap;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::format::ExplainAnalyzeCategories;
+use datafusion_common::funding::{Funding, Held, HeldFuture};
 use datafusion_common::tree_node::{
     Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
@@ -110,10 +115,7 @@ use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubque
 use datafusion_physical_plan::unnest::ListUnnest;
 use datafusion_session::{PhysicalOptimizerContext, PhysicalOptimizerRule, Session};
 
-use async_trait::async_trait;
 use datafusion_physical_plan::async_func::{AsyncFuncExec, AsyncMapper};
-use futures::{StreamExt, TryStreamExt};
-use indexmap::IndexSet;
 use itertools::{Itertools, multiunzip};
 use log::debug;
 use tokio::sync::Mutex;
@@ -150,25 +152,17 @@ pub struct DefaultPhysicalPlanner {
     extension_planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>>,
 }
 
-#[async_trait]
 impl PhysicalPlanner for DefaultPhysicalPlanner {
     /// Create a physical plan from a logical plan
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session_state: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if let Some(plan) = self
-            .handle_explain_or_analyze(logical_plan, session_state)
-            .await?
-        {
-            return Ok(plan);
-        }
-        let plan = self
-            .create_initial_plan(logical_plan, session_state)
-            .await?;
-
-        self.optimize_physical_plan(plan, session_state, |_, _| {})
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session_state: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        session_state
+            .config_options()
+            .funding
+            .held_future(self.plan(logical_plan, session_state))
     }
 
     /// Create a physical expression from a logical expression
@@ -201,13 +195,12 @@ struct ExecutionPlanChild {
     plan: Arc<dyn ExecutionPlan>,
 }
 
-#[derive(Debug)]
 enum NodeState {
     ZeroOrOneChild,
     /// Nodes with multiple children will have multiple tasks accessing it,
     /// and each task will append their contribution until the last task takes
     /// all the children to build the parent node.
-    TwoOrMoreChildren(Mutex<Vec<ExecutionPlanChild>>),
+    TwoOrMoreChildren(Mutex<Held<Vec<ExecutionPlanChild>>>),
 }
 
 /// To avoid needing to pass single child wrapped in a Vec for nodes
@@ -215,7 +208,7 @@ enum NodeState {
 enum ChildrenContainer {
     None,
     One(Arc<dyn ExecutionPlan>),
-    Multiple(Vec<Arc<dyn ExecutionPlan>>),
+    Multiple(Held<Vec<Arc<dyn ExecutionPlan>>>),
 }
 
 impl ChildrenContainer {
@@ -228,26 +221,91 @@ impl ChildrenContainer {
 
     fn two(self) -> Result<[Arc<dyn ExecutionPlan>; 2]> {
         match self {
-            Self::Multiple(v) if v.len() == 2 => Ok(v.try_into().unwrap()),
+            Self::Multiple(mut v) if v.len() == 2 => {
+                let right = v.pop().unwrap();
+                let left = v.pop().unwrap();
+                Ok([left, right])
+            }
             _ => internal_err!("ChildrenContainer doesn't contain exactly 2 children"),
         }
     }
 
-    fn vec(self) -> Vec<Arc<dyn ExecutionPlan>> {
+    /// The children in a list held by `funding`, given back as it is freed.
+    fn held(self, funding: &Funding) -> Result<Held<Vec<Arc<dyn ExecutionPlan>>>> {
         match self {
-            Self::None => vec![],
-            Self::One(p) => vec![p],
-            Self::Multiple(v) => v,
+            Self::None => Ok(funding.held()),
+            Self::One(p) => {
+                let mut v = funding.held();
+                v.reserve_exact(1)?;
+                v.push(p)?;
+                Ok(v)
+            }
+            Self::Multiple(v) => Ok(v),
         }
+    }
+
+    /// The children in a list kept by what is made of it.
+    fn vec(self, funding: &Funding) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
+        Ok(self.held(funding)?.keep())
     }
 }
 
-#[derive(Debug)]
 struct LogicalNode<'a> {
     node: &'a LogicalPlan,
     // None if root
     parent_index: Option<usize>,
+    /// The number of inputs `node` has.
+    inputs: usize,
     state: NodeState,
+}
+
+/// Applies `f` to each input of `plan`, in order. The built-in plans are walked
+/// in place; an extension, DDL or statement node lists its inputs itself
+/// ([`LogicalPlan::inputs`]).
+fn for_each_input<'p>(
+    plan: &'p LogicalPlan,
+    mut f: impl FnMut(&'p LogicalPlan) -> Result<()>,
+) -> Result<()> {
+    match plan {
+        LogicalPlan::Projection(Projection { input, .. })
+        | LogicalPlan::Filter(Filter { input, .. })
+        | LogicalPlan::Repartition(Repartition { input, .. })
+        | LogicalPlan::Window(Window { input, .. })
+        | LogicalPlan::Aggregate(Aggregate { input, .. })
+        | LogicalPlan::Sort(Sort { input, .. })
+        | LogicalPlan::Limit(Limit { input, .. })
+        | LogicalPlan::Subquery(Subquery {
+            subquery: input, ..
+        })
+        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+        | LogicalPlan::Distinct(
+            Distinct::All(input) | Distinct::On(DistinctOn { input, .. }),
+        )
+        | LogicalPlan::Explain(Explain { plan: input, .. })
+        | LogicalPlan::Analyze(Analyze { input, .. })
+        | LogicalPlan::Dml(DmlStatement { input, .. })
+        | LogicalPlan::Copy(CopyTo { input, .. })
+        | LogicalPlan::Unnest(Unnest { input, .. }) => f(input.as_ref()),
+        LogicalPlan::Join(Join { left, right, .. })
+        | LogicalPlan::RecursiveQuery(RecursiveQuery {
+            static_term: left,
+            recursive_term: right,
+            ..
+        }) => {
+            f(left.as_ref())?;
+            f(right.as_ref())
+        }
+        LogicalPlan::Union(Union { inputs, .. }) => {
+            inputs.iter().try_for_each(|input| f(input.as_ref()))
+        }
+        LogicalPlan::Extension(_) | LogicalPlan::Ddl(_) | LogicalPlan::Statement(_) => {
+            plan.inputs().into_iter().try_for_each(f)
+        }
+        LogicalPlan::TableScan(_)
+        | LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::Values(_)
+        | LogicalPlan::DescribeTable(_) => Ok(()),
+    }
 }
 
 impl DefaultPhysicalPlanner {
@@ -283,25 +341,59 @@ impl DefaultPhysicalPlanner {
     /// Collect uncorrelated scalar subqueries. We don't descend into nested
     /// subqueries here: each call to `create_initial_plan` handles subqueries
     /// at its level and then recurses in order to handle nested subqueries.
-    #[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Subquery contains Arc with interior mutability but is intentionally used as hash key
-    fn collect_scalar_subqueries(plan: &LogicalPlan) -> Vec<Subquery> {
-        let mut subqueries = IndexSet::new();
-        plan.apply(|node| {
-            for expr in node.expressions() {
+    fn collect_scalar_subqueries(
+        plan: &LogicalPlan,
+        funding: &Funding,
+        subqueries: &mut Held<Vec<Subquery>>,
+    ) -> Result<()> {
+        // An unnest's expressions are the columns it unnests, made up on the
+        // fly: never a subquery.
+        if !matches!(plan, LogicalPlan::Unnest(_)) {
+            plan.apply_expressions(|expr| {
                 expr.apply(|e| {
                     if let Expr::ScalarSubquery(sq) = e
                         && sq.outer_ref_columns.is_empty()
+                        && !subqueries.contains(sq)
                     {
-                        subqueries.insert(sq.clone());
+                        subqueries.reserve(1)?;
+                        subqueries.push(funding.cloned(sq)?)?;
                     }
                     Ok(TreeNodeRecursion::Continue)
                 })
-                .expect("infallible");
-            }
-            Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        for_each_input(plan, |input| {
+            Self::collect_scalar_subqueries(input, funding, subqueries)
         })
-        .expect("infallible");
-        subqueries.into_iter().collect()
+    }
+
+    /// Create a physical plan from a logical plan: everything it allocates is
+    /// charged first to the session's funding. The plan returned keeps what was
+    /// charged for it; a failure gives back all that planning made.
+    pub(crate) async fn plan(
+        &self,
+        logical_plan: &LogicalPlan,
+        session_state: &dyn Session,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let funding = &session_state.config_options().funding;
+        let before = funding.outstanding();
+        let planned = async {
+            if let Some(plan) = self
+                .handle_explain_or_analyze(logical_plan, session_state)
+                .await?
+            {
+                return Ok(plan);
+            }
+            let plan = self
+                .create_initial_plan(logical_plan, session_state)?
+                .await?;
+            self.optimize_physical_plan(plan, session_state, |_, _| {})
+        }
+        .await;
+        if planned.is_err() {
+            funding.unwound(before);
+        }
+        planned
     }
 
     /// Create a physical plan from a logical plan.
@@ -320,36 +412,36 @@ impl DefaultPhysicalPlanner {
     /// the recursive call produces its own [`ScalarSubqueryExec`] inside the
     /// subquery plan — each level manages only its own subqueries.
     ///
-    /// Returns a [`BoxFuture`] rather than using `async fn` because of
+    /// Returns a [`HeldFuture`] rather than using `async fn` because of
     /// this recursion.
     ///
     /// [`ScalarSubqueryExpr`]: datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr
-    /// [`BoxFuture`]: futures::future::BoxFuture
     fn create_initial_plan<'a>(
         &'a self,
         logical_plan: &'a LogicalPlan,
         session_state: &'a dyn Session,
-    ) -> futures::future::BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
-        Box::pin(async move {
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        let funding = &session_state.config_options().funding;
+        funding.held_future(async move {
             // When `enable_physical_uncorrelated_scalar_subquery` is disabled, the
             // `ScalarSubqueryToJoin` optimizer rule rewrites all uncorrelated
             // scalar subqueries to joins, so none should reach this point.
             // Skip collection in that case to avoid creating a no-op
             // `ScalarSubqueryExec` wrapper.
-            let all_subqueries = if session_state
+            let mut all_subqueries = funding.held();
+            if session_state
                 .config_options()
                 .optimizer
                 .enable_physical_uncorrelated_scalar_subquery
             {
-                Self::collect_scalar_subqueries(logical_plan)
-            } else {
-                Vec::new()
-            };
-            let (links, index_map) = self
-                .plan_scalar_subqueries(all_subqueries, session_state)
-                .await?;
+                Self::collect_scalar_subqueries(
+                    logical_plan,
+                    funding,
+                    &mut all_subqueries,
+                )?;
+            }
 
-            if links.is_empty() {
+            if all_subqueries.is_empty() {
                 return self
                     .create_initial_plan_inner(
                         logical_plan,
@@ -358,6 +450,9 @@ impl DefaultPhysicalPlanner {
                     )
                     .await;
             }
+            let (links, index_map) = self
+                .plan_scalar_subqueries(all_subqueries, session_state)
+                .await?;
 
             // Build a `PhysicalPlanningContext` that carries the index map and
             // shared results container into calls that create physical expressions.
@@ -383,44 +478,50 @@ impl DefaultPhysicalPlanner {
         session_state: &dyn Session,
         planning_ctx: &PhysicalPlanningContext,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let funding = &session_state.config_options().funding;
         // DFS the tree to flatten it into a Vec.
         // This will allow us to build the Physical Plan from the leaves up
         // to avoid recursion, and also to make it easier to build a valid
         // Physical Plan from the start and not rely on some intermediate
         // representation (since parents need to know their children at
         // construction time).
-        let mut flat_tree = vec![];
-        let mut dfs_visit_stack = vec![(None, logical_plan)];
+        let mut flat_tree: Held<Vec<LogicalNode>> = funding.held();
+        let mut dfs_visit_stack: Held<Vec<(Option<usize>, &LogicalPlan)>> =
+            funding.held();
+        dfs_visit_stack.push((None, logical_plan))?;
         // Use this to be able to find the leaves to start construction bottom
         // up concurrently.
-        let mut flat_tree_leaf_indices = vec![];
+        let mut flat_tree_leaf_indices: Held<Vec<usize>> = funding.held();
         while let Some((parent_index, node)) = dfs_visit_stack.pop() {
             let current_index = flat_tree.len();
             // Because of how we extend the visit stack here, we visit the children
             // in reverse order of how they appear, so later we need to reverse
             // the order of children when building the nodes.
-            dfs_visit_stack
-                .extend(node.inputs().iter().map(|&n| (Some(current_index), n)));
-            let state = match node.inputs().len() {
+            let mut inputs = 0;
+            for_each_input(node, |input| {
+                inputs += 1;
+                dfs_visit_stack.push((Some(current_index), input))
+            })?;
+            let state = match inputs {
                 0 => {
-                    flat_tree_leaf_indices.push(current_index);
+                    flat_tree_leaf_indices.push(current_index)?;
                     NodeState::ZeroOrOneChild
                 }
                 1 => NodeState::ZeroOrOneChild,
                 _ => {
-                    let ready_children = Vec::with_capacity(node.inputs().len());
-                    let ready_children = Mutex::new(ready_children);
-                    NodeState::TwoOrMoreChildren(ready_children)
+                    let mut ready_children = funding.held();
+                    ready_children.reserve_exact(inputs)?;
+                    NodeState::TwoOrMoreChildren(Mutex::new(ready_children))
                 }
             };
-            let node = LogicalNode {
+            flat_tree.push(LogicalNode {
                 node,
                 parent_index,
+                inputs,
                 state,
-            };
-            flat_tree.push(node);
+            })?;
         }
-        let flat_tree = Arc::new(flat_tree);
+        drop(dfs_visit_stack);
 
         let planning_concurrency = session_state
             .config_options()
@@ -431,25 +532,71 @@ impl DefaultPhysicalPlanner {
         // single task.
         let max_concurrency = planning_concurrency.min(flat_tree_leaf_indices.len());
 
-        // Spawning tasks which will traverse leaf up to the root.
-        let tasks = flat_tree_leaf_indices.into_iter().map(|index| {
-            self.task_helper(index, Arc::clone(&flat_tree), session_state, planning_ctx)
-        });
-        let mut outputs = futures::stream::iter(tasks)
-            .buffer_unordered(max_concurrency)
-            .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        // Ideally this never happens if we have a valid LogicalPlan tree
-        assert_eq_or_internal_err!(
-            outputs.len(),
-            1,
-            "Failed to convert LogicalPlan to ExecutionPlan: More than one root detected"
-        );
-        let plan = outputs.pop().unwrap();
-        Ok(plan)
+        // Tasks which traverse leaf up to the root, at most `max_concurrency` at
+        // a time, each in a held slot of its own.
+        let task = |index| {
+            funding.held_future(self.task_helper(
+                index,
+                &flat_tree,
+                session_state,
+                planning_ctx,
+            ))
+        };
+        let mut leaves = flat_tree_leaf_indices.iter().copied();
+        let mut running = funding.held();
+        running.reserve_exact(max_concurrency)?;
+        for index in leaves.by_ref().take(max_concurrency) {
+            running.push(Some(task(index)?))?;
+        }
+        let mut root = None;
+        std::future::poll_fn(|cx| {
+            loop {
+                let mut progressed = false;
+                let mut pending = false;
+                for slot in running.iter_mut() {
+                    let Some(running_task) = slot else {
+                        continue;
+                    };
+                    let Poll::Ready(output) = Pin::new(running_task).poll(cx) else {
+                        pending = true;
+                        continue;
+                    };
+                    progressed = true;
+                    *slot = None;
+                    match output {
+                        Err(e) => return Poll::Ready(Err(e)),
+                        Ok(Some(plan)) => {
+                            // Ideally this never happens if we have a valid LogicalPlan tree
+                            if root.replace(plan).is_some() {
+                                return Poll::Ready(internal_err!(
+                                    "Failed to convert LogicalPlan to ExecutionPlan: More than one root detected"
+                                ));
+                            }
+                        }
+                        Ok(None) => {}
+                    }
+                    if let Some(index) = leaves.next() {
+                        match task(index) {
+                            Ok(next) => *slot = Some(next),
+                            Err(e) => return Poll::Ready(Err(e)),
+                        }
+                    }
+                }
+                if !progressed {
+                    return if pending {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(()))
+                    };
+                }
+            }
+        })
+        .await?;
+        root.ok_or_else(|| {
+            internal_datafusion_err!(
+                "Failed to convert LogicalPlan to ExecutionPlan: No root detected"
+            )
+        })
     }
 
     /// These tasks start at a leaf and traverse up the tree towards the root, building
@@ -460,10 +607,11 @@ impl DefaultPhysicalPlanner {
     async fn task_helper<'a>(
         &'a self,
         leaf_starter_index: usize,
-        flat_tree: Arc<Vec<LogicalNode<'a>>>,
+        flat_tree: &'a [LogicalNode<'a>],
         session_state: &'a dyn Session,
         planning_ctx: &'a PhysicalPlanningContext,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        let funding = &session_state.config_options().funding;
         // We always start with a leaf, so can ignore status and pass empty children
         let mut node = flat_tree.get(leaf_starter_index).ok_or_else(|| {
             internal_datafusion_err!(
@@ -499,15 +647,15 @@ impl DefaultPhysicalPlanner {
                 }
                 // See if we have all children to build the node.
                 NodeState::TwoOrMoreChildren(children) => {
-                    let mut children: Vec<ExecutionPlanChild> = {
+                    let mut children: Held<Vec<ExecutionPlanChild>> = {
                         let mut guard = children.lock().await;
                         // Add our contribution to this parent node.
                         // Vec is pre-allocated so no allocation should occur here.
                         guard.push(ExecutionPlanChild {
                             index: current_index,
                             plan,
-                        });
-                        if guard.len() < node.node.inputs().len() {
+                        })?;
+                        if guard.len() < node.inputs {
                             // This node is not ready yet, still pending more children.
                             // This task is finished forever.
                             return Ok(None);
@@ -517,7 +665,7 @@ impl DefaultPhysicalPlanner {
                         // This task is the only one building this node now, and thus
                         // no other task will need the Mutex for this node, so take
                         // all children.
-                        std::mem::take(guard.as_mut())
+                        std::mem::replace(&mut *guard, funding.held())
                     };
 
                     // Indices refer to position in flat tree Vec, which means they are
@@ -526,8 +674,13 @@ impl DefaultPhysicalPlanner {
                     // We reverse sort because of how we visited the node in the initial
                     // DFS traversal (see above).
                     children.sort_unstable_by_key(|epc| std::cmp::Reverse(epc.index));
-                    let children = children.into_iter().map(|epc| epc.plan).collect();
-                    let children = ChildrenContainer::Multiple(children);
+                    let mut plans = funding.held();
+                    plans.reserve_exact(children.len())?;
+                    for child in children.drain(..) {
+                        plans.push(child.plan)?;
+                    }
+                    drop(children);
+                    let children = ChildrenContainer::Multiple(plans);
                     plan = self
                         .map_logical_node_to_physical(
                             node.node,
@@ -552,6 +705,7 @@ impl DefaultPhysicalPlanner {
         planning_ctx: &PhysicalPlanningContext,
         children: ChildrenContainer,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let funding = &session_state.config_options().funding;
         let execution_props = session_state.execution_props();
         let exec_node: Arc<dyn ExecutionPlan> = match node {
             // Leaves (no children)
@@ -1782,10 +1936,10 @@ impl DefaultPhysicalPlanner {
             }
 
             // N Children
-            LogicalPlan::Union(_) => UnionExec::try_new(children.vec())?,
+            LogicalPlan::Union(_) => UnionExec::try_new(children.vec(funding)?)?,
             LogicalPlan::Extension(Extension { node }) => {
                 let mut maybe_plan = None;
-                let children = children.vec();
+                let children = children.held(funding)?;
                 for planner in &self.extension_planners {
                     if maybe_plan.is_some() {
                         break;
@@ -2652,7 +2806,7 @@ impl DefaultPhysicalPlanner {
             ExplainFormat::Tree => {
                 // Tree render does not try to explain errors,
                 let physical_plan = self
-                    .create_initial_plan(e.plan.as_ref(), session_state)
+                    .create_initial_plan(e.plan.as_ref(), session_state)?
                     .await?;
 
                 let optimized_plan = self.optimize_physical_plan(
@@ -2702,7 +2856,7 @@ impl DefaultPhysicalPlanner {
 
         if !config.logical_plan_only && e.logical_optimization_succeeded {
             match self
-                .create_initial_plan(e.plan.as_ref(), session_state)
+                .create_initial_plan(e.plan.as_ref(), session_state)?
                 .await
             {
                 Ok(input) => {
@@ -2821,7 +2975,7 @@ impl DefaultPhysicalPlanner {
         a: &Analyze,
         session_state: &dyn Session,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let input = self.create_physical_plan(&a.input, session_state).await?;
+        let input = self.create_physical_plan(&a.input, session_state)?.await?;
         let schema = Arc::clone(a.schema.inner());
         let show_statistics = session_state.config_options().explain.show_statistics;
         // Statement-level overrides take precedence over the session config.
@@ -2961,18 +3115,19 @@ impl DefaultPhysicalPlanner {
     /// `Subquery` to its index.
     async fn plan_scalar_subqueries(
         &self,
-        subqueries: Vec<Subquery>,
+        mut subqueries: Held<Vec<Subquery>>,
         session_state: &dyn Session,
     ) -> Result<(Vec<ScalarSubqueryLink>, DFHashMap<Subquery, SubqueryIndex>)> {
-        let mut links = Vec::with_capacity(subqueries.len());
+        let funding = &session_state.config_options().funding;
+        let mut links = funding.vec_with_capacity(subqueries.len())?;
         let mut index_map = DFHashMap::with_capacity(subqueries.len());
-        for sq in subqueries {
+        for sq in subqueries.drain(..) {
             // Callers deduplicate, but guard against accidental double-planning.
             if index_map.contains_key(&sq) {
                 continue;
             }
             let physical_plan = self
-                .create_initial_plan(&sq.subquery, session_state)
+                .create_initial_plan(&sq.subquery, session_state)?
                 .await?;
             let index = SubqueryIndex::new(links.len());
             links.push(ScalarSubqueryLink {
@@ -3293,6 +3448,7 @@ mod tests {
     };
     use crate::prelude::{SessionConfig, SessionContext};
     use crate::test_util::{scan_empty, scan_empty_with_partitions};
+    use async_trait::async_trait;
 
     use crate::execution::context::SessionState;
     use crate::execution::session_state::SessionStateBuilder;
@@ -3364,17 +3520,18 @@ mod tests {
         invoked: Arc<AtomicBool>,
     }
 
-    #[async_trait]
     impl QueryPlanner for TestQueryPlanner {
-        async fn create_physical_plan(
-            &self,
-            logical_plan: &LogicalPlan,
-            session: &dyn Session,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
+        fn create_physical_plan<'a>(
+            &'a self,
+            logical_plan: &'a LogicalPlan,
+            session: &'a dyn Session,
+        ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
             self.invoked.store(true, AtomicOrdering::Relaxed);
-            DefaultPhysicalPlanner::default()
-                .create_physical_plan(logical_plan, session)
-                .await
+            session.config_options().funding.held_future(async move {
+                DefaultPhysicalPlanner::default()
+                    .plan(logical_plan, session)
+                    .await
+            })
         }
     }
 
@@ -3383,7 +3540,6 @@ mod tests {
         query_planner: Arc<dyn QueryPlanner + Send + Sync>,
     }
 
-    #[async_trait]
     impl Session for TestSession {
         fn session_id(&self) -> &str {
             self.inner.session_id()
@@ -3416,14 +3572,16 @@ mod tests {
             self.inner.statistics_registry()
         }
 
-        async fn create_physical_plan(
-            &self,
-            logical_plan: &LogicalPlan,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            let logical_plan = self.optimize(logical_plan)?;
-            self.query_planner()
-                .create_physical_plan(&logical_plan, self)
-                .await
+        fn create_physical_plan<'a>(
+            &'a self,
+            logical_plan: &'a LogicalPlan,
+        ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+            self.config_options().funding.held_future(async move {
+                let logical_plan = self.optimize(logical_plan)?;
+                self.query_planner()
+                    .create_physical_plan(&logical_plan, self)?
+                    .await
+            })
         }
 
         fn create_physical_expr(
@@ -3575,7 +3733,7 @@ mod tests {
         let logical_plan = session_state.optimize(logical_plan)?;
         let planner = DefaultPhysicalPlanner::default();
         planner
-            .create_physical_plan(&logical_plan, &session_state)
+            .create_physical_plan(&logical_plan, &session_state)?
             .await
     }
 
@@ -3601,7 +3759,7 @@ mod tests {
         assert!(session.as_any().downcast_ref::<SessionState>().is_none());
 
         let logical_plan = LogicalPlanBuilder::empty(false).build()?;
-        let physical_plan = session.create_physical_plan(&logical_plan).await?;
+        let physical_plan = session.create_physical_plan(&logical_plan)?.await?;
         assert!(physical_plan.is::<EmptyExec>());
         assert!(query_planner_invoked.load(AtomicOrdering::Relaxed));
         assert!(invoked.load(AtomicOrdering::Relaxed));
@@ -3645,7 +3803,7 @@ mod tests {
 
         let planner = DefaultPhysicalPlanner::default();
         let physical_plan = planner
-            .create_initial_plan(&logical_plan, &make_session_state())
+            .create_initial_plan(&logical_plan, &make_session_state())?
             .await?;
         let repartition = physical_plan
             .as_ref()
@@ -3732,7 +3890,7 @@ mod tests {
         )?);
 
         DefaultPhysicalPlanner::default()
-            .create_physical_plan(&aggregate, &SessionContext::new().state())
+            .create_physical_plan(&aggregate, &SessionContext::new().state())?
             .await?;
 
         Ok(())
@@ -4275,7 +4433,7 @@ mod tests {
         assert!(session.as_any().downcast_ref::<SessionState>().is_none());
 
         let plan = planner
-            .create_physical_plan(&logical_plan, &session)
+            .create_physical_plan(&logical_plan, &session)?
             .await?;
 
         assert_contains!(format!("{plan:?}"), "ScalarSubqueryExec");
@@ -4293,7 +4451,7 @@ mod tests {
             node: Arc::new(NoOpExtensionNode::default()),
         });
         match planner
-            .create_physical_plan(&logical_plan, &session_state)
+            .create_physical_plan(&logical_plan, &session_state)?
             .await
         {
             Ok(_) => panic!("Expected planning failure"),
@@ -4351,7 +4509,7 @@ mod tests {
             node: Arc::new(NoOpExtensionNode::default()),
         });
         let plan = planner
-            .create_physical_plan(&logical_plan, &session_state)
+            .create_physical_plan(&logical_plan, &session_state)?
             .await;
 
         let expected_error = "No installed planner was able to convert the custom node to an execution plan: NoOp";
@@ -4377,7 +4535,7 @@ mod tests {
             node: Arc::new(NoOpExtensionNode::default()),
         });
         let e = planner
-            .create_physical_plan(&logical_plan, &session_state)
+            .create_physical_plan(&logical_plan, &session_state)?
             .await
             .expect_err("planning error")
             .strip_backtrace();
@@ -5460,11 +5618,11 @@ digraph {
         let logical_plan = LogicalPlanBuilder::new(alias)
             .aggregate(vec![col("a:1")], Vec::<Expr>::new())?
             .build()?;
-        let _physical_plan = planner.create_physical_plan(&logical_plan, &state).await?;
+        let _physical_plan = planner.create_physical_plan(&logical_plan, &state)?.await?;
 
         let optimized_logical_plan = state.optimize(&logical_plan)?;
         let _optimized_physical_plan = planner
-            .create_physical_plan(&optimized_logical_plan, &state)
+            .create_physical_plan(&optimized_logical_plan, &state)?
             .await?;
 
         Ok(())
@@ -5752,7 +5910,7 @@ digraph {
             .unwrap();
 
         let plan = physical_planner
-            .create_physical_plan(&logical_plan, &session_state)
+            .create_physical_plan(&logical_plan, &session_state)?
             .await
             .unwrap();
 

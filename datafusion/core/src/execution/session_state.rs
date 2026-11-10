@@ -43,6 +43,7 @@ use datafusion_common::alias::AliasGenerator;
 use datafusion_common::config::Dialect;
 use datafusion_common::config::{ConfigExtension, ConfigOptions, TableOptions};
 use datafusion_common::display::{PlanType, StringifiedPlan, ToStringifiedPlan};
+use datafusion_common::funding::HeldFuture;
 use datafusion_common::tree_node::TreeNode;
 use datafusion_common::{
     DFSchema, DataFusionError, ResolvedTableReference, TableReference, config_err,
@@ -83,7 +84,6 @@ use datafusion_sql::{
     planner::{ContextProvider, ParserOptions, PlannerContext, SqlToRel},
 };
 
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use log::{debug, info};
@@ -258,7 +258,6 @@ impl Debug for SessionState {
     }
 }
 
-#[async_trait]
 impl Session for SessionState {
     fn session_id(&self) -> &str {
         self.session_id()
@@ -291,11 +290,15 @@ impl Session for SessionState {
         SessionState::statistics_registry(self)
     }
 
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        self.create_physical_plan(logical_plan).await
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+    ) -> datafusion_common::Result<
+        HeldFuture<'a, datafusion_common::Result<Arc<dyn ExecutionPlan>>>,
+    > {
+        self.config_options()
+            .funding
+            .held_future(SessionState::create_physical_plan(self, logical_plan))
     }
 
     fn create_physical_expr(
@@ -778,10 +781,22 @@ impl SessionState {
         &self,
         logical_plan: &LogicalPlan,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let logical_plan = self.optimize(logical_plan)?;
-        self.query_planner
-            .create_physical_plan(&logical_plan, self)
-            .await
+        let funding = &self.config_options().funding;
+        let before = funding.outstanding();
+        // The returned plan shares the optimized logical plan's schemas and
+        // expressions, so it keeps everything charged here; a failure gives it
+        // all back once the intermediate values are freed.
+        let planned = async {
+            let logical_plan = self.optimize(logical_plan)?;
+            self.query_planner
+                .create_physical_plan(&logical_plan, self)?
+                .await
+        }
+        .await;
+        if planned.is_err() {
+            funding.unwound(before);
+        }
+        planned
     }
 
     /// Create a [`PhysicalExpr`] from an [`Expr`] after applying type
@@ -2339,18 +2354,25 @@ impl From<&SessionState> for TaskContext {
 #[derive(Debug)]
 struct DefaultQueryPlanner {}
 
-#[async_trait]
 impl QueryPlanner for DefaultQueryPlanner {
     /// Given a `LogicalPlan`, create an [`ExecutionPlan`] suitable for execution
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session_state: &dyn Session,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        let planner = DefaultPhysicalPlanner::default();
-        planner
-            .create_physical_plan(logical_plan, session_state)
-            .await
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session_state: &'a dyn Session,
+    ) -> datafusion_common::Result<
+        HeldFuture<'a, datafusion_common::Result<Arc<dyn ExecutionPlan>>>,
+    > {
+        session_state
+            .config_options()
+            .funding
+            .held_future(async move {
+                // The default planner has no extension planners, so making it
+                // allocates nothing.
+                DefaultPhysicalPlanner::default()
+                    .plan(logical_plan, session_state)
+                    .await
+            })
     }
 }
 

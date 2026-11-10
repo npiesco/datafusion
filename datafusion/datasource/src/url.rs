@@ -1182,7 +1182,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl Session for MockSession {
         fn session_id(&self) -> &str {
             unimplemented!()
@@ -1196,10 +1195,12 @@ mod tests {
             Arc::new(EmptyCatalogProviderList)
         }
 
-        async fn create_physical_plan(
-            &self,
-            _logical_plan: &LogicalPlan,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
+        fn create_physical_plan<'a>(
+            &'a self,
+            _logical_plan: &'a LogicalPlan,
+        ) -> Result<
+            datafusion_common::funding::HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>,
+        > {
             unimplemented!()
         }
 

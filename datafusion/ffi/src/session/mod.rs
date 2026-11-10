@@ -38,8 +38,8 @@ use std::sync::{Arc, OnceLock};
 use arrow_schema::SchemaRef;
 use arrow_schema::ffi::FFI_ArrowSchema;
 use async_ffi::{FfiFuture, FutureExt};
-use async_trait::async_trait;
 use datafusion_common::config::{ConfigFileType, ConfigOptions, TableOptions};
+use datafusion_common::funding::HeldFuture;
 use datafusion_common::{DFSchema, DataFusionError};
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
@@ -258,7 +258,10 @@ unsafe extern "C" fn create_physical_plan_fn_wrapper(
                     logical_codec.as_ref(),
                 ));
 
-            let physical_plan = session.create_physical_plan(&logical_plan).await;
+            let physical_plan = match session.create_physical_plan(&logical_plan) {
+                Ok(planning) => planning.await,
+                Err(refused) => Err(refused),
+            };
 
             sresult!(physical_plan.map(|plan| FFI_ExecutionPlan::new(plan, runtime)))
         }
@@ -702,7 +705,6 @@ fn table_options_from_rhashmap(options: SVec<(SString, SString)>) -> TableOption
     table_options
 }
 
-#[async_trait]
 impl Session for ForeignSession {
     fn session_id(&self) -> &str {
         unsafe { (self.session.session_id)(&self.session).as_str() }
@@ -745,26 +747,32 @@ impl Session for ForeignSession {
         }
     }
 
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        unsafe {
-            let codec: Arc<dyn LogicalExtensionCodec> =
-                (&self.session.logical_codec).into();
-            let logical_plan =
-                logical_plan_to_bytes_with_extension_codec(logical_plan, codec.as_ref())?;
-            let physical_plan = df_result!(
-                (self.session.create_physical_plan)(
-                    &self.session,
-                    logical_plan.as_ref().into()
-                )
-                .await
-            )?;
-            let physical_plan = <Arc<dyn ExecutionPlan>>::try_from(&physical_plan)?;
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+    ) -> datafusion_common::Result<
+        HeldFuture<'a, datafusion_common::Result<Arc<dyn ExecutionPlan>>>,
+    > {
+        self.config_options().funding.held_future(async move {
+            unsafe {
+                let codec: Arc<dyn LogicalExtensionCodec> =
+                    (&self.session.logical_codec).into();
+                let logical_plan = logical_plan_to_bytes_with_extension_codec(
+                    logical_plan,
+                    codec.as_ref(),
+                )?;
+                let physical_plan = df_result!(
+                    (self.session.create_physical_plan)(
+                        &self.session,
+                        logical_plan.as_ref().into()
+                    )
+                    .await
+                )?;
+                let physical_plan = <Arc<dyn ExecutionPlan>>::try_from(&physical_plan)?;
 
-            Ok(physical_plan)
-        }
+                Ok(physical_plan)
+            }
+        })
     }
 
     fn create_physical_expr(
@@ -978,11 +986,11 @@ mod tests {
         assert!(foreign_session.statistics_registry().is_none());
         let planned = foreign_session
             .query_planner()
-            .create_physical_plan(&logical_plan, &foreign_session)
+            .create_physical_plan(&logical_plan, &foreign_session)?
             .await?;
         assert_eq!(planned.name(), "EmptyExec");
 
-        let physical_plan = foreign_session.create_physical_plan(&logical_plan).await?;
+        let physical_plan = foreign_session.create_physical_plan(&logical_plan)?.await?;
         assert_eq!(
             format!("{physical_plan:?}"),
             "EmptyExec { schema: Schema { fields: [], metadata: {} }, partitions: 1, cache: PlanProperties { eq_properties: EquivalenceProperties { eq_group: EquivalenceGroup { map: {}, classes: [] }, oeq_class: OrderingEquivalenceClass { orderings: [] }, oeq_cache: OrderingEquivalenceCache { normal_cls: OrderingEquivalenceClass { orderings: [] }, leading_map: {} }, constraints: Constraints { inner: [] }, schema: Schema { fields: [], metadata: {} } }, partitioning: UnknownPartitioning(1), emission_type: Incremental, boundedness: Bounded, evaluation_type: Lazy, scheduling_type: Cooperative, output_ordering: None } }"
@@ -1038,7 +1046,7 @@ mod tests {
         let foreign_session = ForeignSession::try_from(&local_session)?;
 
         let logical_plan = ctx.table("test_table").await?.into_optimized_plan()?;
-        let physical_plan = foreign_session.create_physical_plan(&logical_plan).await?;
+        let physical_plan = foreign_session.create_physical_plan(&logical_plan)?.await?;
 
         assert_eq!(physical_plan.name(), "DataSourceExec");
         assert_eq!(physical_plan.schema().field(0).name(), "a");

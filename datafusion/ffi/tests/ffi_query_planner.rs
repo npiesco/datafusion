@@ -77,7 +77,7 @@ mod tests {
 
         let logical_plan = datafusion_expr::LogicalPlanBuilder::empty(false).build()?;
         let state = ctx.state();
-        let physical_plan = planner.create_physical_plan(&logical_plan, &state).await?;
+        let physical_plan = planner.create_physical_plan(&logical_plan, &state)?.await?;
 
         assert_eq!(physical_plan.name(), "EmptyExec");
         assert!(physical_plan.is::<EmptyExec>());
@@ -232,7 +232,7 @@ mod tests {
         assert!(planner_any.downcast_ref::<ForeignQueryPlanner>().is_some());
 
         let state = ctx.state();
-        let physical_plan = planner.create_physical_plan(&logical_plan, &state).await?;
+        let physical_plan = planner.create_physical_plan(&logical_plan, &state)?.await?;
 
         // Deserialization in A reconstructs the full result as A-local
         // concrete nodes, including the plans that originated in B.

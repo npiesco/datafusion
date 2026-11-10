@@ -110,7 +110,7 @@ async fn to_physical_plan_step_by_step_demo(
     let physical_plan = ctx
         .state()
         .query_planner()
-        .create_physical_plan(&optimized_logical_plan, &ctx.state())
+        .create_physical_plan(&optimized_logical_plan, &ctx.state())?
         .await?;
     println!(
         "Final physical plan:\n\n{}\n\n",

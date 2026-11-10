@@ -22,6 +22,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion_common::funding::HeldFuture;
 use datafusion_common::{DFSchema, Result, not_impl_err};
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, LogicalPlan, TableScan, UserDefinedLogicalNode};
@@ -30,14 +31,16 @@ use datafusion_physical_plan::{ExecutionPlan, PhysicalExpr};
 use crate::Session;
 
 /// A planner that creates a physical plan for a query.
-#[async_trait]
 pub trait QueryPlanner: Any + Debug {
-    /// Given a [`LogicalPlan`], create an [`ExecutionPlan`] suitable for execution
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
+    /// Given a [`LogicalPlan`], create an [`ExecutionPlan`] suitable for execution.
+    ///
+    /// The planning to await is boxed, its block charged first to the session's planning
+    /// funding ([`datafusion_common::funding::Funding::held_future`]).
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>>;
 }
 
 /// A query planner that reports that planning is not implemented.
@@ -47,27 +50,28 @@ pub trait QueryPlanner: Any + Debug {
 #[derive(Debug, Default)]
 pub struct UnsupportedQueryPlanner;
 
-#[async_trait]
 impl QueryPlanner for UnsupportedQueryPlanner {
-    async fn create_physical_plan(
-        &self,
-        _logical_plan: &LogicalPlan,
-        _session: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    fn create_physical_plan<'a>(
+        &'a self,
+        _logical_plan: &'a LogicalPlan,
+        _session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
         not_impl_err!("This session does not expose its query planner")
     }
 }
 
 /// Physical query planner that converts a [`LogicalPlan`] to an
 /// [`ExecutionPlan`] suitable for execution.
-#[async_trait]
 pub trait PhysicalPlanner: Send + Sync {
-    /// Create a physical plan from a logical plan
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-        session: &dyn Session,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
+    /// Create a physical plan from a logical plan.
+    ///
+    /// The planning to await is boxed, its block charged first to the session's planning
+    /// funding ([`datafusion_common::funding::Funding::held_future`]).
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>>;
 
     /// Create a physical expression from a logical expression
     /// suitable for evaluation

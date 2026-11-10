@@ -119,6 +119,7 @@ use datafusion::{
     optimizer::simplify_expressions::simplify_literal::parse_literal,
     physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions},
 };
+use datafusion_common::funding::HeldFuture;
 use datafusion_common::{
     DFSchemaRef, DataFusionError, Result, Statistics, internal_err, not_impl_err,
     plan_datafusion_err, plan_err, tree_node::TreeNodeRecursion,
@@ -564,9 +565,8 @@ impl Hash for HashableF64 {
 #[derive(Debug)]
 struct TableSampleQueryPlanner;
 
-#[async_trait]
-impl QueryPlanner for TableSampleQueryPlanner {
-    async fn create_physical_plan(
+impl TableSampleQueryPlanner {
+    async fn plan(
         &self,
         logical_plan: &LogicalPlan,
         session_state: &dyn Session,
@@ -575,8 +575,21 @@ impl QueryPlanner for TableSampleQueryPlanner {
             TableSampleExtensionPlanner,
         )]);
         planner
-            .create_physical_plan(logical_plan, session_state)
+            .create_physical_plan(logical_plan, session_state)?
             .await
+    }
+}
+
+impl QueryPlanner for TableSampleQueryPlanner {
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        session
+            .config_options()
+            .funding
+            .held_future(self.plan(logical_plan, session))
     }
 }
 

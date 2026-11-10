@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use async_trait::async_trait;
 use datafusion_common::config::{ConfigOptions, TableOptions};
+use datafusion_common::funding::HeldFuture;
 use datafusion_common::{DFSchema, Result};
 use datafusion_execution::TaskContext;
 use datafusion_execution::config::SessionConfig;
@@ -76,7 +76,6 @@ use crate::{PhysicalOptimizerRule, QueryPlanner, UnsupportedQueryPlanner};
 ///
 /// [`SessionState`]: https://docs.rs/datafusion/latest/datafusion/execution/session_state/struct.SessionState.html
 /// [`TableProvider`]: https://docs.rs/datafusion/latest/datafusion/catalog/trait.TableProvider.html
-#[async_trait]
 pub trait Session: Send + Sync {
     /// Return the session ID
     fn session_id(&self) -> &str;
@@ -147,10 +146,13 @@ pub trait Session: Send + Sync {
     /// This function will error for [`LogicalPlan`]s such as catalog DDL like
     /// `CREATE TABLE`, which do not have corresponding physical plans and must
     /// be handled by another layer, typically the `SessionContext`.
-    async fn create_physical_plan(
-        &self,
-        logical_plan: &LogicalPlan,
-    ) -> Result<Arc<dyn ExecutionPlan>>;
+    ///
+    /// The planning to await is boxed, its block charged first to the session's planning
+    /// funding ([`datafusion_common::funding::Funding::held_future`]): refused, nothing is planned.
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>>;
 
     /// Create a [`PhysicalExpr`] from an [`Expr`] after applying type
     /// coercion, and function rewrites.

@@ -19,8 +19,8 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
-use async_trait::async_trait;
 use datafusion_catalog::default_table_source::source_as_provider;
+use datafusion_common::funding::HeldFuture;
 use datafusion_common::{Result, exec_err};
 use datafusion_expr::LogicalPlan;
 use datafusion_physical_plan::ExecutionPlan;
@@ -40,9 +40,8 @@ use crate::util::FFI_Option;
 #[derive(Debug)]
 struct TestQueryPlanner;
 
-#[async_trait]
-impl QueryPlanner for TestQueryPlanner {
-    async fn create_physical_plan(
+impl TestQueryPlanner {
+    async fn plan(
         &self,
         logical_plan: &LogicalPlan,
         session: &dyn Session,
@@ -89,6 +88,19 @@ impl QueryPlanner for TestQueryPlanner {
     }
 }
 
+impl QueryPlanner for TestQueryPlanner {
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        session
+            .config_options()
+            .funding
+            .held_future(self.plan(logical_plan, session))
+    }
+}
+
 /// Library C's planner for the planner-swap deployment.
 ///
 /// It holds the query planner library A exported *before* A swapped this planner
@@ -98,9 +110,8 @@ struct SwappedQueryPlanner {
     library_a_planner: Arc<dyn QueryPlanner + Send + Sync>,
 }
 
-#[async_trait]
-impl QueryPlanner for SwappedQueryPlanner {
-    async fn create_physical_plan(
+impl SwappedQueryPlanner {
+    async fn plan(
         &self,
         logical_plan: &LogicalPlan,
         session: &dyn Session,
@@ -126,7 +137,7 @@ impl QueryPlanner for SwappedQueryPlanner {
         // Rust type identities.
         let plan = self
             .library_a_planner
-            .create_physical_plan(logical_plan, session)
+            .create_physical_plan(logical_plan, session)?
             .await?;
 
         if plan.is::<ForeignExecutionPlan>() {
@@ -148,6 +159,19 @@ impl QueryPlanner for SwappedQueryPlanner {
             Arc::clone(&plan),
             Arc::clone(&plan),
         ])?)
+    }
+}
+
+impl QueryPlanner for SwappedQueryPlanner {
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        session
+            .config_options()
+            .funding
+            .held_future(self.plan(logical_plan, session))
     }
 }
 

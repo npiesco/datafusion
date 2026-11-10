@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::MemorySourceConfig;
 use datafusion::common::DFSchemaRef;
+use datafusion::common::funding::HeldFuture;
 use datafusion::error::Result;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::session_state::CacheFactory;
@@ -196,9 +197,8 @@ struct CacheNodeQueryPlanner {
     cache_manager: Arc<RwLock<CacheManager>>,
 }
 
-#[async_trait]
-impl QueryPlanner for CacheNodeQueryPlanner {
-    async fn create_physical_plan(
+impl CacheNodeQueryPlanner {
+    async fn plan(
         &self,
         logical_plan: &LogicalPlan,
         session_state: &dyn Session,
@@ -210,8 +210,21 @@ impl QueryPlanner for CacheNodeQueryPlanner {
                 },
             )]);
         physical_planner
-            .create_physical_plan(logical_plan, session_state)
+            .create_physical_plan(logical_plan, session_state)?
             .await
+    }
+}
+
+impl QueryPlanner for CacheNodeQueryPlanner {
+    fn create_physical_plan<'a>(
+        &'a self,
+        logical_plan: &'a LogicalPlan,
+        session: &'a dyn Session,
+    ) -> Result<HeldFuture<'a, Result<Arc<dyn ExecutionPlan>>>> {
+        session
+            .config_options()
+            .funding
+            .held_future(self.plan(logical_plan, session))
     }
 }
 
