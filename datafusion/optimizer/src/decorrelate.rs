@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use std::ops::Deref;
 use std::sync::Arc;
 
+use crate::funded::has_out_ref_exprs;
 use crate::simplify_expressions::ExprSimplifier;
 
 use datafusion_common::tree_node::{
@@ -144,7 +145,7 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 Ok(Transformed::new(plan, false, TreeNodeRecursion::Jump))
             }
             LogicalPlan::Union(_) | LogicalPlan::Sort(_) | LogicalPlan::Extension(_) => {
-                let plan_hold_outer = !plan.all_out_ref_exprs().is_empty();
+                let plan_hold_outer = has_out_ref_exprs(&plan);
                 if plan_hold_outer {
                     // the unsupported case
                     self.can_pull_up = false;
@@ -154,7 +155,7 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 }
             }
             LogicalPlan::Limit(_) => {
-                let plan_hold_outer = !plan.all_out_ref_exprs().is_empty();
+                let plan_hold_outer = has_out_ref_exprs(&plan);
                 match (self.exists_sub_query, plan_hold_outer) {
                     (false, true) => {
                         // the unsupported case

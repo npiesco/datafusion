@@ -1198,6 +1198,63 @@ pub(crate) fn count_plans(plan: &LogicalPlan) -> usize {
     count
 }
 
+/// The outer reference columns `plan` and its inputs hold (not their subqueries'), each
+/// once, in the order [`LogicalPlan::all_out_ref_exprs`] lists them: the list and each copy
+/// charged before they are made.
+pub(crate) fn out_ref_exprs(funding: &Funding, plan: &LogicalPlan) -> Result<Vec<Expr>> {
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn collect(
+        funding: &Funding,
+        plan: &LogicalPlan,
+        found: &mut Held<Vec<Expr>>,
+    ) -> Result<()> {
+        apply_plan_exprs(plan, &mut |expr| {
+            expr.apply(|e| {
+                if matches!(e, Expr::OuterReferenceColumn(..)) && !found.contains(e) {
+                    found.push(funding.cloned(e)?)?;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        apply_inputs(plan, &mut |input| {
+            collect(funding, input, found)?;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(())
+    }
+    let mut found = funding.held::<Vec<Expr>>();
+    collect(funding, plan, &mut found)?;
+    Ok(found.keep())
+}
+
+/// Whether `plan` or its inputs (not their subqueries) hold an outer reference column,
+/// found without listing them.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+pub(crate) fn has_out_ref_exprs(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    let _ = apply_plan_exprs(plan, &mut |expr| {
+        expr.apply(|e| {
+            if matches!(e, Expr::OuterReferenceColumn(..)) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    if !found {
+        let _ = apply_inputs(plan, &mut |input| {
+            found = has_out_ref_exprs(input);
+            Ok(if found {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        });
+    }
+    found
+}
+
 /// Whether `plan` (not its inputs) holds a subquery expression.
 pub(crate) fn has_subquery_exprs(plan: &LogicalPlan) -> bool {
     let mut found = false;
