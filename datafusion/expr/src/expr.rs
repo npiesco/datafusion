@@ -467,10 +467,19 @@ impl HigherOrderFunction {
             .args
             .iter()
             .map(|e| match e {
-                Expr::Lambda(lambda) => {
-                    Ok(ValueOrLambda::Lambda(Some(lambda.body.to_field(schema)?.1)))
-                }
-                _ => Ok(ValueOrLambda::Value(e.to_field(schema)?.1)),
+                Expr::Lambda(lambda) => Ok(ValueOrLambda::Lambda(Some(
+                    lambda
+                        .body
+                        .to_field(
+                            schema,
+                            &datafusion_common::funding::Funding::default(),
+                        )?
+                        .1,
+                ))),
+                _ => Ok(ValueOrLambda::Value(
+                    e.to_field(schema, &datafusion_common::funding::Funding::default())?
+                        .1,
+                )),
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -2939,7 +2948,8 @@ fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Resu
     if let Expr::Placeholder(Placeholder { id: _, field }) = expr
         && field.is_none()
     {
-        let other_field = other.to_field(schema);
+        let other_field =
+            other.to_field(schema, &datafusion_common::funding::Funding::default());
         match other_field {
             Err(e) => {
                 Err(e.context(format!(

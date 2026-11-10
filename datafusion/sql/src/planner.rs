@@ -28,15 +28,14 @@ use datafusion_common::config::SqlParserOptions;
 use datafusion_common::datatype::{DataTypeExt, FieldExt};
 use datafusion_common::error::add_possible_columns_to_diag;
 use datafusion_common::funding::{Funding, Held};
-use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    DFSchemaRef, Diagnostic, SchemaError, field_not_found, internal_err,
-    plan_datafusion_err,
+    Column, DFSchemaRef, Diagnostic, SchemaError, field_not_found, plan_datafusion_err,
 };
+use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
 use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
-use datafusion_expr::utils::find_column_exprs;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
@@ -724,67 +723,79 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Validate the schema provides all of the columns referenced in the expressions.
-    pub(crate) fn validate_schema_satisfies_exprs(
+    /// Checks every column `exprs` reference resolves in `schema`, walking them without
+    /// allocating.
+    pub(crate) fn validate_schema_satisfies_exprs<'a>(
         &self,
         schema: &DFSchema,
-        exprs: &[Expr],
+        exprs: impl IntoIterator<Item = &'a Expr>,
     ) -> Result<()> {
-        find_column_exprs(exprs)
-            .iter()
-            .try_for_each(|col| match col {
-                Expr::Column(col) => match &col.relation {
-                    Some(r) => schema.field_with_qualified_name(r, &col.name).map(|_| ()),
-                    None => {
-                        if !schema.fields_with_unqualified_name(&col.name).is_empty() {
-                            Ok(())
-                        } else {
-                            Err(field_not_found(
-                                col.relation.clone(),
-                                col.name.as_str(),
-                                schema,
-                            ))
-                        }
+        for expr in exprs {
+            let mut resolved = Ok(());
+            expr.apply(|expr| {
+                if let Expr::Column(col) = expr {
+                    resolved = self.validate_schema_satisfies_column(schema, col);
+                    if resolved.is_err() {
+                        return Ok(TreeNodeRecursion::Stop);
                     }
                 }
-                .map_err(|err: DataFusionError| match &err {
-                    DataFusionError::SchemaError(inner, _)
-                        if matches!(
-                            inner.as_ref(),
-                            SchemaError::FieldNotFound { .. }
-                        ) =>
-                    {
-                        let SchemaError::FieldNotFound {
-                            field,
-                            valid_fields,
-                        } = inner.as_ref()
-                        else {
-                            unreachable!()
-                        };
-                        let mut diagnostic = if let Some(relation) = &col.relation {
-                            Diagnostic::new_error(
-                                format!(
-                                    "column '{}' not found in '{}'",
-                                    col.name, relation
-                                ),
-                                col.spans().first(),
-                            )
-                        } else {
-                            Diagnostic::new_error(
-                                format!("column '{}' not found", col.name),
-                                col.spans().first(),
-                            )
-                        };
-                        add_possible_columns_to_diag(
-                            &mut diagnostic,
-                            field,
-                            valid_fields,
-                        );
-                        err.with_diagnostic(diagnostic)
-                    }
-                    _ => err,
-                }),
-                _ => internal_err!("Not a column"),
-            })
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            resolved?;
+        }
+        Ok(())
+    }
+
+    fn validate_schema_satisfies_column(
+        &self,
+        schema: &DFSchema,
+        col: &Column,
+    ) -> Result<()> {
+        match &col.relation {
+            Some(r) => schema.field_with_qualified_name(r, &col.name).map(|_| ()),
+            None => {
+                if schema
+                    .fields()
+                    .iter()
+                    .any(|field| field.name() == &col.name)
+                {
+                    Ok(())
+                } else {
+                    Err(field_not_found(
+                        col.relation.clone(),
+                        col.name.as_str(),
+                        schema,
+                    ))
+                }
+            }
+        }
+        .map_err(|err: DataFusionError| match &err {
+            DataFusionError::SchemaError(inner, _)
+                if matches!(inner.as_ref(), SchemaError::FieldNotFound { .. }) =>
+            {
+                let SchemaError::FieldNotFound {
+                    field,
+                    valid_fields,
+                } = inner.as_ref()
+                else {
+                    unreachable!()
+                };
+                let mut diagnostic = if let Some(relation) = &col.relation {
+                    Diagnostic::new_error(
+                        format!("column '{}' not found in '{}'", col.name, relation),
+                        col.spans().first(),
+                    )
+                } else {
+                    Diagnostic::new_error(
+                        format!("column '{}' not found", col.name),
+                        col.spans().first(),
+                    )
+                };
+                add_possible_columns_to_diag(&mut diagnostic, field, valid_fields);
+                err.with_diagnostic(diagnostic)
+            }
+            _ => err,
+        })
     }
 
     pub(crate) fn convert_data_type_to_field(

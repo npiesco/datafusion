@@ -155,7 +155,12 @@ pub async fn from_substrait_extended_expr(
         let expr = consumer
             .consume_expression(scalar_expr, &input_schema)
             .await?;
-        let output_field = expr.to_field(&input_schema)?.1;
+        let output_field = expr
+            .to_field(
+                &input_schema,
+                &datafusion::common::funding::Funding::default(),
+            )?
+            .1;
         let mut names_idx = 0;
         let output_field = rename_field(
             &output_field,

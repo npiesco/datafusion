@@ -1395,6 +1395,48 @@ pub fn qualified_name(qualifier: Option<&TableReference>, name: &str) -> String 
     s
 }
 
+/// The bytes of the name [`qualified_name`] makes, yielded without allocating.
+fn qualified_name_bytes<'a>(
+    qualifier: Option<&'a TableReference>,
+    name: &'a str,
+) -> impl Iterator<Item = u8> + 'a {
+    let parts: [Option<&'a str>; 4] = match qualifier {
+        None => [None, None, None, Some(name)],
+        Some(TableReference::Bare { table }) => [Some(table), None, None, Some(name)],
+        Some(TableReference::Partial { schema, table }) => {
+            [Some(schema), Some(table), None, Some(name)]
+        }
+        Some(TableReference::Full {
+            catalog,
+            schema,
+            table,
+        }) => [Some(catalog), Some(schema), Some(table), Some(name)],
+    };
+    parts
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(i, part)| (i > 0).then_some(b'.').into_iter().chain(part.bytes()))
+}
+
+/// Whether [`qualified_name`] of `qualifier` and `name` is `text`, compared without
+/// allocating.
+pub fn qualified_name_is(
+    qualifier: Option<&TableReference>,
+    name: &str,
+    text: &str,
+) -> bool {
+    qualified_name_bytes(qualifier, name).eq(text.bytes())
+}
+
+/// Whether two qualified names are the same [`qualified_name`], compared without allocating.
+pub fn qualified_names_equal(
+    left: (Option<&TableReference>, &str),
+    right: (Option<&TableReference>, &str),
+) -> bool {
+    qualified_name_bytes(left.0, left.1).eq(qualified_name_bytes(right.0, right.1))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::assert_contains;

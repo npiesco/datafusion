@@ -29,6 +29,7 @@ use crate::{
 use datafusion_expr_common::signature::{Signature, TypeSignature};
 
 use arrow::datatypes::{DataType, Field, Schema};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
@@ -473,7 +474,11 @@ pub fn expand_qualified_wildcard(
     let qualified_indices = schema.fields_indices_with_qualified(qualifier);
     let projected_func_dependencies = schema
         .functional_dependencies()
-        .project_functional_dependencies(&qualified_indices, qualified_indices.len());
+        .project_functional_dependencies(
+            &qualified_indices,
+            qualified_indices.len(),
+            &Funding::default(),
+        )?;
     let fields_with_qualified = get_at_indices(schema.fields(), &qualified_indices)?;
     if fields_with_qualified.is_empty() {
         return plan_err!("Invalid qualifier {qualifier}");
@@ -855,13 +860,17 @@ where
 pub fn exprlist_to_fields<'a>(
     exprs: impl IntoIterator<Item = &'a Expr>,
     plan: &LogicalPlan,
+    funding: &Funding,
 ) -> Result<Vec<(Option<TableReference>, Arc<Field>)>> {
     // Look for exact match in plan's output schema
     let input_schema = plan.schema();
-    exprs
-        .into_iter()
-        .map(|e| e.to_field(input_schema))
-        .collect()
+    let exprs = exprs.into_iter();
+    let mut fields = funding.vec_with_capacity(exprs.size_hint().0)?;
+    for expr in exprs {
+        let field = expr.to_field(input_schema, funding)?;
+        funding.push(&mut fields, field)?;
+    }
+    Ok(fields)
 }
 
 /// Convert an expression into Column expression if it's already provided as input plan.
@@ -1402,10 +1411,7 @@ pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
 /// Refer to that documentation for details on precedence and metadata handling.
 ///
 /// What the merged schema allocates is charged to `funding`.
-pub fn merge_schema(
-    inputs: &[&LogicalPlan],
-    funding: &datafusion_common::funding::Funding,
-) -> Result<DFSchema> {
+pub fn merge_schema(inputs: &[&LogicalPlan], funding: &Funding) -> Result<DFSchema> {
     match inputs {
         [input] => funding.cloned(input.schema().as_ref()),
         _ => inputs.iter().try_fold(DFSchema::empty(), |lhs, rhs| {

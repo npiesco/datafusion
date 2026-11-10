@@ -1245,7 +1245,10 @@ fn resolve_higher_order_function(
         .iter()
         .map(|e| match e {
             Expr::Lambda(_lambda_function) => Ok(ValueOrLambda::Lambda(None)),
-            _ => Ok(ValueOrLambda::Value(e.to_field(schema)?.1)),
+            _ => Ok(ValueOrLambda::Value(
+                e.to_field(schema, &datafusion_common::funding::Funding::default())?
+                    .1,
+            )),
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1295,7 +1298,16 @@ fn resolve_higher_order_function(
 
                                 remove_scope(vars, &lambda.params)?;
 
-                                *field = Some(body_with_vars.data.to_field(schema)?.1);
+                                *field = Some(
+                                    body_with_vars
+                                        .data
+                                        .to_field(
+                                            schema,
+                                            &datafusion_common::funding::Funding::default(
+                                            ),
+                                        )?
+                                        .1,
+                                );
                                 *lambda.body = body_with_vars.data;
                             }
                         }

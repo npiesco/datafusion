@@ -36,7 +36,9 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
 use datafusion_common::{NullHandling, RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::ExprSchemable;
-use datafusion_expr::builder::get_struct_unnested_columns;
+use datafusion_expr::builder::{
+    get_struct_unnested_columns, project, project_with_schema,
+};
 use datafusion_expr::expr::Unnest as UnnestExpr;
 use datafusion_expr::expr::{PlannedReplaceSelectItem, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
@@ -763,7 +765,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(None);
         };
 
-        let field = unnest_expr.expr.to_field(input.schema())?.1;
+        let field = unnest_expr.expr.to_field(input.schema(), self.funding())?.1;
         let DataType::Struct(inner_fields) = field.data_type() else {
             return Ok(None);
         };
@@ -1179,26 +1181,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         expr: Vec<SelectExpr>,
         set_expr_left_schema: Option<DFSchemaRef>,
     ) -> Result<LogicalPlan> {
-        // convert to Expr for validate_schema_satisfies_exprs
-        let plain_exprs = expr
-            .iter()
-            .filter_map(|e| match e {
-                SelectExpr::Expression(expr) => Some(expr.to_owned()),
+        self.validate_schema_satisfies_exprs(
+            input.schema(),
+            expr.iter().filter_map(|e| match e {
+                SelectExpr::Expression(expr) => Some(expr),
                 _ => None,
-            })
-            .collect::<Vec<_>>();
-        self.validate_schema_satisfies_exprs(input.schema(), &plain_exprs)?;
+            }),
+        )?;
 
         // When inside a set expression, pass the left-most schema so
         // that expressions get aliased to match, avoiding duplicate
         // name errors from expressions like `count(*), count(*)`.
-        let builder = LogicalPlanBuilder::from(input);
         if let Some(left_schema) = set_expr_left_schema {
-            builder
-                .project_with_validation_and_schema(expr, &left_schema)?
-                .build()
+            project_with_schema(input, expr, &left_schema, self.funding())
         } else {
-            builder.project(expr)?.build()
+            project(input, expr, self.funding())
         }
     }
 

@@ -193,7 +193,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             cte,
                             self.context_provider.get_table_source(table_ref.clone()),
                         ) {
-                            (Some(cte_plan), _) => Ok(cte_plan.as_ref().clone()),
+                            (Some(cte_plan), _) => self.funding().cloned(cte_plan.as_ref()),
                             (_, Ok(provider)) => LogicalPlanBuilder::scan(
                                 table_ref.clone(),
                                 provider,

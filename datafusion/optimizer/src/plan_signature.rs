@@ -106,7 +106,7 @@ mod tests {
         assert_eq!(1, get_node_number(&one_node_plan).get());
 
         let two_node_plan = Arc::new(LogicalPlan::Projection(
-            datafusion_expr::Projection::try_new(vec![lit(1), lit(2)], one_node_plan)?,
+            datafusion_expr::Projection::try_new(vec![lit(1), lit(2)], one_node_plan, &datafusion_common::funding::Funding::default())?,
         ));
 
         assert_eq!(2, get_node_number(&two_node_plan).get());

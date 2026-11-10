@@ -56,6 +56,7 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion_common::cse::{NormalizeEq, Normalizeable};
 use datafusion_common::format::{ExplainAnalyzeCategories, ExplainFormat, MetricType};
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::check_metadata_with_storage_equal;
 use datafusion_common::tree_node::{
     Transformed, TreeNode, TreeNodeContainer, TreeNodeRecursion,
@@ -67,6 +68,7 @@ use datafusion_common::{
     aggregate_functional_dependencies, assert_eq_or_internal_err, assert_or_internal_err,
     internal_err, plan_err, validate_range_split_points,
 };
+use datafusion_common::{qualified_name_is, qualified_names_equal};
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 
@@ -633,7 +635,8 @@ impl LogicalPlan {
                 expr,
                 input,
                 schema: _,
-            }) => Projection::try_new(expr, input).map(LogicalPlan::Projection),
+            }) => Projection::try_new(expr, input, &Funding::default())
+                .map(LogicalPlan::Projection),
             LogicalPlan::Dml(_) => Ok(self),
             LogicalPlan::Copy(_) => Ok(self),
             LogicalPlan::Values(Values { schema, values }) => {
@@ -803,7 +806,8 @@ impl LogicalPlan {
             // may change. We need to use try_new method instead of try_new_with_schema method.
             LogicalPlan::Projection(Projection { .. }) => {
                 let input = self.only_input(inputs)?;
-                Projection::try_new(expr, Arc::new(input)).map(LogicalPlan::Projection)
+                Projection::try_new(expr, Arc::new(input), &Funding::default())
+                    .map(LogicalPlan::Projection)
             }
             LogicalPlan::Dml(DmlStatement {
                 table_name,
@@ -2258,10 +2262,7 @@ impl LogicalPlan {
     /// [`LambdaVariable`]: crate::expr::LambdaVariable
     pub fn resolve_lambda_variables(self) -> Result<Transformed<LogicalPlan>> {
         self.transform_with_subqueries(|plan| {
-            let schema = merge_schema(
-                &plan.inputs(),
-                &datafusion_common::funding::Funding::default(),
-            )?;
+            let schema = merge_schema(&plan.inputs(), &Funding::default())?;
 
             plan.map_expressions(|expr| expr.resolve_lambda_variables(&schema))
         })
@@ -2420,7 +2421,7 @@ fn recursive_query_output_schema(
     DFSchema::new_with_metadata(
         &fields,
         static_schema.metadata().clone(),
-        &datafusion_common::funding::Funding::default(),
+        &Funding::default(),
     )
     .map(DFSchemaRef::new)
 }
@@ -2474,8 +2475,12 @@ impl PartialOrd for Projection {
 
 impl Projection {
     /// Create a new Projection
-    pub fn try_new(expr: Vec<Expr>, input: Arc<LogicalPlan>) -> Result<Self> {
-        let projection_schema = projection_schema(&input, &expr)?;
+    pub fn try_new(
+        expr: Vec<Expr>,
+        input: Arc<LogicalPlan>,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let projection_schema = projection_schema(&input, &expr, funding)?;
         Self::try_new_with_schema(expr, input, projection_schema)
     }
 
@@ -2532,19 +2537,24 @@ impl Projection {
 /// A `Result` containing an `Arc<DFSchema>` representing the schema of the result
 /// produced by the projection operation. If the schema computation is successful,
 /// the `Result` will contain the schema; otherwise, it will contain an error.
-pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSchema>> {
-    // Preserve input schema metadata at the schema level
+pub fn projection_schema(
+    input: &LogicalPlan,
+    exprs: &[Expr],
+    funding: &Funding,
+) -> Result<Arc<DFSchema>> {
+    // Preserve input schema metadata at the schema level. A non-empty metadata map is
+    // copied uncharged: its table's size is not measured.
     let metadata = input.schema().metadata().clone();
 
     // Convert expressions to fields with Field properties determined by `Expr::to_field`
-    let schema = DFSchema::new_with_metadata(
-        &exprlist_to_fields(exprs, input)?,
-        metadata,
-        &datafusion_common::funding::Funding::default(),
-    )?
-    .with_functional_dependencies(calc_func_dependencies_for_project(exprs, input)?)?;
+    let fields = exprlist_to_fields(exprs, input, funding)?;
+    let schema = DFSchema::new_with_metadata(&fields, metadata, funding)?;
+    funding.released(fields);
+    let schema = schema.with_functional_dependencies(
+        calc_func_dependencies_for_project(exprs, input, funding)?,
+    )?;
 
-    Ok(Arc::new(schema))
+    funding.arc(schema)
 }
 
 /// Aliased subquery
@@ -2591,7 +2601,8 @@ impl SubqueryAlias {
                     }
                 })
                 .collect();
-            let projection = Projection::try_new(projection_expressions, plan)?;
+            let projection =
+                Projection::try_new(projection_expressions, plan, &Funding::default())?;
             Arc::new(LogicalPlan::Projection(projection))
         } else {
             plan
@@ -2808,7 +2819,8 @@ impl Window {
             .collect();
         let input_len = fields.len();
         let mut window_fields = fields;
-        let expr_fields = exprlist_to_fields(window_expr.as_slice(), &input)?;
+        let expr_fields =
+            exprlist_to_fields(window_expr.as_slice(), &input, &Funding::default())?;
         window_fields.extend_from_slice(expr_fields.as_slice());
         let metadata = input.schema().metadata().clone();
 
@@ -2878,7 +2890,7 @@ impl Window {
                 DFSchema::new_with_metadata(
                     &window_fields,
                     metadata,
-                    &datafusion_common::funding::Funding::default(),
+                    &Funding::default(),
                 )?
                 .with_functional_dependencies(window_func_dependencies)?,
             ),
@@ -3129,8 +3141,8 @@ impl TableScanBuilder {
         let projected_schema = projection
             .as_ref()
             .map(|p| {
-                let projected_func_dependencies =
-                    func_dependencies.project_functional_dependencies(p, p.len());
+                let projected_func_dependencies = func_dependencies
+                    .project_functional_dependencies(p, p.len(), &Funding::default())?;
 
                 let df_schema = DFSchema::new_with_metadata(
                     &p.iter()
@@ -3139,7 +3151,7 @@ impl TableScanBuilder {
                         })
                         .collect(),
                     schema.metadata.clone(),
-                    &datafusion_common::funding::Funding::default(),
+                    &Funding::default(),
                 )?;
                 df_schema.with_functional_dependencies(projected_func_dependencies)
             })
@@ -3346,7 +3358,7 @@ impl Union {
         let schema = DFSchema::new_with_metadata(
             &union_fields,
             union_schema_metadata,
-            &datafusion_common::funding::Funding::default(),
+            &Funding::default(),
         )?;
         let schema = Arc::new(schema);
 
@@ -3428,7 +3440,7 @@ impl Union {
         let schema = DFSchema::new_with_metadata(
             &union_fields,
             union_schema_metadata,
-            &datafusion_common::funding::Funding::default(),
+            &Funding::default(),
         )?;
         let schema = Arc::new(schema);
 
@@ -3807,14 +3819,15 @@ impl DistinctOn {
         }
 
         let on_expr = normalize_cols(on_expr, input.as_ref())?;
-        let qualified_fields = exprlist_to_fields(select_expr.as_slice(), &input)?
-            .into_iter()
-            .collect();
+        let qualified_fields =
+            exprlist_to_fields(select_expr.as_slice(), &input, &Funding::default())?
+                .into_iter()
+                .collect();
 
         let dfschema = DFSchema::new_with_metadata(
             &qualified_fields,
             input.schema().metadata().clone(),
-            &datafusion_common::funding::Funding::default(),
+            &Funding::default(),
         )?;
 
         let mut distinct_on = DistinctOn {
@@ -3938,7 +3951,8 @@ impl Aggregate {
 
         let grouping_expr: Vec<&Expr> = grouping_set_to_exprlist(group_expr.as_slice())?;
 
-        let mut qualified_fields = exprlist_to_fields(grouping_expr, &input)?;
+        let mut qualified_fields =
+            exprlist_to_fields(grouping_expr, &input, &Funding::default())?;
 
         // Even columns that cannot be null will become nullable when used in a grouping set.
         if is_grouping_set {
@@ -3958,12 +3972,16 @@ impl Aggregate {
             ));
         }
 
-        qualified_fields.extend(exprlist_to_fields(aggr_expr.as_slice(), &input)?);
+        qualified_fields.extend(exprlist_to_fields(
+            aggr_expr.as_slice(),
+            &input,
+            &Funding::default(),
+        )?);
 
         let schema = DFSchema::new_with_metadata(
             &qualified_fields,
             input.schema().metadata().clone(),
-            &datafusion_common::funding::Funding::default(),
+            &Funding::default(),
         )?;
 
         Self::try_new_with_schema(input, group_expr, aggr_expr, Arc::new(schema))
@@ -4176,66 +4194,63 @@ fn calc_func_dependencies_for_aggregate(
 fn calc_func_dependencies_for_project(
     exprs: &[Expr],
     input: &LogicalPlan,
+    funding: &Funding,
 ) -> Result<FunctionalDependencies> {
     // Sentinel for projection outputs that do not map back to any input field.
     const COMPUTED_EXPR_INDEX: usize = usize::MAX;
 
-    let input_fields = input.schema().field_names();
+    let input_schema = input.schema();
+    // The input column an expression displayed as `text` is, its display made through
+    // `funding` and freed once it is looked up.
+    let input_index = |text: String| {
+        let index = input_schema
+            .iter()
+            .position(|(qualifier, field)| {
+                qualified_name_is(qualifier, field.name(), &text)
+            })
+            .unwrap_or(COMPUTED_EXPR_INDEX);
+        funding.released(text);
+        index
+    };
     // Map each projection output position to its input column index.
     // A projection expression can produce multiple output columns, such as `*`.
-    let proj_indices = exprs
-        .iter()
-        .map(|expr| match expr {
+    let mut proj_indices = funding.vec_with_capacity(exprs.len())?;
+    for expr in exprs {
+        match expr {
             #[expect(deprecated)]
-            Expr::Wildcard { qualifier, options } => {
-                let wildcard_fields = exprlist_to_fields(
-                    vec![&Expr::Wildcard {
-                        qualifier: qualifier.clone(),
-                        options: options.clone(),
-                    }],
-                    input,
-                )?;
-                Ok::<_, DataFusionError>(
-                    wildcard_fields
-                        .into_iter()
-                        .map(|(qualifier, f)| {
-                            let flat_name = qualifier
-                                .map(|t| format!("{}.{}", t, f.name()))
-                                .unwrap_or_else(|| f.name().clone());
-                            input_fields
-                                .iter()
-                                .position(|item| *item == flat_name)
-                                .unwrap_or(COMPUTED_EXPR_INDEX)
+            Expr::Wildcard { .. } => {
+                let wildcard_fields =
+                    exprlist_to_fields(std::slice::from_ref(expr), input, funding)?;
+                for (qualifier, f) in &wildcard_fields {
+                    let index = input_schema
+                        .iter()
+                        .position(|(input_qualifier, input_field)| {
+                            qualified_names_equal(
+                                (qualifier.as_ref(), f.name()),
+                                (input_qualifier, input_field.name()),
+                            )
                         })
-                        .collect::<Vec<_>>(),
-                )
+                        .unwrap_or(COMPUTED_EXPR_INDEX);
+                    funding.push(&mut proj_indices, index)?;
+                }
+                funding.released(wildcard_fields);
             }
             Expr::Alias(alias) => {
-                let name = format!("{}", alias.expr);
-                let input_index = input_fields
-                    .iter()
-                    .position(|item| *item == name)
-                    .unwrap_or(COMPUTED_EXPR_INDEX);
-                Ok(vec![input_index])
+                let index = input_index(funding.format(format_args!("{}", alias.expr))?);
+                funding.push(&mut proj_indices, index)?;
             }
             _ => {
-                let name = format!("{expr}");
-                let input_index = input_fields
-                    .iter()
-                    .position(|item| *item == name)
-                    .unwrap_or(COMPUTED_EXPR_INDEX);
-                Ok(vec![input_index])
+                let index = input_index(funding.format(format_args!("{expr}"))?);
+                funding.push(&mut proj_indices, index)?;
             }
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        }
+    }
 
-    Ok(input
-        .schema()
+    let func_dependencies = input_schema
         .functional_dependencies()
-        .project_functional_dependencies(&proj_indices, exprs.len()))
+        .project_functional_dependencies(&proj_indices, exprs.len(), funding)?;
+    funding.released(proj_indices);
+    Ok(func_dependencies)
 }
 
 /// Sorts its input according to a list of sort expressions.
@@ -4831,11 +4846,8 @@ impl Unnest {
             .collect::<Vec<_>>();
 
         let metadata = input_schema.metadata().clone();
-        let df_schema = DFSchema::new_with_metadata(
-            &fields,
-            metadata,
-            &datafusion_common::funding::Funding::default(),
-        )?;
+        let df_schema =
+            DFSchema::new_with_metadata(&fields, metadata, &Funding::default())?;
         // We can use the existing functional dependencies:
         let deps = input_schema.functional_dependencies().clone();
         let schema = Arc::new(df_schema.with_functional_dependencies(deps)?);
@@ -5058,6 +5070,7 @@ mod tests {
                 col("employee_csv.id"),
             ],
             Arc::new(input),
+            &Funding::default(),
         )?;
 
         let deps = projection.schema.functional_dependencies();

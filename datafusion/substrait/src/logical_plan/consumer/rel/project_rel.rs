@@ -76,7 +76,11 @@ pub async fn from_project_rel(
             final_exprs.push(name_tracker.get_uniquely_named_expr(e)?);
         }
         final_exprs.append(&mut explicit_exprs);
-        project(input, final_exprs)
+        project(
+            input,
+            final_exprs,
+            &datafusion::common::funding::Funding::default(),
+        )
     } else {
         not_impl_err!("Projection without an input is not supported")
     }

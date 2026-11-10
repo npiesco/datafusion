@@ -167,7 +167,10 @@ impl ScalarUDFImpl for ArrowCastFunc {
         // 2. The source has no extension metadata that needs to be stripped
         let new_expr = if source_type == target_type {
             // Check if source has extension metadata
-            let source_field = source_arg.to_field(info.schema())?;
+            let source_field = source_arg.to_field(
+                info.schema(),
+                &datafusion_common::funding::Funding::default(),
+            )?;
             let has_extension_metadata = source_field
                 .1
                 .metadata()
