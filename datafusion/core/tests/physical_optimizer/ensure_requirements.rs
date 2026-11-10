@@ -21,6 +21,7 @@
 //! so the tests live alongside the rest of the `physical_optimizer/` integration
 //! suite and can use real `ExecutionPlan`s where convenient.
 
+use datafusion_common::funding::Funding;
 use insta::assert_snapshot;
 
 use datafusion_common::config::ConfigOptions;
@@ -566,12 +567,16 @@ fn test_output_requirement_single_partition_over_multi_partition_source() {
     let sort_expr = sort_expr_on("a", 0, true, true);
 
     // OutputRequirementExec with SinglePartition + ordering requirement
-    let output_req: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
-        source,
-        Some(OrderingRequirements::from(sort_expr)),
-        Distribution::SinglePartition,
-        Some(21),
-    ));
+    let output_req: Arc<dyn ExecutionPlan> = Arc::new(
+        OutputRequirementExec::new(
+            source,
+            Some(OrderingRequirements::from(sort_expr)),
+            Distribution::SinglePartition,
+            Some(21),
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
 
     // SinglePartition must be satisfied (via SPM or Coalesce+Sort) — snapshot
     // documents which one the optimizer chooses.
@@ -607,12 +612,16 @@ fn test_sort_pushdown_through_projection_adds_spm() {
     let sort_expr = sort_expr_on("a", 0, true, true);
 
     // OutputRequirementExec(SinglePartition) → ProjectionExec → multi-partition source
-    let output_req: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
-        projection,
-        Some(OrderingRequirements::from(sort_expr)),
-        Distribution::SinglePartition,
-        Some(21),
-    ));
+    let output_req: Arc<dyn ExecutionPlan> = Arc::new(
+        OutputRequirementExec::new(
+            projection,
+            Some(OrderingRequirements::from(sort_expr)),
+            Distribution::SinglePartition,
+            Some(21),
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
 
     // SinglePartition must be satisfied. The final ensure_distribution pass
     // adds CoalescePartitionsExec or SortPreservingMergeExec as needed — the
@@ -639,12 +648,16 @@ fn test_idempotent_output_requirement_single_partition() {
     let source = Arc::new(MockMultiPartitionExec::new(10));
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let output_req: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
-        source,
-        Some(OrderingRequirements::from(sort_expr)),
-        Distribution::SinglePartition,
-        Some(21),
-    ));
+    let output_req: Arc<dyn ExecutionPlan> = Arc::new(
+        OutputRequirementExec::new(
+            source,
+            Some(OrderingRequirements::from(sort_expr)),
+            Distribution::SinglePartition,
+            Some(21),
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
 
     assert_idempotent(output_req);
 }
@@ -663,12 +676,16 @@ fn test_idempotent_projection_over_multi_partition_with_single_partition_require
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
-    let output_req: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
-        projection,
-        Some(OrderingRequirements::from(sort_expr)),
-        Distribution::SinglePartition,
-        Some(21),
-    ));
+    let output_req: Arc<dyn ExecutionPlan> = Arc::new(
+        OutputRequirementExec::new(
+            projection,
+            Some(OrderingRequirements::from(sort_expr)),
+            Distribution::SinglePartition,
+            Some(21),
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
 
     assert_idempotent(output_req);
 }

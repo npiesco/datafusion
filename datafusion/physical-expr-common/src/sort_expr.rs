@@ -29,6 +29,7 @@ use crate::physical_expr::{PhysicalExpr, fmt_sql};
 use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use datafusion_common::cloned::{CloneBytes, slice_clone_bytes};
 use datafusion_common::{HashSet, Result};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use indexmap::IndexSet;
@@ -881,6 +882,28 @@ impl OrderingRequirements {
         match self {
             Self::Hard(alts) => (alts, false),
             Self::Soft(alts) => (alts, true),
+        }
+    }
+}
+
+impl CloneBytes for PhysicalSortRequirement {
+    fn clone_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl CloneBytes for LexRequirement {
+    fn clone_bytes(&self) -> usize {
+        slice_clone_bytes(&self.reqs)
+    }
+}
+
+impl CloneBytes for OrderingRequirements {
+    fn clone_bytes(&self) -> usize {
+        match self {
+            Self::Hard(alternatives) | Self::Soft(alternatives) => {
+                slice_clone_bytes(alternatives)
+            }
         }
     }
 }

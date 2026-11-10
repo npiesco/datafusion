@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::compute::SortOptions;
@@ -705,31 +706,35 @@ fn test_projection_after_projection() -> Result<()> {
 #[test]
 fn test_output_req_after_projection() -> Result<()> {
     let csv = create_simple_csv_exec();
-    let sort_req: Arc<dyn ExecutionPlan> = Arc::new(OutputRequirementExec::new(
-        csv,
-        Some(OrderingRequirements::new(
-            [
-                PhysicalSortRequirement::new(
-                    Arc::new(Column::new("b", 1)),
-                    Some(SortOptions::default()),
-                ),
-                PhysicalSortRequirement::new(
-                    Arc::new(BinaryExpr::new(
-                        Arc::new(Column::new("c", 2)),
-                        Operator::Plus,
-                        Arc::new(Column::new("a", 0)),
-                    )),
-                    Some(SortOptions::default()),
-                ),
-            ]
-            .into(),
-        )),
-        Distribution::KeyPartitioned(vec![
-            Arc::new(Column::new("a", 0)),
-            Arc::new(Column::new("b", 1)),
-        ]),
-        None,
-    ));
+    let sort_req: Arc<dyn ExecutionPlan> = Arc::new(
+        OutputRequirementExec::new(
+            csv,
+            Some(OrderingRequirements::new(
+                [
+                    PhysicalSortRequirement::new(
+                        Arc::new(Column::new("b", 1)),
+                        Some(SortOptions::default()),
+                    ),
+                    PhysicalSortRequirement::new(
+                        Arc::new(BinaryExpr::new(
+                            Arc::new(Column::new("c", 2)),
+                            Operator::Plus,
+                            Arc::new(Column::new("a", 0)),
+                        )),
+                        Some(SortOptions::default()),
+                    ),
+                ]
+                .into(),
+            )),
+            Distribution::KeyPartitioned(vec![
+                Arc::new(Column::new("a", 0)),
+                Arc::new(Column::new("b", 1)),
+            ]),
+            None,
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
             ProjectionExpr::new(Arc::new(Column::new("c", 2)), "c"),

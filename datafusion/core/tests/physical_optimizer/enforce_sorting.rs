@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::memory_limit::DummyStreamPartition;
@@ -540,12 +541,16 @@ fn union_with_mix_of_presorted_and_explicitly_resorted_inputs_impl(
         Some(SortOptions::new(false, true)),
     )]
     .into();
-    let physical_plan = Arc::new(OutputRequirementExec::new(
-        coalesced,
-        Some(OrderingRequirements::new(requirement)),
-        Distribution::SinglePartition,
-        None,
-    ));
+    let physical_plan = Arc::new(
+        OutputRequirementExec::new(
+            coalesced,
+            Some(OrderingRequirements::new(requirement)),
+            Distribution::SinglePartition,
+            None,
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
 
     let test =
         EnforceSortingTest::new(physical_plan).with_repartition_sorts(repartition_sorts);
@@ -1199,12 +1204,16 @@ async fn test_soft_hard_requirements_with_multiple_soft_requirements_and_output_
         Some(SortOptions::new(false, true)),
     )]
     .into();
-    let physical_plan = Arc::new(OutputRequirementExec::new(
-        bounded_window2,
-        Some(OrderingRequirements::new(requirement)),
-        Distribution::SinglePartition,
-        None,
-    ));
+    let physical_plan = Arc::new(
+        OutputRequirementExec::new(
+            bounded_window2,
+            Some(OrderingRequirements::new(requirement)),
+            Distribution::SinglePartition,
+            None,
+            &Funding::default(),
+        )
+        .unwrap(),
+    );
     let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true);
     assert_snapshot!(test.run(), @r#"
     Input Plan:

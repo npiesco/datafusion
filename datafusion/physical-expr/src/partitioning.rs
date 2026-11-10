@@ -22,6 +22,7 @@ use crate::{
     expressions::UnKnownColumn, physical_exprs_contains, physical_exprs_equal,
 };
 pub use datafusion_common::SplitPoint;
+use datafusion_common::cloned::{CloneBytes, slice_clone_bytes};
 use datafusion_common::{Result, validate_range_split_points};
 use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -702,6 +703,21 @@ pub enum Distribution {
     /// Requires children to be distributed in such a way that the same
     /// values of the keys end up in the same partition
     KeyPartitioned(Vec<Arc<dyn PhysicalExpr>>),
+}
+
+#[expect(
+    deprecated,
+    reason = "HashPartitioned is accepted during the KeyPartitioned migration"
+)]
+impl CloneBytes for Distribution {
+    fn clone_bytes(&self) -> usize {
+        match self {
+            Self::UnspecifiedDistribution | Self::SinglePartition => 0,
+            Self::HashPartitioned(exprs) | Self::KeyPartitioned(exprs) => {
+                slice_clone_bytes(exprs)
+            }
+        }
+    }
 }
 
 #[expect(

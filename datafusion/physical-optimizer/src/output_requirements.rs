@@ -27,6 +27,7 @@ use std::sync::Arc;
 use crate::PhysicalOptimizerRule;
 
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
@@ -108,23 +109,28 @@ pub struct OutputRequirementExec {
     dist_requirement: Distribution,
     cache: Arc<PlanProperties>,
     fetch: Option<usize>,
+    /// What it is rebuilt within.
+    funding: Funding,
 }
 
 impl OutputRequirementExec {
+    /// Made within `funding`, which its rebuilds are made within too.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         requirements: Option<OrderingRequirements>,
         dist_requirement: Distribution,
         fetch: Option<usize>,
-    ) -> Self {
-        let cache = Self::compute_properties(&input, &fetch);
-        Self {
+        funding: &Funding,
+    ) -> Result<Self> {
+        let cache = funding.arc(Self::compute_properties(&input, &fetch))?;
+        Ok(Self {
             input,
             order_requirement: requirements,
             dist_requirement,
-            cache: Arc::new(cache),
+            cache,
             fetch,
-        }
+            funding: funding.clone(),
+        })
     }
 
     pub fn input(&self) -> Arc<dyn ExecutionPlan> {
@@ -241,12 +247,15 @@ impl ExecutionPlan for OutputRequirementExec {
         mut children: Vec<Arc<dyn ExecutionPlan>>,
         _: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
+        let funding = &self.funding;
+        let rebuilt = Self::new(
             children.remove(0), // has a single child
-            self.order_requirement.clone(),
-            self.dist_requirement.clone(),
+            funding.cloned(&self.order_requirement)?,
+            funding.cloned(&self.dist_requirement)?,
             self.fetch,
-        )))
+            funding,
+        )?;
+        Ok(funding.arc(rebuilt)? as _)
     }
 
     fn with_new_children(
@@ -331,10 +340,15 @@ impl ExecutionPlan for OutputRequirementExec {
             }
         };
 
-        make_with_child(projection, &self.input()).map(|input| {
-            let e = OutputRequirementExec::new(input, requirements, dist_req, self.fetch);
-            Some(Arc::new(e) as _)
-        })
+        let input = make_with_child(projection, &self.input())?;
+        let e = OutputRequirementExec::new(
+            input,
+            requirements,
+            dist_req,
+            self.fetch,
+            &self.funding,
+        )?;
+        Ok(Some(self.funding.arc(e)? as _))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -355,10 +369,10 @@ impl PhysicalOptimizerRule for OutputRequirements {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match self.mode {
-            RuleMode::Add => require_top_ordering(plan),
+            RuleMode::Add => require_top_ordering(plan, &config.funding),
             RuleMode::Remove => plan
                 .transform_up(|plan| {
                     if let Some(sort_req) = plan.downcast_ref::<OutputRequirementExec>() {
@@ -387,22 +401,26 @@ impl PhysicalOptimizerRule for OutputRequirements {
 /// AQE does after every completed stage, see datafusion-ballista#1359) does not
 /// stack wrappers, whether the previously-added `OutputRequirementExec` sits at
 /// the root (handled here) or below it (handled in `require_top_ordering_helper`).
-fn require_top_ordering(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>> {
+fn require_top_ordering(
+    plan: Arc<dyn ExecutionPlan>,
+    funding: &Funding,
+) -> Result<Arc<dyn ExecutionPlan>> {
     if plan.downcast_ref::<OutputRequirementExec>().is_some() {
         return Ok(plan);
     }
-    let (new_plan, is_changed) = require_top_ordering_helper(plan)?;
+    let (new_plan, is_changed) = require_top_ordering_helper(plan, funding)?;
     if is_changed {
         Ok(new_plan)
     } else {
         // Add `OutputRequirementExec` to the top, with no specified ordering and distribution requirement.
-        Ok(Arc::new(OutputRequirementExec::new(
+        Ok(funding.arc(OutputRequirementExec::new(
             new_plan,
             // there is no ordering requirement
             None,
             Distribution::UnspecifiedDistribution,
             None,
-        )) as _)
+            funding,
+        )?)? as _)
     }
 }
 
@@ -427,6 +445,7 @@ fn output_requirement_child(plan: &dyn ExecutionPlan) -> Option<usize> {
 /// `OutputRequirementExec` is added to the plan.
 fn require_top_ordering_helper(
     plan: Arc<dyn ExecutionPlan>,
+    funding: &Funding,
 ) -> Result<(Arc<dyn ExecutionPlan>, bool)> {
     // A previous run of this rule already captured the ordering requirement at
     // this node. Report it as already handled.
@@ -448,24 +467,26 @@ fn require_top_ordering_helper(
         let fetch = sort_exec.fetch();
 
         Ok((
-            Arc::new(OutputRequirementExec::new(
+            funding.arc(OutputRequirementExec::new(
                 plan,
                 Some(reqs),
                 req_dist,
                 fetch,
-            )) as _,
+                funding,
+            )?)? as _,
             true,
         ))
     } else if let Some(spm) = plan.downcast_ref::<SortPreservingMergeExec>() {
         let reqs = OrderingRequirements::from(spm.expr().clone());
         let fetch = spm.fetch();
         Ok((
-            Arc::new(OutputRequirementExec::new(
+            funding.arc(OutputRequirementExec::new(
                 plan,
                 Some(reqs),
                 Distribution::SinglePartition,
                 fetch,
-            )) as _,
+                funding,
+            )?)? as _,
             true,
         ))
     } else if let Some(idx) = output_requirement_child(plan.as_ref()) {
@@ -482,7 +503,7 @@ fn require_top_ordering_helper(
             let mut children: Vec<Arc<dyn ExecutionPlan>> =
                 plan.children().into_iter().map(Arc::clone).collect();
             let (new_child, is_changed) =
-                require_top_ordering_helper(Arc::clone(&children[idx]))?;
+                require_top_ordering_helper(Arc::clone(&children[idx]), funding)?;
             if is_changed {
                 children[idx] = new_child;
                 return Ok((replace_children_if_necessary(plan, children)?, true));
