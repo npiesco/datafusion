@@ -161,6 +161,27 @@ impl SessionConfig {
         Arc::make_mut(&mut self.options)
     }
 
+    /// Plans within `funding`: everything planning allocates (SQL to plan, the logical
+    /// optimizer, the physical planner and its optimizer rules) is charged to it before it is
+    /// made ([`datafusion_common::funding`]).
+    ///
+    /// Set once, as the session is built: setting it on options already shared copies them.
+    /// A session planning statement after statement within different funds sets a
+    /// [`PlanningFunding`](datafusion_common::funding::PlanningFunding) that charges whichever
+    /// statement is planning.
+    pub fn with_planning_funding(
+        mut self,
+        funding: datafusion_common::funding::Funding,
+    ) -> Self {
+        self.options_mut().funding = funding;
+        self
+    }
+
+    /// The funding planning is charged to ([`SessionConfig::with_planning_funding`]).
+    pub fn planning_funding(&self) -> &datafusion_common::funding::Funding {
+        &self.options.funding
+    }
+
     /// Set a configuration option
     pub fn set(self, key: &str, value: &ScalarValue) -> Self {
         self.set_str(key, &value.to_string())

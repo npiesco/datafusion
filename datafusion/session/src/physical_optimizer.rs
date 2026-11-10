@@ -54,6 +54,9 @@ pub trait PhysicalOptimizerRule: Debug + std::any::Any {
     ///
     /// This is the primary optimization method. For rules that need access to
     /// the statistics registry, override [`optimize_with_context`](Self::optimize_with_context) instead.
+    ///
+    /// What the rule allocates is charged first to `config.funding`
+    /// ([`datafusion_common::funding`]).
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,

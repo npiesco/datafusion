@@ -170,6 +170,13 @@ pub enum DataFusionError {
     /// Transferring errors across the FFI boundary is difficult, so the original
     /// error will be converted to a string.
     Ffi(String),
+    /// An allocation of `needed` bytes that planning's funding refused
+    /// ([`crate::funding::PlanningFunding`]), or that the allocator refused: nothing was
+    /// allocated for it, and making this error allocates nothing either.
+    Refused {
+        /// The bytes refused.
+        needed: usize,
+    },
 }
 
 #[macro_export]
@@ -431,6 +438,10 @@ impl From<GenericError> for DataFusionError {
 
 impl Display for DataFusionError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        if let DataFusionError::Refused { needed } = self {
+            // Written out without the message's allocation.
+            return write!(f, "{}{needed} bytes", self.error_prefix());
+        }
         let error_prefix = self.error_prefix();
         let message = self.message();
         write!(f, "{error_prefix}{message}")
@@ -470,6 +481,7 @@ impl Error for DataFusionError {
             DataFusionError::Collection(errs) => errs.first().map(|e| e as &dyn Error),
             DataFusionError::Shared(e) => Some(e.as_ref()),
             DataFusionError::Ffi(_) => None,
+            DataFusionError::Refused { .. } => None,
         }
     }
 }
@@ -519,6 +531,17 @@ impl DataFusionError {
         }
         // return last checkpoint (which may be the original error)
         last_datafusion_error
+    }
+
+    /// The bytes an allocation was refused for, if this error, or the root of its chain, or
+    /// the first of a collection, is that refusal ([`DataFusionError::Refused`]): found
+    /// without allocating.
+    pub fn refused(&self) -> Option<usize> {
+        match self.find_root() {
+            DataFusionError::Refused { needed } => Some(*needed),
+            DataFusionError::Collection(errs) => errs.iter().find_map(Self::refused),
+            _ => None,
+        }
     }
 
     /// wraps self in Self::Context with a description
@@ -600,6 +623,7 @@ impl DataFusionError {
             }
             DataFusionError::Shared(_) => "",
             DataFusionError::Ffi(_) => "FFI error: ",
+            DataFusionError::Refused { .. } => "Refused: planning could not be funded ",
         }
     }
 
@@ -651,6 +675,7 @@ impl DataFusionError {
                 .message(),
             DataFusionError::Shared(ref desc) => Cow::Owned(desc.to_string()),
             DataFusionError::Ffi(ref desc) => Cow::Owned(desc.to_string()),
+            DataFusionError::Refused { needed } => Cow::Owned(format!("{needed} bytes")),
         }
     }
 

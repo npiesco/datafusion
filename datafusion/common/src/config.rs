@@ -23,6 +23,7 @@ use arrow_ipc::CompressionType;
 use crate::encryption::{FileDecryptionProperties, FileEncryptionProperties};
 use crate::error::{_config_datafusion_err, _config_err};
 use crate::format::{ExplainAnalyzeCategories, ExplainFormat, MetricType};
+use crate::funding::Funding;
 use crate::parquet_config::DFParquetWriterVersion;
 use crate::parsers::{CompressionTypeVariant, CsvQuoteStyle};
 use crate::utils::get_available_parallelism;
@@ -1929,6 +1930,11 @@ pub struct ConfigOptions {
     pub format: FormatOptions,
     /// Spark-compatibility options (functions under `datafusion/spark`)
     pub spark: SparkOptions,
+    /// What planning charges each allocation to before it makes it: carried by the options,
+    /// so the SQL planner, the logical optimizer, the physical planner and the physical
+    /// optimizer rules all plan within the same funding. Not a configuration entry: it is
+    /// neither set from nor listed among them.
+    pub funding: Funding,
 }
 
 impl ConfigField for ConfigOptions {
