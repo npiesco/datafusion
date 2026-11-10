@@ -1828,7 +1828,7 @@ fn test_filter_pushdown_through_union() {
     let scan1 = TestScanBuilder::new(schema()).with_support(true).build();
     let scan2 = TestScanBuilder::new(schema()).with_support(true).build();
 
-    let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+    let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
 
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
@@ -1858,7 +1858,7 @@ fn test_filter_pushdown_through_union_mixed_support() {
     let scan1 = TestScanBuilder::new(schema()).with_support(true).build();
     let scan2 = TestScanBuilder::new(schema()).with_support(false).build();
 
-    let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+    let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
 
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
@@ -1889,7 +1889,7 @@ fn test_filter_pushdown_through_union_does_not_support() {
     let scan1 = TestScanBuilder::new(schema()).with_support(false).build();
     let scan2 = TestScanBuilder::new(schema()).with_support(false).build();
 
-    let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+    let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
 
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan =
@@ -1922,7 +1922,7 @@ fn test_filter_with_fetch_fully_pushed_through_union() {
     // should be inserted to preserve the fetch limit.
     let scan1 = TestScanBuilder::new(schema()).with_support(true).build();
     let scan2 = TestScanBuilder::new(schema()).with_support(true).build();
-    let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+    let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
         FilterExecBuilder::new(predicate, union, &Funding::default())
@@ -1957,7 +1957,7 @@ fn test_filter_with_fetch_and_projection_fully_pushed_through_union() {
     // a LocalLimitExec wrapping the UnionExec.
     let scan1 = TestScanBuilder::new(schema()).with_support(true).build();
     let scan2 = TestScanBuilder::new(schema()).with_support(true).build();
-    let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+    let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
     let projection = vec![1, 0];
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
@@ -1995,7 +1995,7 @@ fn test_filter_with_fetch_not_fully_pushed_through_union() {
     // pushdown, the FilterExec remains with its fetch — no LocalLimitExec needed.
     let scan1 = TestScanBuilder::new(schema()).with_support(false).build();
     let scan2 = TestScanBuilder::new(schema()).with_support(false).build();
-    let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+    let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
     let predicate = col_lit_predicate("a", "foo", &schema());
     let plan = Arc::new(
         FilterExecBuilder::new(predicate, union, &Funding::default())

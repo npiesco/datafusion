@@ -89,50 +89,47 @@ use tokio::macros::support::thread_rng_n;
 fn coerce_schema(
     input: Arc<dyn ExecutionPlan>,
     schema: &SchemaRef,
+    funding: &Funding,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let input_schema = input.schema();
     if &input_schema == schema {
         return Ok(input);
     }
 
-    let exprs = input_schema
+    let mut exprs = funding.vec_with_capacity(input_schema.fields().len())?;
+    for (i, (input_field, target_field)) in input_schema
         .fields()
         .iter()
         .zip(schema.fields())
         .enumerate()
-        .map(|(i, (input_field, target_field))| {
-            if input_field.data_type() != target_field.data_type() {
-                return plan_err!(
-                    "UnionExec/InterleaveExec requires all inputs to have the same \
-                     data type per column; column {i} has type {} in one input, but \
-                     the union schema expects {}",
-                    input_field.data_type(),
-                    target_field.data_type()
-                );
-            }
-            let column: Arc<dyn PhysicalExpr> =
-                Arc::new(Column::new(input_field.name(), i));
-            let expr = if input_field == target_field {
-                column
-            } else {
-                Arc::new(CastExpr::new_with_target_field(
-                    column,
-                    Arc::clone(target_field),
-                    None,
-                )) as Arc<dyn PhysicalExpr>
-            };
-            Ok(ProjectionExpr {
-                expr,
-                alias: target_field.name().clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    {
+        if input_field.data_type() != target_field.data_type() {
+            return plan_err!(
+                "UnionExec/InterleaveExec requires all inputs to have the same \
+                 data type per column; column {i} has type {} in one input, but \
+                 the union schema expects {}",
+                input_field.data_type(),
+                target_field.data_type()
+            );
+        }
+        let column: Arc<dyn PhysicalExpr> =
+            funding.arc(Column::new(funding.string(input_field.name())?, i))?;
+        let expr = if input_field == target_field {
+            column
+        } else {
+            funding.arc(CastExpr::new_with_target_field(
+                column,
+                Arc::clone(target_field),
+                None,
+            ))? as Arc<dyn PhysicalExpr>
+        };
+        exprs.push(ProjectionExpr {
+            expr,
+            alias: funding.string(target_field.name())?,
+        });
+    }
 
-    Ok(Arc::new(ProjectionExec::try_new(
-        exprs,
-        input,
-        &Funding::default(),
-    )?))
+    Ok(funding.arc(ProjectionExec::try_new(exprs, input, funding)?)?)
 }
 
 /// `UnionExec`: `UNION ALL` execution plan.
@@ -180,6 +177,8 @@ pub struct UnionExec {
     metrics: ExecutionPlanMetricsSet,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl UnionExec {
@@ -191,8 +190,11 @@ impl UnionExec {
     ///
     /// # Optimization
     /// If there is only one input, returns that input directly rather than wrapping it in a UnionExec
+    ///
+    /// What it allocates is charged to `funding`.
     pub fn try_new(
-        inputs: Vec<Arc<dyn ExecutionPlan>>,
+        mut inputs: Vec<Arc<dyn ExecutionPlan>>,
+        funding: &Funding,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match inputs.len() {
             0 => exec_err!("UnionExec requires at least one input"),
@@ -202,18 +204,25 @@ impl UnionExec {
                 // The schema of the inputs and the union schema is consistent when:
                 // - They have the same number of fields, and
                 // - Their fields have same types at the same indices.
-                let inputs = inputs
-                    .into_iter()
-                    .map(|input| coerce_schema(input, &schema))
-                    .collect::<Result<Vec<_>>>()?;
-                let cache = Self::compute_properties(&inputs, schema)?;
-                Ok(Arc::new(UnionExec {
+                for input in inputs.iter_mut() {
+                    *input = coerce_schema(Arc::clone(input), &schema, funding)?;
+                }
+                let cache =
+                    funding.arc(Self::compute_properties(&inputs, schema, funding)?)?;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(funding.arc(UnionExec {
                     inputs,
                     metrics: ExecutionPlanMetricsSet::new(),
-                    cache: Arc::new(cache),
-                }))
+                    cache,
+                    funding: funding.clone(),
+                })?)
             }
         }
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Get inputs of the execution plan
@@ -239,12 +248,15 @@ impl UnionExec {
     fn compute_properties(
         inputs: &[Arc<dyn ExecutionPlan>],
         schema: SchemaRef,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
-        let children_eqps = inputs
-            .iter()
-            .map(|child| child.equivalence_properties().clone())
-            .collect::<Vec<_>>();
+        let mut children_eqps = funding.vec_with_capacity(inputs.len())?;
+        children_eqps.extend(
+            inputs
+                .iter()
+                .map(|child| child.equivalence_properties().clone()),
+        );
         let eq_properties = calculate_union(children_eqps, schema)?;
 
         // Calculate output partitioning; i.e. sum output partitions of the inputs.
@@ -342,12 +354,17 @@ impl ExecutionPlan for UnionExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                inputs: children,
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
-            ChildrenPropertiesMode::Recompute => UnionExec::try_new(children),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    inputs: children,
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
+            }
+            ChildrenPropertiesMode::Recompute => {
+                UnionExec::try_new(children, &self.funding)
+            }
         }
     }
 
@@ -479,13 +496,12 @@ impl ExecutionPlan for UnionExec {
             return Ok(None);
         }
 
-        let new_children = self
-            .children()
-            .into_iter()
-            .map(|child| make_with_child(projection, child))
-            .collect::<Result<Vec<_>>>()?;
+        let mut new_children = self.funding.vec_with_capacity(self.inputs.len())?;
+        for child in &self.inputs {
+            new_children.push(make_with_child(projection, child)?);
+        }
 
-        Ok(Some(UnionExec::try_new(new_children.clone())?))
+        Ok(Some(UnionExec::try_new(new_children, &self.funding)?))
     }
 
     fn gather_filters_for_pushdown(
@@ -558,7 +574,7 @@ impl ExecutionPlan for UnionExec {
         let all_filters_pushed =
             vec![PushedDown::Yes; child_pushdown_result.parent_filters.len()];
         let propagation = if children_modified {
-            let updated_node = UnionExec::try_new(new_children.keep())?;
+            let updated_node = UnionExec::try_new(new_children.keep(), funding)?;
             FilterPushdownPropagation::with_parent_pushdown_result(all_filters_pushed)
                 .with_updated_node(updated_node)
         } else {
@@ -603,7 +619,7 @@ impl UnionExec {
             .iter()
             .map(|input| ctx.decode_child(input))
             .collect::<Result<Vec<_>>>()?;
-        UnionExec::try_new(inputs)
+        UnionExec::try_new(inputs, &Funding::default())
     }
 }
 
@@ -650,26 +666,37 @@ pub struct InterleaveExec {
     metrics: ExecutionPlanMetricsSet,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl InterleaveExec {
-    /// Create a new InterleaveExec
-    pub fn try_new(inputs: Vec<Arc<dyn ExecutionPlan>>) -> Result<Self> {
+    /// Create a new InterleaveExec, charging what it allocates to `funding`
+    pub fn try_new(
+        mut inputs: Vec<Arc<dyn ExecutionPlan>>,
+        funding: &Funding,
+    ) -> Result<Self> {
         assert_or_internal_err!(
             can_interleave(inputs.iter()),
             "Not all InterleaveExec children have a consistent hash or range partitioning"
         );
         let schema = union_schema(&inputs)?;
-        let inputs = inputs
-            .into_iter()
-            .map(|input| coerce_schema(input, &schema))
-            .collect::<Result<Vec<_>>>()?;
-        let cache = Self::compute_properties(&inputs, schema)?;
+        for input in inputs.iter_mut() {
+            *input = coerce_schema(Arc::clone(input), &schema, funding)?;
+        }
+        let cache = funding.arc(Self::compute_properties(&inputs, schema, funding)?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(InterleaveExec {
             inputs,
             metrics: ExecutionPlanMetricsSet::new(),
-            cache: Arc::new(cache),
+            cache,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Get inputs of the execution plan
@@ -681,10 +708,12 @@ impl InterleaveExec {
     fn compute_properties(
         inputs: &[Arc<dyn ExecutionPlan>],
         schema: SchemaRef,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         let eq_properties = EquivalenceProperties::new(schema);
         // Get output partitioning:
-        let output_partitioning = inputs[0].output_partitioning().clone();
+        let output_partitioning =
+            inputs[0].output_partitioning().funded_clone(funding)?;
         Ok(PlanProperties::new(
             eq_properties,
             output_partitioning,
@@ -741,18 +770,23 @@ impl ExecutionPlan for InterleaveExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                inputs: children,
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    inputs: children,
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
+            }
             ChildrenPropertiesMode::Recompute => {
                 // New children are no longer interleavable, which might be a bug of optimization rewrite.
                 assert_or_internal_err!(
                     can_interleave(children.iter()),
                     "Can not create InterleaveExec: new children can not be interleaved"
                 );
-                Ok(Arc::new(InterleaveExec::try_new(children)?))
+                Ok(self
+                    .funding
+                    .arc(InterleaveExec::try_new(children, &self.funding)?)?)
             }
         }
     }
@@ -883,7 +917,10 @@ impl InterleaveExec {
             .iter()
             .map(|input| ctx.decode_child(input))
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(InterleaveExec::try_new(inputs)?))
+        Ok(Arc::new(InterleaveExec::try_new(
+            inputs,
+            &Funding::default(),
+        )?))
     }
 }
 
@@ -1095,7 +1132,8 @@ mod tests {
         let csv = test::scan_partitioned(4);
         let csv2 = test::scan_partitioned(5);
 
-        let union_exec: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![csv, csv2])?;
+        let union_exec: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![csv, csv2], &Funding::default())?;
 
         // Should have 9 partitions and 9 output batches
         assert_eq!(
@@ -1146,8 +1184,10 @@ mod tests {
             &Funding::default(),
         )?);
 
-        let interleave: Arc<dyn ExecutionPlan> =
-            Arc::new(InterleaveExec::try_new(vec![left, right])?);
+        let interleave: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(
+            vec![left, right],
+            &Funding::default(),
+        )?);
         let interleave_schema = interleave.schema();
         assert!(interleave_schema.field(0).is_nullable());
 
@@ -1288,7 +1328,7 @@ mod tests {
         let right: Arc<dyn ExecutionPlan> =
             Arc::new(StatisticsExec::new(right, schema.as_ref().clone()));
 
-        let union = UnionExec::try_new(vec![left, right])?;
+        let union = UnionExec::try_new(vec![left, right], &Funding::default())?;
         let stats =
             StatisticsContext::new().compute(union.as_ref(), &StatisticsArgs::new())?;
 
@@ -1306,7 +1346,7 @@ mod tests {
         let right: Arc<dyn ExecutionPlan> =
             Arc::new(StatisticsExec::new(right, schema.as_ref().clone()));
 
-        let union = UnionExec::try_new(vec![left, right])?;
+        let union = UnionExec::try_new(vec![left, right], &Funding::default())?;
         let stats =
             StatisticsContext::new().compute(union.as_ref(), &StatisticsArgs::new())?;
 
@@ -1342,7 +1382,7 @@ mod tests {
         let right: Arc<dyn ExecutionPlan> =
             Arc::new(StatisticsExec::new(right, nullable_schema));
 
-        let union = UnionExec::try_new(vec![left, right])?;
+        let union = UnionExec::try_new(vec![left, right], &Funding::default())?;
         let stats =
             StatisticsContext::new().compute(union.as_ref(), &StatisticsArgs::new())?;
 
@@ -1431,7 +1471,7 @@ mod tests {
             &Funding::default(),
         )?);
 
-        let interleave = InterleaveExec::try_new(vec![left, right])?;
+        let interleave = InterleaveExec::try_new(vec![left, right], &Funding::default())?;
         let stats =
             StatisticsContext::new().compute(&interleave, &StatisticsArgs::new())?;
 
@@ -1456,7 +1496,7 @@ mod tests {
             &Funding::default(),
         )?);
 
-        let interleave = InterleaveExec::try_new(vec![left, right])?;
+        let interleave = InterleaveExec::try_new(vec![left, right], &Funding::default())?;
         let stats = StatisticsContext::new()
             .compute(&interleave, &StatisticsArgs::new().with_partition(Some(0)))?;
 
@@ -1544,7 +1584,8 @@ mod tests {
             let mut union_expected_eq = EquivalenceProperties::new(Arc::clone(&schema));
             union_expected_eq.add_orderings(union_expected_orderings);
 
-            let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![child1, child2])?;
+            let union: Arc<dyn ExecutionPlan> =
+                UnionExec::try_new(vec![child1, child2], &Funding::default())?;
             let union_eq_properties = union.properties().equivalence_properties();
             let err_msg = format!(
                 "Error in test id: {:?}, test case: {:?}",
@@ -1572,7 +1613,7 @@ mod tests {
     #[test]
     fn test_union_empty_inputs() {
         // Test that UnionExec::try_new fails with empty inputs
-        let result = UnionExec::try_new(vec![]);
+        let result = UnionExec::try_new(vec![], &Funding::default());
         assert!(
             result
                 .unwrap_err()
@@ -1600,7 +1641,7 @@ mod tests {
         let memory_exec: Arc<dyn ExecutionPlan> =
             Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema), None)?);
         let memory_exec_clone = Arc::clone(&memory_exec);
-        let result = UnionExec::try_new(vec![memory_exec])?;
+        let result = UnionExec::try_new(vec![memory_exec], &Funding::default())?;
 
         // Check that the result is the same as the input (no UnionExec wrapper)
         assert_eq!(result.schema(), schema);
@@ -1619,7 +1660,8 @@ mod tests {
         let memory_exec2 =
             Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema), None)?);
 
-        let union_plan = UnionExec::try_new(vec![memory_exec1, memory_exec2])?;
+        let union_plan =
+            UnionExec::try_new(vec![memory_exec1, memory_exec2], &Funding::default())?;
 
         // Downcast to verify it's a UnionExec
         let union = union_plan
@@ -1644,7 +1686,8 @@ mod tests {
         let memory_exec2 =
             Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema2), None).unwrap());
 
-        let result = UnionExec::try_new(vec![memory_exec1, memory_exec2]);
+        let result =
+            UnionExec::try_new(vec![memory_exec1, memory_exec2], &Funding::default());
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains(
@@ -1781,7 +1824,7 @@ mod tests {
         let input2: Arc<dyn ExecutionPlan> =
             Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema), None)?);
 
-        let union = UnionExec::try_new(vec![input1, input2])?;
+        let union = UnionExec::try_new(vec![input1, input2], &Funding::default())?;
         let union = union
             .downcast_ref::<UnionExec>()
             .expect("expected UnionExec for multiple inputs");

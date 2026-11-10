@@ -2535,7 +2535,7 @@ fn union_to_interleave() -> Result<()> {
     );
 
     //  Union
-    let plan = UnionExec::try_new(vec![left, right])?;
+    let plan = UnionExec::try_new(vec![left, right], &Funding::default())?;
 
     // final agg
     let plan =
@@ -2580,7 +2580,7 @@ fn union_not_to_interleave() -> Result<()> {
     );
 
     //  Union
-    let plan = UnionExec::try_new(vec![left, right])?;
+    let plan = UnionExec::try_new(vec![left, right], &Funding::default())?;
 
     // final agg
     let plan =

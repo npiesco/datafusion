@@ -64,10 +64,10 @@ impl TestQueryPlanner {
                 return exec_err!("library B's plan unexpectedly downcast as C-local");
             }
 
-            let plan = UnionExec::try_new(vec![
-                Arc::clone(&library_b_plan),
-                Arc::clone(&library_b_plan),
-            ])?;
+            let plan = UnionExec::try_new(
+                vec![Arc::clone(&library_b_plan), Arc::clone(&library_b_plan)],
+                &Funding::default(),
+            )?;
             if !plan.is::<UnionExec>() {
                 return exec_err!("library C could not downcast its local UnionExec");
             }
@@ -158,10 +158,10 @@ impl SwappedQueryPlanner {
             return exec_err!("library B's scan unexpectedly downcast as C-local");
         }
 
-        Ok(UnionExec::try_new(vec![
-            Arc::clone(&plan),
-            Arc::clone(&plan),
-        ])?)
+        Ok(UnionExec::try_new(
+            vec![Arc::clone(&plan), Arc::clone(&plan)],
+            &Funding::default(),
+        )?)
     }
 }
 

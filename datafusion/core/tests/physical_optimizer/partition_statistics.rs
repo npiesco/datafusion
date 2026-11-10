@@ -473,7 +473,7 @@ mod test {
     async fn test_statistic_by_partition_of_union() -> Result<()> {
         let scan = create_scan_exec_with_statistics(None, Some(2)).await;
         let union_exec: Arc<dyn ExecutionPlan> =
-            UnionExec::try_new(vec![scan.clone(), scan])?;
+            UnionExec::try_new(vec![scan.clone(), scan], &Funding::default())?;
         let statistics = (0..union_exec.output_partitioning().partition_count())
             .map(|idx| {
                 StatisticsContext::new().compute(
@@ -540,8 +540,10 @@ mod test {
             &Funding::default(),
         )?);
 
-        let interleave: Arc<dyn ExecutionPlan> =
-            Arc::new(InterleaveExec::try_new(vec![repartition1, repartition2])?);
+        let interleave: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(
+            vec![repartition1, repartition2],
+            &Funding::default(),
+        )?);
 
         // Verify the result of partition statistics
         let stats = (0..interleave.output_partitioning().partition_count())

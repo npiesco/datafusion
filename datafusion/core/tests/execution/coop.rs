@@ -507,7 +507,10 @@ async fn interleave_then_filter_all_yields(
     }
 
     // Build an InterleaveExec over all infinite children.
-    let interleave = Arc::new(InterleaveExec::try_new(infinite_children)?);
+    let interleave = Arc::new(InterleaveExec::try_new(
+        infinite_children,
+        &Funding::default(),
+    )?);
 
     // Wrap the InterleaveExec in a FilterExec that always returns false,
     // ensuring that no rows are ever emitted.
@@ -577,7 +580,10 @@ async fn interleave_then_aggregate_yields(
 
     // Build an InterleaveExec over all N children.
     // Since each child now has Partitioning::Hash([col "value"], 1), InterleaveExec::try_new succeeds.
-    let interleave = Arc::new(InterleaveExec::try_new(infinite_children)?);
+    let interleave = Arc::new(InterleaveExec::try_new(
+        infinite_children,
+        &Funding::default(),
+    )?);
     let interleave_schema = interleave.schema();
 
     // Build a global AggregateExec that sums “value” over all rows.

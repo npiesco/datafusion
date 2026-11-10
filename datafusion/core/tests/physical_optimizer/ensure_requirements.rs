@@ -276,7 +276,8 @@ fn test_union_mixed_partitions_sort_limit() {
     let live = Arc::new(MockMultiPartitionExec::new(32));
     let historical = Arc::new(MockMultiPartitionExec::new(1));
 
-    let union = UnionExec::try_new(vec![live as _, historical as _]).unwrap();
+    let union = UnionExec::try_new(vec![live as _, historical as _], &Funding::default())
+        .unwrap();
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
@@ -300,7 +301,8 @@ fn test_union_mixed_partitions_sort_limit() {
 fn test_idempotent_union_mixed_partitions() {
     let live = Arc::new(MockMultiPartitionExec::new(8));
     let hist = Arc::new(MockMultiPartitionExec::new(1));
-    let union = UnionExec::try_new(vec![live as _, hist as _]).unwrap();
+    let union =
+        UnionExec::try_new(vec![live as _, hist as _], &Funding::default()).unwrap();
 
     let sort_expr = sort_expr_on("a", 0, true, true);
 
@@ -1395,7 +1397,8 @@ fn test_enforce_distribution_idempotent_hash_join() {
 fn test_idempotent_union_projection_sort() {
     let live: Arc<dyn ExecutionPlan> = Arc::new(MockMultiPartitionExec::new(16));
     let hist: Arc<dyn ExecutionPlan> = Arc::new(MockMultiPartitionExec::new(1));
-    let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![live, hist]).unwrap();
+    let union: Arc<dyn ExecutionPlan> =
+        UnionExec::try_new(vec![live, hist], &Funding::default()).unwrap();
 
     // Identity projection
     let proj_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![

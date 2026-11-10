@@ -129,7 +129,9 @@ async fn test_sort_union_repartition_spill_mixed_nullability() {
         MemorySourceConfig::try_new_exec(&[nullable_batches()], nullable_schema(), None)
             .unwrap();
 
-    let union_exec = UnionExec::try_new(vec![non_nullable_exec, nullable_exec]).unwrap();
+    let union_exec =
+        UnionExec::try_new(vec![non_nullable_exec, nullable_exec], &Funding::default())
+            .unwrap();
     assert!(union_exec.schema().field(1).is_nullable());
 
     let repartition = Arc::new(

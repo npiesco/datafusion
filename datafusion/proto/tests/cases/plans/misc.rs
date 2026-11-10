@@ -174,7 +174,7 @@ fn roundtrip_union() -> Result<()> {
     let left = EmptyExec::new(Arc::new(schema_left), &Funding::default()).unwrap();
     let right = EmptyExec::new(Arc::new(schema_right), &Funding::default()).unwrap();
     let inputs: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::new(left), Arc::new(right)];
-    let union = UnionExec::try_new(inputs)?;
+    let union = UnionExec::try_new(inputs, &Funding::default())?;
     roundtrip_test(union)
 }
 
@@ -204,7 +204,7 @@ async fn roundtrip_union_with_mismatched_nullability_executes() -> Result<()> {
     let nullable_leg = literal_leg(ScalarValue::Int64(None))?;
 
     let union: Arc<dyn ExecutionPlan> =
-        UnionExec::try_new(vec![non_nullable_leg, nullable_leg])?;
+        UnionExec::try_new(vec![non_nullable_leg, nullable_leg], &Funding::default())?;
     assert!(union.schema().field(0).is_nullable());
     assert!(
         format!("{union:?}").contains("CastExpr"),
@@ -257,10 +257,13 @@ fn roundtrip_repartition_preserve_order() -> Result<()> {
         &Funding::default(),
     )
     .unwrap();
-    let union = UnionExec::try_new(vec![
-        Arc::new(source1) as Arc<dyn ExecutionPlan>,
-        Arc::new(source2) as Arc<dyn ExecutionPlan>,
-    ])?;
+    let union = UnionExec::try_new(
+        vec![
+            Arc::new(source1) as Arc<dyn ExecutionPlan>,
+            Arc::new(source2) as Arc<dyn ExecutionPlan>,
+        ],
+        &Funding::default(),
+    )?;
 
     let repartition = RepartitionExec::try_new(
         union,
@@ -391,7 +394,7 @@ fn roundtrip_interleave() -> Result<()> {
         &Funding::default(),
     )?;
     let inputs: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::new(left), Arc::new(right)];
-    let interleave = InterleaveExec::try_new(inputs)?;
+    let interleave = InterleaveExec::try_new(inputs, &Funding::default())?;
     roundtrip_test(Arc::new(interleave))
 }
 
@@ -421,10 +424,10 @@ async fn roundtrip_interleave_with_mismatched_nullability_executes() -> Result<(
     let non_nullable_leg = literal_leg(ScalarValue::Int64(Some(1)))?;
     let nullable_leg = literal_leg(ScalarValue::Int64(None))?;
 
-    let interleave: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(vec![
-        non_nullable_leg,
-        nullable_leg,
-    ])?);
+    let interleave: Arc<dyn ExecutionPlan> = Arc::new(InterleaveExec::try_new(
+        vec![non_nullable_leg, nullable_leg],
+        &Funding::default(),
+    )?);
     assert!(interleave.schema().field(0).is_nullable());
     assert!(
         format!("{interleave:?}").contains("CastExpr"),

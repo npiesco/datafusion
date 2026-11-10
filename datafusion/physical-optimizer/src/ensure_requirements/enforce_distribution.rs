@@ -1503,10 +1503,8 @@ pub fn ensure_distribution(
         )
         .collect::<Result<Vec<_>>>()?;
 
-    let children_plans = children
-        .iter()
-        .map(|c| Arc::clone(&c.plan))
-        .collect::<Vec<_>>();
+    let mut children_plans = funding.vec_with_capacity(children.len())?;
+    children_plans.extend(children.iter().map(|c| Arc::clone(&c.plan)));
 
     plan = if plan.is::<UnionExec>()
         && !config.optimizer.prefer_existing_union
@@ -1535,7 +1533,7 @@ pub fn ensure_distribution(
         //     - Agg:
         //         Repartition (hash):
         //           Data
-        Arc::new(InterleaveExec::try_new(children_plans)?)
+        funding.arc(InterleaveExec::try_new(children_plans, funding)?)?
     } else {
         // Route through `replace_children_if_necessary` so the common
         // case where no child was replaced above skips the expensive

@@ -2237,7 +2237,10 @@ mod tests {
 
     #[test]
     fn test_union_provider_sums_rows() -> Result<()> {
-        let union = UnionExec::try_new(vec![make_source(300), make_source(700)])?;
+        let union = UnionExec::try_new(
+            vec![make_source(300), make_source(700)],
+            &Funding::default(),
+        )?;
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(UnionStatisticsProvider),
@@ -2250,11 +2253,10 @@ mod tests {
 
     #[test]
     fn test_union_provider_three_inputs() -> Result<()> {
-        let union = UnionExec::try_new(vec![
-            make_source(100),
-            make_source(200),
-            make_source(300),
-        ])?;
+        let union = UnionExec::try_new(
+            vec![make_source(100), make_source(200), make_source(300)],
+            &Funding::default(),
+        )?;
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(UnionStatisticsProvider),
@@ -2268,10 +2270,13 @@ mod tests {
     #[test]
     fn test_union_provider_absent_propagates() -> Result<()> {
         // One input with unknown row count -> result must be Absent, not Inexact(300)
-        let union = UnionExec::try_new(vec![
-            make_source(300),
-            make_source_with_precision(Precision::Absent),
-        ])?;
+        let union = UnionExec::try_new(
+            vec![
+                make_source(300),
+                make_source_with_precision(Precision::Absent),
+            ],
+            &Funding::default(),
+        )?;
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(UnionStatisticsProvider),

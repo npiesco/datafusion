@@ -244,7 +244,7 @@ mod tests {
 
         let scan1 = scan_partitioned(1);
         let scan2 = scan_partitioned(1);
-        let union = UnionExec::try_new(vec![scan1, scan2]).unwrap();
+        let union = UnionExec::try_new(vec![scan1, scan2], &Funding::default()).unwrap();
 
         let config = ConfigOptions::new();
         let optimized = EnsureCooperative::new()

@@ -1976,7 +1976,7 @@ impl DefaultPhysicalPlanner {
             }
 
             // N Children
-            LogicalPlan::Union(_) => UnionExec::try_new(children.vec(funding)?)?,
+            LogicalPlan::Union(_) => UnionExec::try_new(children.vec(funding)?, funding)?,
             LogicalPlan::Extension(Extension { node }) => {
                 let mut maybe_plan = None;
                 let children = children.held(funding)?;
