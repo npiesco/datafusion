@@ -19,6 +19,7 @@
 
 mod required_indices;
 
+use crate::funded::freed;
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -274,16 +275,21 @@ fn optimize_projections(
             })?
             .transform_data(|plan| optimize_subqueries(plan, config));
         }
-        LogicalPlan::TableScan(table_scan) => {
+        LogicalPlan::TableScan(mut table_scan) => {
+            let funding = config.funding();
             // Get indices referred to in the original (schema with all fields)
             // given projected indices.
-            let projection = match &table_scan.projection {
-                Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
+            let projection = match table_scan.projection.take() {
+                Some(projection) => {
+                    let mapped = indices.into_mapped_indices(|idx| projection[idx]);
+                    freed(&funding, projection);
+                    mapped
+                }
                 None => indices.into_inner(),
             };
             let new_scan = TableScanBuilder::from(table_scan)
                 .with_projection(Some(projection))
-                .build(&Funding::default())?;
+                .build(&funding)?;
 
             return Transformed::yes(LogicalPlan::TableScan(new_scan))
                 .transform_data(|plan| optimize_subqueries(plan, config));

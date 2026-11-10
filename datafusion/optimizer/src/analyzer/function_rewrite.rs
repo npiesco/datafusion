@@ -18,13 +18,13 @@
 //! [`ApplyFunctionRewrites`] to replace `Expr`s with function calls (e.g `||` to array_concat`)
 
 use super::AnalyzerRule;
+use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{DFSchema, Result};
 
 use crate::funded::{
-    Freed, Released, map_plan_exprs_mut, merged_input_schema, merged_with, rebalanced,
-    transform_up_plan_with_subqueries,
+    Freed, Released, map_plan_exprs_mut, merged_input_schema, merged_with,
+    qualified_schema, rebalanced, transform_up_plan_with_subqueries,
 };
 use crate::utils::NamePreserver;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
@@ -55,11 +55,10 @@ impl ApplyFunctionRewrites {
         let mut schema = merged_input_schema(f, &plan)?;
 
         if let LogicalPlan::TableScan(ts) = &plan {
-            let source_schema = DFSchema::try_from_qualified_schema(
-                ts.table_name.clone(),
-                &ts.source.schema(),
-                &datafusion_common::funding::Funding::default(),
-            )?;
+            let (source_schema, bytes) =
+                qualified_schema(f, &ts.table_name, &ts.source.schema())?;
+            // Given back once merged.
+            let source_schema = Released::new(f, source_schema, bytes);
             schema = merged_with(f, schema, &source_schema)?;
         }
 
@@ -73,11 +72,10 @@ impl ApplyFunctionRewrites {
             ..
         }) = &plan
         {
-            let target_schema = DFSchema::try_from_qualified_schema(
-                table_name.clone(),
-                &target.schema(),
-                &datafusion_common::funding::Funding::default(),
-            )?;
+            let (target_schema, bytes) =
+                qualified_schema(f, table_name, &target.schema())?;
+            // Given back once merged.
+            let target_schema = Released::new(f, target_schema, bytes);
             schema = merged_with(f, schema, &target_schema)?;
         }
         // Freed once the expressions are rewritten.

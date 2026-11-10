@@ -42,7 +42,7 @@ use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
 
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{DataType, Field};
+use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::cloned::CloneBytes;
 use datafusion_common::funding::{Funding, Held, arc_bytes};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -1226,6 +1226,24 @@ pub(crate) fn merged_with(
     drop(schema);
     funding.discharge(held_bytes);
     Ok((merged, bytes))
+}
+
+/// `schema` with each field under `qualifier` ([`DFSchema::try_from_qualified_schema`]),
+/// with what it charged for itself: its qualifiers' list and its Arrow schema's block.
+pub(crate) fn qualified_schema(
+    funding: &Funding,
+    qualifier: &TableReference,
+    schema: &Schema,
+) -> Result<(DFSchema, usize)> {
+    let made = DFSchema::try_from_qualified_schema(qualifier.clone(), schema, funding)?;
+    let bytes = sum([
+        schema
+            .fields()
+            .len()
+            .saturating_mul(size_of::<Option<TableReference>>()),
+        arc_bytes::<Schema>(),
+    ]);
+    Ok((made, bytes))
 }
 
 /// What dropping `expr` frees, but for the plans of its subqueries: those are charged as

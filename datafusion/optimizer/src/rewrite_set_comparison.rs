@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::funded::{
     Released, apply_plan_exprs, binary, cloned_plan, column_expr,
     for_each_child_expr_mut, freed, map_plan_exprs_mut, merged_input_schema, merged_with,
-    out_ref_exprs, transform_up_plan_with_subqueries,
+    out_ref_exprs, qualified_schema, transform_up_plan_with_subqueries,
 };
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::funding::Funding;
@@ -64,15 +64,11 @@ impl RewriteSetComparison {
             ..
         }) = &plan
         {
-            schema = merged_with(
-                funding,
-                schema,
-                &DFSchema::try_from_qualified_schema(
-                    table_name.clone(),
-                    &target.schema(),
-                    &Funding::default(),
-                )?,
-            )?;
+            let (target_schema, bytes) =
+                qualified_schema(funding, table_name, &target.schema())?;
+            // Given back once merged.
+            let target_schema = Released::new(funding, target_schema, bytes);
+            schema = merged_with(funding, schema, &target_schema)?;
         }
         let (schema, bytes) = schema;
         let schema = Released::new(funding, schema, bytes);

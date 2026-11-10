@@ -33,7 +33,7 @@ use datafusion_expr::{DmlStatement, Expr, WriteOp};
 use super::ExprSimplifier;
 use crate::funded::{
     Released, apply_inputs, for_each_child_expr_mut, freed, map_plan_exprs_mut,
-    merged_input_schema, merged_with,
+    merged_input_schema, merged_with, qualified_schema,
 };
 use crate::optimizer::ApplyOrder;
 use crate::simplify_expressions::linear_aggregates::rewrite_multiple_linear_aggregates;
@@ -92,11 +92,10 @@ impl SimplifyExpressions {
             ..
         }) = &plan
         {
-            let target_schema = DFSchema::try_from_qualified_schema(
-                table_name.clone(),
-                &target.schema(),
-                &Funding::default(),
-            )?;
+            let (target_schema, bytes) =
+                qualified_schema(f, table_name, &target.schema())?;
+            // Given back once merged.
+            let target_schema = Released::new(f, target_schema, bytes);
             merged_with(f, merged_input_schema(f, &plan)?, &target_schema)?
         } else if apply_inputs(&plan, &mut |_| Ok(TreeNodeRecursion::Stop))?
             == TreeNodeRecursion::Stop
@@ -113,14 +112,7 @@ impl SimplifyExpressions {
             //
             // Thus, use the full schema of the inner provider without any
             // projection applied for simplification
-            (
-                DFSchema::try_from_qualified_schema(
-                    scan.table_name.clone(),
-                    &scan.source.schema(),
-                    &Funding::default(),
-                )?,
-                0,
-            )
+            qualified_schema(f, &scan.table_name, &scan.source.schema())?
         } else {
             (f.cloned(DFSchema::empty_ref().as_ref())?, 0)
         };

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::analyzer::AnalyzerRule;
 use crate::funded::{
     Freed, Released, aliased, freed_bytes_outside_subqueries, map_plan_exprs_mut,
-    merged_input_schema, merged_with, plan_mut, rebalanced,
+    merged_input_schema, merged_with, plan_mut, qualified_schema, rebalanced,
     transform_up_plan_with_subqueries, unwrapped,
 };
 use crate::utils::NamePreserver;
@@ -142,11 +142,10 @@ fn analyze_internal(
     let mut schema = merged_input_schema(f, &plan)?;
 
     if let LogicalPlan::TableScan(ts) = &plan {
-        let source_schema = DFSchema::try_from_qualified_schema(
-            ts.table_name.clone(),
-            &ts.source.schema(),
-            &Funding::default(),
-        )?;
+        let (source_schema, bytes) =
+            qualified_schema(f, &ts.table_name, &ts.source.schema())?;
+        // Given back once merged.
+        let source_schema = Released::new(f, source_schema, bytes);
         schema = merged_with(f, schema, &source_schema)?;
     }
 
@@ -160,11 +159,9 @@ fn analyze_internal(
         ..
     }) = &plan
     {
-        let target_schema = DFSchema::try_from_qualified_schema(
-            table_name.clone(),
-            &target.schema(),
-            &Funding::default(),
-        )?;
+        let (target_schema, bytes) = qualified_schema(f, table_name, &target.schema())?;
+        // Given back once merged.
+        let target_schema = Released::new(f, target_schema, bytes);
         schema = merged_with(f, schema, &target_schema)?;
     }
 
@@ -270,11 +267,10 @@ impl<'a> TypeCoercionRewriter<'a> {
         if !matches!(dml.op, WriteOp::MergeInto(_)) {
             return Ok(LogicalPlan::Dml(dml));
         }
-        let target_schema = DFSchema::try_from_qualified_schema(
-            dml.table_name.clone(),
-            &dml.target.schema(),
-            &Funding::default(),
-        )?;
+        let (target_schema, bytes) =
+            qualified_schema(self.funding, &dml.table_name, &dml.target.schema())?;
+        // Given back once the merge's expressions are coerced.
+        let target_schema = Released::new(self.funding, target_schema, bytes);
         let WriteOp::MergeInto(merge_op) = &mut dml.op else {
             return Ok(LogicalPlan::Dml(dml));
         };
