@@ -1577,7 +1577,7 @@ mod tests {
                 (None, Arc::new(Field::new("c1", DataType::Boolean, true))),
             ],
             HashMap::new(),
-            &crate::funding::Funding::default(),
+            &Funding::default(),
         )?;
         assert_eq!("fields:[t0.c0, c1], metadata:{}", schema.to_string());
         Ok(())
@@ -2438,7 +2438,7 @@ mod tests {
                 ),
             ],
             HashMap::new(),
-            &crate::funding::Funding::default(),
+            &Funding::default(),
         )
         .unwrap();
 

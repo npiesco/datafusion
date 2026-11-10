@@ -308,7 +308,7 @@ pub fn apply_masking(
                     .iter()
                     .map(|i| schema.qualified_field(*i))
                     .map(|(qualifier, field)| (qualifier.cloned(), Arc::clone(field)))
-                    .collect();
+                    .collect::<Vec<_>>();
 
                 Ok(DFSchema::new_with_metadata(
                     &fields,
@@ -353,7 +353,7 @@ fn apply_projection(
                 .iter()
                 .map(|i| df_schema.qualified_field(*i))
                 .map(|(qualifier, field)| (qualifier.cloned(), Arc::clone(field)))
-                .collect();
+                .collect::<Vec<_>>();
 
             scan.projected_schema = DFSchemaRef::new(DFSchema::new_with_metadata(
                 &fields,

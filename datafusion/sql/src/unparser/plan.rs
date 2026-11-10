@@ -2315,6 +2315,7 @@ impl Unparser<'_> {
                         return Ok(Some(LogicalPlan::Projection(Projection::try_new(
                             exprs,
                             Arc::new(plan),
+                            &datafusion_common::funding::Funding::default(),
                         )?)));
                     }
 

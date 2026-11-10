@@ -909,7 +909,8 @@ pub fn cast_subquery(subquery: Subquery, cast_to_type: &DataType) -> Result<Subq
                 .cast_to(cast_to_type, projection.input.schema())?;
             LogicalPlan::Projection(Projection::try_new(
                 vec![cast_expr],
-                Arc::clone(&projection.input), &datafusion_common::funding::Funding::default(),
+                Arc::clone(&projection.input),
+                &Funding::default(),
             )?)
         }
         _ => {
@@ -917,7 +918,8 @@ pub fn cast_subquery(subquery: Subquery, cast_to_type: &DataType) -> Result<Subq
                 .cast_to(cast_to_type, subquery.subquery.schema())?;
             LogicalPlan::Projection(Projection::try_new(
                 vec![cast_expr],
-                subquery.subquery, &datafusion_common::funding::Funding::default(),
+                subquery.subquery,
+                &Funding::default(),
             )?)
         }
     };

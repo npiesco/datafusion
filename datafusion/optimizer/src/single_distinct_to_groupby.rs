@@ -279,7 +279,11 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                     outer_group_exprs,
                     outer_aggr_exprs,
                 )?);
-                Ok(Transformed::yes(project(outer_aggr, alias_expr)?))
+                Ok(Transformed::yes(project(
+                    outer_aggr,
+                    alias_expr,
+                    &datafusion_common::funding::Funding::default(),
+                )?))
             }
             _ => Ok(Transformed::no(plan)),
         }

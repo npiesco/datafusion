@@ -595,7 +595,7 @@ pub fn create_physical_expr(
                             .iter()
                             .map(|(tbl, field)| (tbl.cloned(), Arc::clone(field)))
                             .chain(lambda_parameters)
-                            .collect();
+                            .collect::<Vec<_>>();
 
                         let lambda_schema = DFSchema::new_with_metadata(
                             &new_fields,
