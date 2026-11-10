@@ -24,6 +24,7 @@
 
 extern crate core;
 
+mod cloned;
 mod higher_order_function;
 mod literal;
 mod operation;

@@ -24,6 +24,7 @@ mod unnest;
 
 pub mod alias;
 pub mod cast;
+pub mod cloned;
 pub mod config;
 pub mod cse;
 pub mod datatype;
