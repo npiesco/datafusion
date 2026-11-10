@@ -595,7 +595,10 @@ fn merge_consecutive_projections_one_level(
     let name_preserver = NamePreserver::new_for_projection();
     let mut original_names = vec![];
     let new_exprs = expr.map_elements(|expr| {
-        original_names.push(name_preserver.save(&expr));
+        original_names.push(
+            name_preserver
+                .save(&expr, &datafusion_common::funding::Funding::default())?,
+        );
 
         // do not rewrite top level Aliases (rewriter will remove all aliases within exprs)
         match expr {
@@ -636,9 +639,17 @@ fn merge_consecutive_projections_one_level(
             .data
             .into_iter()
             .zip(original_names)
-            .map(|(expr, original_name)| original_name.restore(expr))
-            .collect::<Vec<_>>();
-        Projection::try_new(new_exprs, prev_projection.input, &datafusion_common::funding::Funding::default()).map(Transformed::yes)
+            .map(|(expr, original_name)| {
+                original_name
+                    .restore(expr, &datafusion_common::funding::Funding::default())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Projection::try_new(
+            new_exprs,
+            prev_projection.input,
+            &datafusion_common::funding::Funding::default(),
+        )
+        .map(Transformed::yes)
     } else {
         // not rewritten, so put the projection back together
         let input = Arc::new(LogicalPlan::Projection(prev_projection));
@@ -814,9 +825,13 @@ fn add_projection_on_top_if_helpful(
     if project_exprs.len() >= plan.schema().fields().len() {
         Ok(Transformed::no(plan))
     } else {
-        Projection::try_new(project_exprs, Arc::new(plan), &datafusion_common::funding::Funding::default())
-            .map(LogicalPlan::Projection)
-            .map(Transformed::yes)
+        Projection::try_new(
+            project_exprs,
+            Arc::new(plan),
+            &datafusion_common::funding::Funding::default(),
+        )
+        .map(LogicalPlan::Projection)
+        .map(Transformed::yes)
     }
 }
 
@@ -856,9 +871,13 @@ fn rewrite_projection_given_requirements(
             if is_projection_unnecessary(&input, &exprs_used)? {
                 Ok(Transformed::yes(input))
             } else {
-                Projection::try_new(exprs_used, Arc::new(input), &datafusion_common::funding::Funding::default())
-                    .map(LogicalPlan::Projection)
-                    .map(Transformed::yes)
+                Projection::try_new(
+                    exprs_used,
+                    Arc::new(input),
+                    &datafusion_common::funding::Funding::default(),
+                )
+                .map(LogicalPlan::Projection)
+                .map(Transformed::yes)
             }
         })
 }
@@ -2046,8 +2065,11 @@ mod tests {
         // that the Column references are unqualified (e.g. their
         // relation is `None`). PlanBuilder resolves the expressions
         let expr = vec![col("test.a"), col("test.b")];
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(expr, Arc::new(table_scan), &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            expr,
+            Arc::new(table_scan),
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_fields_eq(&plan, vec!["a", "b"]);
 

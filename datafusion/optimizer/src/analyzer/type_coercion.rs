@@ -174,9 +174,11 @@ fn analyze_internal(
     let name_preserver = NamePreserver::new(&plan);
     // apply coercion rewrite all expressions in the plan individually
     plan.map_expressions(|expr| {
-        let original_name = name_preserver.save(&expr);
-        expr.rewrite(&mut expr_rewrite)
-            .map(|transformed| transformed.update_data(|e| original_name.restore(e)))
+        let original_name = name_preserver
+            .save(&expr, &datafusion_common::funding::Funding::default())?;
+        expr.rewrite(&mut expr_rewrite)?.map_data(|e| {
+            original_name.restore(e, &datafusion_common::funding::Funding::default())
+        })
     })?
     // some plans need extra coercion after their expressions are coerced
     .map_data(|plan| expr_rewrite.coerce_plan(plan))?
@@ -1568,7 +1570,11 @@ mod test {
     fn simple_case() -> Result<()> {
         let expr = col("a").lt(lit(2_u32));
         let empty = empty_with_type(DataType::Float64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -1619,7 +1625,8 @@ mod test {
             .execute_and_check(union, &ConfigOptions::default(), |_, _| {})?;
         let top_level_plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("a")],
-            Arc::new(analyzed_union), &datafusion_common::funding::Funding::default(),
+            Arc::new(analyzed_union),
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         assert_analyzed_plan_eq!(
@@ -1724,7 +1731,8 @@ mod test {
         let empty = empty_with_type(DataType::Utf8View);
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![expr.clone()],
-            Arc::clone(&empty), &datafusion_common::funding::Funding::default(),
+            Arc::clone(&empty),
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         // Plan A: no coerce
@@ -1752,7 +1760,8 @@ mod test {
         let bool_expr = col("a").lt(lit("foo"));
         let bool_plan = LogicalPlan::Projection(Projection::try_new(
             vec![bool_expr],
-            Arc::clone(&empty), &datafusion_common::funding::Funding::default(),
+            Arc::clone(&empty),
+            &datafusion_common::funding::Funding::default(),
         )?);
         // Plan B: no coerce
         coerce_on_output_if_viewtype!(
@@ -1819,7 +1828,8 @@ mod test {
         // scenario: two layers of projections with view types
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("a")],
-            Arc::new(sort_plan), &datafusion_common::funding::Funding::default(),
+            Arc::new(sort_plan),
+            &datafusion_common::funding::Funding::default(),
         )?);
         // Plan D: no coerce
         coerce_on_output_if_viewtype!(
@@ -1855,7 +1865,8 @@ mod test {
         let empty = empty_with_type(DataType::BinaryView);
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![expr.clone()],
-            Arc::clone(&empty), &datafusion_common::funding::Funding::default(),
+            Arc::clone(&empty),
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         // Plan A: no coerce
@@ -1883,7 +1894,8 @@ mod test {
         let bool_expr = col("a").lt(lit(vec![8, 1, 8, 1]));
         let bool_plan = LogicalPlan::Projection(Projection::try_new(
             vec![bool_expr],
-            Arc::clone(&empty), &datafusion_common::funding::Funding::default(),
+            Arc::clone(&empty),
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         // Plan B: no coerce
@@ -1941,7 +1953,8 @@ mod test {
         // scenario: two layers of projections with view types
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("a")],
-            Arc::new(sort_plan), &datafusion_common::funding::Funding::default(),
+            Arc::new(sort_plan),
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         // Plan D: no coerce
@@ -1978,7 +1991,8 @@ mod test {
 
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![expr.clone().or(expr)],
-            empty, &datafusion_common::funding::Funding::default(),
+            empty,
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         assert_analyzed_plan_eq!(
@@ -2046,7 +2060,11 @@ mod test {
             signature: Signature::uniform(1, vec![DataType::Float32], Volatility::Stable),
         })
         .call(vec![lit(123_i32)]);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![udf], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![udf],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2064,8 +2082,12 @@ mod test {
             signature: Signature::uniform(1, vec![DataType::Float32], Volatility::Stable),
         })
         .call(vec![lit("Apple")]);
-        Projection::try_new(vec![udf], empty, &datafusion_common::funding::Funding::default())
-            .expect_err("Expected an error due to incorrect function input");
+        Projection::try_new(
+            vec![udf],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )
+        .expect_err("Expected an error due to incorrect function input");
 
         Ok(())
     }
@@ -2082,7 +2104,8 @@ mod test {
             Expr::ScalarFunction(ScalarFunction::new_udf(Arc::new(fun), vec![lit_expr]));
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![scalar_function_expr],
-            empty, &datafusion_common::funding::Funding::default(),
+            empty,
+            &datafusion_common::funding::Funding::default(),
         )?);
 
         assert_analyzed_plan_eq!(
@@ -2113,7 +2136,11 @@ mod test {
             vec![],
             None,
         ));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![udaf], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![udaf],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2149,7 +2176,13 @@ mod test {
             None,
         ));
 
-        let err = Projection::try_new(vec![udaf], empty, &datafusion_common::funding::Funding::default()).err().unwrap();
+        let err = Projection::try_new(
+            vec![udaf],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )
+        .err()
+        .unwrap();
         assert!(
             err.strip_backtrace().starts_with("Error during planning: Failed to coerce arguments to satisfy a call to 'MY_AVG' function: coercion from Utf8 to the signature Uniform(1, [Float64]) failed")
         );
@@ -2167,7 +2200,11 @@ mod test {
             vec![],
             None,
         ));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![agg_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![agg_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2186,7 +2223,11 @@ mod test {
             vec![],
             None,
         ));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![agg_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![agg_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2208,10 +2249,14 @@ mod test {
             vec![],
             None,
         ));
-        let err = Projection::try_new(vec![agg_expr], empty, &datafusion_common::funding::Funding::default())
-            .err()
-            .unwrap()
-            .strip_backtrace();
+        let err = Projection::try_new(
+            vec![agg_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )
+        .err()
+        .unwrap()
+        .strip_backtrace();
         assert!(
             err.contains("Function 'avg' failed to match any signature"),
             "Err: {err:?}"
@@ -2225,7 +2270,11 @@ mod test {
         let expr = cast(lit("1998-03-18"), DataType::Date32)
             + lit(ScalarValue::new_interval_dt(123, 456));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2241,7 +2290,11 @@ mod test {
         // a in (1,4,8), a is int64
         let expr = col("a").in_list(vec![lit(1_i32), lit(4_i8), lit(8_i64)], false);
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_analyzed_plan_eq!(
             plan,
             @r"
@@ -2258,7 +2311,11 @@ mod test {
                 std::collections::HashMap::new(),
             )?),
         }));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_analyzed_plan_eq!(
             plan,
             @r"
@@ -2328,8 +2385,11 @@ mod test {
         // is true
         let expr = col("a").is_true();
         let empty = empty_with_type(DataType::Boolean);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![expr.clone()], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr.clone()],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2340,7 +2400,11 @@ mod test {
         )?;
 
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "Cannot infer common argument type for comparison operation Int64 IS DISTINCT FROM Boolean",
@@ -2349,7 +2413,11 @@ mod test {
         // is not true
         let expr = col("a").is_not_true();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2362,7 +2430,11 @@ mod test {
         // is false
         let expr = col("a").is_false();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2375,7 +2447,11 @@ mod test {
         // is not false
         let expr = col("a").is_not_false();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2393,7 +2469,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![like_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2407,7 +2487,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::Null));
         let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![like_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2421,7 +2505,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![like_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "There isn't a common type to coerce Int64 and Utf8 in LIKE expression",
@@ -2432,7 +2520,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![ilike_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2446,7 +2538,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::Null));
         let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![ilike_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2460,7 +2556,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![ilike_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "There isn't a common type to coerce Int64 and Utf8 in ILIKE expression",
@@ -2477,8 +2577,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2495,8 +2598,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2512,8 +2618,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Utf8View);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2529,8 +2638,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2549,8 +2661,11 @@ mod test {
             Box::new(DataType::Int32),
             Box::new(Utf8),
         ));
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2566,8 +2681,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Int64);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "There isn't a common type to coerce Int64 and Utf8 in SIMILAR TO expression",
@@ -2581,8 +2699,11 @@ mod test {
         // unknown
         let expr = col("a").is_unknown();
         let empty = empty_with_type(DataType::Boolean);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![expr.clone()], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr.clone()],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2593,7 +2714,11 @@ mod test {
         )?;
 
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "Cannot infer common argument type for comparison operation Utf8 IS DISTINCT FROM Boolean",
@@ -2602,7 +2727,11 @@ mod test {
         // is not unknown
         let expr = col("a").is_not_unknown();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2623,8 +2752,11 @@ mod test {
             signature: Signature::variadic(vec![Utf8], Volatility::Immutable),
         })
         .call(args.to_vec());
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![expr], Arc::clone(&empty), &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            Arc::clone(&empty),
+            &datafusion_common::funding::Funding::default(),
+        )?);
         assert_analyzed_plan_eq!(
             plan,
             @r#"
@@ -2680,7 +2812,11 @@ mod test {
         )
         .eq(cast(lit("1998-03-18"), DataType::Date32));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3031,7 +3167,11 @@ mod test {
 
         let expr = col("a").eq(cast(col("a"), may_type_custom));
         let empty = empty_with_type(map_type_entries);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3058,7 +3198,11 @@ mod test {
 
         let expr = ScalarUDF::from(TestArrayElementUDF).call(vec![col("a"), lit(1_i64)]);
         let empty = empty_with_type(list_type);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3081,7 +3225,11 @@ mod test {
             )),
         ));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3106,7 +3254,11 @@ mod test {
             )),
         ));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty, &datafusion_common::funding::Funding::default())?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,

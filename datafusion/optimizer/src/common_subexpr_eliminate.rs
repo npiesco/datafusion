@@ -199,10 +199,15 @@ impl CommonSubexprEliminate {
                     .map(|exprs| {
                         exprs
                             .iter()
-                            .map(|expr| name_preserver.save(expr))
-                            .collect::<Vec<_>>()
+                            .map(|expr| {
+                                name_preserver.save(
+                                    expr,
+                                    &datafusion_common::funding::Funding::default(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 new_window_expr_list.into_iter().zip(saved_names).try_rfold(
                     new_input,
                     |plan, (new_window_expr, saved_names)| {
@@ -210,9 +215,12 @@ impl CommonSubexprEliminate {
                             .into_iter()
                             .zip(saved_names)
                             .map(|(new_window_expr, saved_name)| {
-                                saved_name.restore(new_window_expr)
+                                saved_name.restore(
+                                    new_window_expr,
+                                    &datafusion_common::funding::Funding::default(),
+                                )
                             })
-                            .collect::<Vec<_>>();
+                            .collect::<Result<Vec<_>>>()?;
                         Window::try_new(new_window_expr, Arc::new(plan))
                             .map(LogicalPlan::Window)
                     },
@@ -322,8 +330,16 @@ impl CommonSubexprEliminate {
                             let name_preserver = NamePreserver::new_for_projection();
                             aggr_expr
                                 .iter()
-                                .map(|expr| Some(name_preserver.save(expr)))
-                                .collect::<Vec<_>>()
+                                .map(|expr| {
+                                    name_preserver
+                                        .save(
+                                            expr,
+                                            &datafusion_common::funding::Funding::default(
+                                            ),
+                                        )
+                                        .map(Some)
+                                })
+                                .collect::<Result<Vec<_>>>()?
                         } else {
                             (0..new_aggr_expr.len()).map(|_| None).collect()
                         };
@@ -346,7 +362,10 @@ impl CommonSubexprEliminate {
                             if expr_rewritten == expr_orig {
                                 let expr_rewritten = if let Some(saved_name) = saved_name
                                 {
-                                    saved_name.restore(expr_rewritten)
+                                    saved_name.restore(
+                                        expr_rewritten,
+                                        &datafusion_common::funding::Funding::default(),
+                                    )?
                                 } else {
                                     expr_rewritten
                                 };
@@ -380,8 +399,12 @@ impl CommonSubexprEliminate {
                             new_group_expr,
                             agg_exprs,
                         )?);
-                        Projection::try_new(proj_exprs, Arc::new(agg), &datafusion_common::funding::Funding::default())
-                            .map(|p| Transformed::yes(LogicalPlan::Projection(p)))
+                        Projection::try_new(
+                            proj_exprs,
+                            Arc::new(agg),
+                            &datafusion_common::funding::Funding::default(),
+                        )
+                        .map(|p| Transformed::yes(LogicalPlan::Projection(p)))
                     }
 
                     // If there aren't any common aggregate sub-expressions, then just
@@ -405,15 +428,23 @@ impl CommonSubexprEliminate {
                             let name_preserver = NamePreserver::new_for_projection();
                             let saved_names = aggr_expr
                                 .iter()
-                                .map(|expr| name_preserver.save(expr))
-                                .collect::<Vec<_>>();
+                                .map(|expr| {
+                                    name_preserver.save(
+                                        expr,
+                                        &datafusion_common::funding::Funding::default(),
+                                    )
+                                })
+                                .collect::<Result<Vec<_>>>()?;
                             let new_aggr_expr = rewritten_aggr_expr
                                 .into_iter()
                                 .zip(saved_names)
                                 .map(|(new_expr, saved_name)| {
-                                    saved_name.restore(new_expr)
+                                    saved_name.restore(
+                                        new_expr,
+                                        &datafusion_common::funding::Funding::default(),
+                                    )
                                 })
-                                .collect::<Vec<Expr>>();
+                                .collect::<Result<Vec<Expr>>>()?;
 
                             // Since `group_expr` may have changed, schema may also.
                             // Use `try_new()` method.
@@ -803,7 +834,12 @@ fn build_common_expr_project_plan(
         }
     }
 
-    Projection::try_new(project_exprs, Arc::new(input), &datafusion_common::funding::Funding::default()).map(LogicalPlan::Projection)
+    Projection::try_new(
+        project_exprs,
+        Arc::new(input),
+        &datafusion_common::funding::Funding::default(),
+    )
+    .map(LogicalPlan::Projection)
 }
 
 /// Build the projection plan to eliminate unnecessary columns produced by
@@ -816,7 +852,12 @@ fn build_recover_project_plan(
     input: LogicalPlan,
 ) -> Result<LogicalPlan> {
     let col_exprs = schema.iter().map(Expr::from).collect();
-    Projection::try_new(col_exprs, Arc::new(input), &datafusion_common::funding::Funding::default()).map(LogicalPlan::Projection)
+    Projection::try_new(
+        col_exprs,
+        Arc::new(input),
+        &datafusion_common::funding::Funding::default(),
+    )
+    .map(LogicalPlan::Projection)
 }
 
 fn extract_expressions(expr: &Expr, result: &mut Vec<Expr>) {

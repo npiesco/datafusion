@@ -748,6 +748,17 @@ impl<'a, T: Hash + Eq> HashIndex<'a, T> {
         self.position(item).is_some()
     }
 
+    /// How many items are equal to `item`.
+    pub(crate) fn count(&self, item: &T) -> usize {
+        let hash = hash_of(item);
+        let start = self.hashes.partition_point(|(other, _)| *other < hash);
+        self.hashes[start..]
+            .iter()
+            .take_while(|(other, _)| *other == hash)
+            .filter(|(_, at)| self.items[*at] == *item)
+            .count()
+    }
+
     /// Whether the item at `at` is the first of those equal to it.
     pub(crate) fn is_first(&self, at: usize) -> bool {
         self.position(&self.items[at]) == Some(at)
@@ -765,6 +776,85 @@ pub(crate) fn emptied(
         produce_one_row: false,
         schema,
     })
+}
+
+/// The schema of `plan`'s inputs merged ([`merge_schema`]), found without listing them,
+/// with what it holds alone charged for it: each schema merged on the way freed and given
+/// back.
+///
+/// [`merge_schema`]: datafusion_expr::utils::merge_schema
+pub(crate) fn merged_input_schema(
+    funding: &Funding,
+    plan: &LogicalPlan,
+) -> Result<(DFSchema, usize)> {
+    if let Some(input) = only_input(plan) {
+        let bytes = input.schema().clone_bytes();
+        return Ok((funding.cloned(input.schema().as_ref())?, bytes));
+    }
+    let mut merged: Option<(DFSchema, usize)> = None;
+    apply_inputs(plan, &mut |input| {
+        let base = merged
+            .as_ref()
+            .map_or(DFSchema::empty_ref().as_ref(), |(schema, _)| schema);
+        let before = funding.outstanding();
+        let next = base.merge(input.schema(), funding)?;
+        let bytes = funding.outstanding().saturating_sub(before);
+        if let Some((_, held)) = merged.replace((next, bytes)) {
+            funding.discharge(held);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    match merged {
+        Some(merged) => Ok(merged),
+        None => Ok((funding.cloned(DFSchema::empty_ref().as_ref())?, 0)),
+    }
+}
+
+/// `held`, a schema with what it holds alone charged for it, merged with `other`
+/// ([`DFSchema::merge`]): the merged schema charged before it is made, `held` then freed and
+/// given back.
+pub(crate) fn merged_with(
+    funding: &Funding,
+    held: (DFSchema, usize),
+    other: &DFSchema,
+) -> Result<(DFSchema, usize)> {
+    let (schema, held_bytes) = held;
+    let before = funding.outstanding();
+    let merged = schema.merge(other, funding)?;
+    let bytes = funding.outstanding().saturating_sub(before);
+    drop(schema);
+    funding.discharge(held_bytes);
+    Ok((merged, bytes))
+}
+
+/// What a value held `before` and holds `after` it was changed by code that allocates on its
+/// own: the difference charged or given back once it is made.
+pub(crate) fn rebalanced(funding: &Funding, before: usize, after: usize) -> Result<()> {
+    if after > before {
+        funding.charge(after - before)
+    } else {
+        funding.discharge(before - after);
+        Ok(())
+    }
+}
+
+/// Whether `value` displays as exactly `text`, compared as it is written, nothing allocated.
+pub(crate) fn displays_as(value: impl std::fmt::Display, text: &str) -> bool {
+    use std::fmt::Write;
+    struct Rest<'a>(&'a str);
+    impl Write for Rest<'_> {
+        fn write_str(&mut self, part: &str) -> std::fmt::Result {
+            match self.0.strip_prefix(part) {
+                Some(rest) => {
+                    self.0 = rest;
+                    Ok(())
+                }
+                None => Err(std::fmt::Error),
+            }
+        }
+    }
+    let mut rest = Rest(text);
+    write!(rest, "{value}").is_ok() && rest.0.is_empty()
 }
 
 /// The one input of `plan`, if it has exactly one, found without listing its inputs.
@@ -1276,6 +1366,107 @@ pub(crate) fn map_subqueries_mut(
             })?;
             *plan = rewritten.data;
         }
+    }
+    Ok(changed)
+}
+
+/// Calls `f` on each expression `plan` holds, to change in place, in the order
+/// [`LogicalPlan::map_expressions`] visits them. Returns whether `f` changed any.
+///
+/// An extension's, a range partitioning's, an unnest's or a merge's expressions are
+/// rewritten through [`LogicalPlan::map_expressions`]: what that allocates is theirs.
+pub(crate) fn map_plan_exprs_mut(
+    plan: &mut LogicalPlan,
+    f: &mut dyn FnMut(&mut Expr) -> Result<bool>,
+) -> Result<bool> {
+    let mut changed = false;
+    let mut each = |exprs: &mut dyn Iterator<Item = &mut Expr>| -> Result<()> {
+        for expr in exprs {
+            changed |= f(expr)?;
+        }
+        Ok(())
+    };
+    match plan {
+        LogicalPlan::Projection(Projection { expr, .. }) => each(&mut expr.iter_mut())?,
+        LogicalPlan::Values(Values { values, .. }) => {
+            each(&mut values.iter_mut().flatten())?
+        }
+        LogicalPlan::Filter(Filter { predicate, .. }) => {
+            each(&mut std::iter::once(predicate))?
+        }
+        LogicalPlan::Repartition(Repartition {
+            partitioning_scheme:
+                Partitioning::Hash(exprs, _) | Partitioning::DistributeBy(exprs),
+            ..
+        }) => each(&mut exprs.iter_mut())?,
+        LogicalPlan::Window(Window { window_expr, .. }) => {
+            each(&mut window_expr.iter_mut())?
+        }
+        LogicalPlan::Aggregate(Aggregate {
+            group_expr,
+            aggr_expr,
+            ..
+        }) => each(&mut group_expr.iter_mut().chain(aggr_expr.iter_mut()))?,
+        LogicalPlan::Join(Join { on, filter, .. }) => each(
+            &mut on
+                .iter_mut()
+                .flat_map(|(left, right)| [left, right])
+                .chain(filter.iter_mut()),
+        )?,
+        LogicalPlan::Sort(SortPlan { expr, .. }) => {
+            each(&mut expr.iter_mut().map(|sort| &mut sort.expr))?
+        }
+        LogicalPlan::TableScan(TableScan { filters, .. }) => {
+            each(&mut filters.iter_mut())?
+        }
+        LogicalPlan::Distinct(Distinct::On(DistinctOn {
+            on_expr,
+            select_expr,
+            sort_expr,
+            ..
+        })) => each(
+            &mut on_expr
+                .iter_mut()
+                .chain(select_expr.iter_mut())
+                .chain(sort_expr.iter_mut().flatten().map(|sort| &mut sort.expr)),
+        )?,
+        LogicalPlan::Limit(Limit { skip, fetch, .. }) => each(
+            &mut skip
+                .iter_mut()
+                .chain(fetch.iter_mut())
+                .map(|expr| expr.as_mut()),
+        )?,
+        LogicalPlan::Statement(Statement::Execute(Execute { parameters, .. })) => {
+            each(&mut parameters.iter_mut())?
+        }
+        LogicalPlan::Extension(_)
+        | LogicalPlan::Repartition(_)
+        | LogicalPlan::Unnest(_)
+        | LogicalPlan::Dml(DmlStatement {
+            op: WriteOp::MergeInto(_),
+            ..
+        }) => {
+            let owned = std::mem::take(plan);
+            let rewritten = owned.map_expressions(|mut expr| {
+                let expr_changed = f(&mut expr)?;
+                Ok(Transformed::new_transformed(expr, expr_changed))
+            })?;
+            changed = rewritten.transformed;
+            *plan = rewritten.data;
+        }
+        LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::RecursiveQuery(_)
+        | LogicalPlan::Subquery(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Analyze(_)
+        | LogicalPlan::Explain(_)
+        | LogicalPlan::Union(_)
+        | LogicalPlan::Distinct(Distinct::All(_))
+        | LogicalPlan::Statement(_)
+        | LogicalPlan::Dml(_)
+        | LogicalPlan::Ddl(_)
+        | LogicalPlan::Copy(_)
+        | LogicalPlan::DescribeTable(_) => {}
     }
     Ok(changed)
 }
