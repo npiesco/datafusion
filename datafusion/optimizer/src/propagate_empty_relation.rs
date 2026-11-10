@@ -227,6 +227,7 @@ impl OptimizerRule for PropagateEmptyRelation {
                             return internal_err!("a union's one input is kept");
                         };
                         if child.schema().eq(&schema) {
+                            freed(&funding, schema);
                             Ok(Transformed::yes(unwrapped(&funding, child)?))
                         } else {
                             Ok(Transformed::yes(schema_projection(
@@ -274,12 +275,13 @@ fn join_side(join: Join, left_side: bool) -> (Arc<LogicalPlan>, impl Freed) {
         right,
         on,
         filter,
+        schema,
         ..
     } = join;
     if left_side {
-        (left, (right, (on, filter)))
+        (left, (right, (on, (filter, schema))))
     } else {
-        (right, (left, (on, filter)))
+        (right, (left, (on, (filter, schema))))
     }
 }
 

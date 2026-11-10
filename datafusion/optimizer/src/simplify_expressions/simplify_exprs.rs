@@ -224,7 +224,7 @@ fn rewrite_aggregate_non_aggregate_aggr_expr(
         input,
         group_expr,
         aggr_expr,
-        ..
+        schema,
     }) = plan
     else {
         return internal_err!("Expected an aggregate");
@@ -248,6 +248,8 @@ fn rewrite_aggregate_non_aggregate_aggr_expr(
     }
     freed(f, group_expr);
     freed(f, input);
+    // The aggregate's schema is replaced by the projection's.
+    freed(f, schema);
 
     Ok(Transformed::yes(LogicalPlan::Projection(
         Projection::try_new(projection_exprs, inner_aggregate, f)?,

@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::funded::{
     apply_plan, binary, equijoin_sides, freed, hashable, map_inputs_mut,
-    map_subqueries_mut, schema_columns, unwrapped, vacated,
+    map_subqueries_mut, recomputed, schema_columns, unwrapped, vacated,
 };
 use crate::join_key_set::JoinKeySet;
 use datafusion_common::funding::{Funding, Held};
@@ -297,7 +297,7 @@ fn rewrite_children(
 
     // recompute schema if the plan was transformed
     if changed {
-        plan = plan.recompute_schema()?;
+        plan = recomputed(&config.funding(), plan)?;
     }
     Ok(Transformed::new_transformed(plan, changed))
 }
@@ -322,13 +322,14 @@ fn flatten_join_inputs(
                 right,
                 mut on,
                 filter,
+                schema,
                 ..
             } = join;
             if let Some(filter) = filter {
                 all_filters.push(filter)?;
             }
             possible_join_keys.insert_all_owned(on.drain(..))?;
-            freed(funding, on);
+            freed(funding, (on, schema));
             flatten_join_inputs(
                 funding,
                 unwrapped(funding, left)?,

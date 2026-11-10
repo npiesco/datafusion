@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use crate::analyzer::AnalyzerRule;
 use crate::funded::{
-    Freed, Released, aliased, freed_bytes_outside_subqueries, map_plan_exprs_mut,
-    merged_input_schema, merged_with, plan_mut, qualified_schema, rebalanced,
+    Freed, Released, aliased, freed, freed_bytes_outside_subqueries, map_plan_exprs_mut,
+    merged_input_schema, merged_with, plan_mut, qualified_schema, rebalanced, recomputed,
     transform_up_plan_with_subqueries, unwrapped,
 };
 use crate::utils::NamePreserver;
@@ -193,10 +193,7 @@ fn analyze_internal(
     // some plans need extra coercion after their expressions are coerced
     let plan = expr_rewrite.coerce_plan(plan)?;
     // recompute the schema after the expressions have been rewritten as the types may have changed
-    Ok(Transformed::new_transformed(
-        plan.recompute_schema()?,
-        changed,
-    ))
+    Ok(Transformed::new_transformed(recomputed(f, plan)?, changed))
 }
 
 /// Rewrite expressions to apply type coercion.
@@ -370,7 +367,11 @@ impl<'a> TypeCoercionRewriter<'a> {
             &union_plan.schema,
             funding,
         )?)?;
-        let Union { mut inputs, .. } = union_plan;
+        let Union {
+            mut inputs,
+            schema: replaced,
+        } = union_plan;
+        freed(funding, replaced);
         for input in &mut inputs {
             // Each input coerced in its own block: a shared one is copied first.
             let p = std::mem::replace(

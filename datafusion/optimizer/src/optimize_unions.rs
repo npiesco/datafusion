@@ -58,9 +58,9 @@ impl OptimizerRule for OptimizeUnions {
     ) -> Result<Transformed<LogicalPlan>> {
         let funding = config.funding();
         match plan {
-            LogicalPlan::Union(Union { mut inputs, .. }) if inputs.len() == 1 => {
+            LogicalPlan::Union(Union { mut inputs, schema }) if inputs.len() == 1 => {
                 let input = inputs.pop().unwrap();
-                freed(&funding, inputs);
+                freed(&funding, (inputs, schema));
                 Ok(Transformed::yes(unwrapped(&funding, input)?))
             }
             LogicalPlan::Union(Union { inputs, schema }) => {
@@ -125,11 +125,11 @@ fn extract_plans_from_union(
     emit: &mut dyn FnMut(LogicalPlan) -> Result<()>,
 ) -> Result<()> {
     match unwrapped(funding, plan)? {
-        LogicalPlan::Union(Union { mut inputs, .. }) => {
+        LogicalPlan::Union(Union { mut inputs, schema }) => {
             for input in inputs.drain(..) {
                 emit(unwrapped(funding, input)?)?;
             }
-            freed(funding, inputs);
+            freed(funding, (inputs, schema));
             Ok(())
         }
         // While unnesting, unwrap a Projection whose input is a nested Union,
@@ -145,7 +145,10 @@ fn extract_plans_from_union(
             schema,
             ..
         }) if matches!(input.as_ref(), LogicalPlan::Union(_)) => {
-            let LogicalPlan::Union(Union { mut inputs, .. }) = unwrapped(funding, input)?
+            let LogicalPlan::Union(Union {
+                mut inputs,
+                schema: union_schema,
+            }) = unwrapped(funding, input)?
             else {
                 return internal_err!("optimize_unions: projection lost its union input");
             };
@@ -156,8 +159,8 @@ fn extract_plans_from_union(
                     Arc::clone(&schema),
                 )?))?;
             }
-            freed(funding, inputs);
-            freed(funding, expr);
+            freed(funding, (inputs, union_schema));
+            freed(funding, (expr, schema));
             Ok(())
         }
         plan => emit(plan),
@@ -186,6 +189,7 @@ mod tests {
     use crate::analyzer::type_coercion::TypeCoercion;
     use crate::assert_optimized_plan_eq_snapshot;
     use crate::funded::Freed;
+    use crate::test::unlimited_context;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::funding::PlanningFunding;
@@ -595,6 +599,28 @@ mod tests {
         assert_eq!(
             config.options().funding.outstanding(),
             flattened.data.freed_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_input_union_gives_back_its_schema() -> Result<()> {
+        let input = table_scan(Some("table"), &schema(), None)?.build()?;
+        let schema = Arc::new(input.schema().as_ref().clone());
+        let plan = LogicalPlan::Union(Union {
+            inputs: vec![Arc::new(input)],
+            schema,
+        });
+        let config = unlimited_context();
+        config.options().funding.charge(plan.freed_bytes())?;
+
+        let unwrapped = OptimizeUnions::new().rewrite(plan, &config)?;
+
+        assert!(matches!(unwrapped.data, LogicalPlan::TableScan(_)));
+        // The union's node, list and schema are given back.
+        assert_eq!(
+            config.options().funding.outstanding(),
+            unwrapped.data.freed_bytes()
         );
         Ok(())
     }

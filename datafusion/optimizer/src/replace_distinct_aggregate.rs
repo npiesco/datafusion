@@ -208,6 +208,8 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
                 }
 
                 let plan = project(plan, project_exprs.drain(..), &funding)?;
+                // The DISTINCT ON's schema is replaced by the projection's.
+                freed(&funding, schema);
 
                 Ok(Transformed::yes(plan))
             }

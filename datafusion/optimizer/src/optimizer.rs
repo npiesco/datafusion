@@ -48,7 +48,7 @@ use crate::extract_leaf_expressions::{ExtractLeafExpressions, PushDownLeafProjec
 use crate::filter_null_join_keys::FilterNullJoinKeys;
 use crate::funded::{
     apply_plan, cloned_plan, freed, has_subquery_exprs, map_inputs_mut,
-    map_subqueries_mut, with_context,
+    map_subqueries_mut, recomputed, with_context,
 };
 use crate::optimize_projections::OptimizeProjections;
 use crate::optimize_unions::OptimizeUnions;
@@ -402,7 +402,7 @@ fn rewrite_plan_in_place(
     if child_schema_changed && !with_subqueries {
         // Child rewrites can change their output schemas. Recompute the current
         // node before later rules use positional requirements from that schema.
-        *plan = std::mem::take(plan).recompute_schema()?;
+        *plan = recomputed(&funding, std::mem::take(plan))?;
     }
 
     // f_up phase

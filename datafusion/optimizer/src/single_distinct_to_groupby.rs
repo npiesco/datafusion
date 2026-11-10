@@ -329,11 +329,11 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                     outer_group_exprs,
                     outer_aggr_exprs,
                 )?);
-                Ok(Transformed::yes(project(
-                    outer_aggr,
-                    alias_expr.drain(..),
-                    &funding,
-                )?))
+                let plan = project(outer_aggr, alias_expr.drain(..), &funding)?;
+                // The aggregate's schema is replaced by the projection's.
+                drop(out_group_expr_with_alias);
+                freed(&funding, schema);
+                Ok(Transformed::yes(plan))
             }
             _ => Ok(Transformed::no(plan)),
         }

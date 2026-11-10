@@ -19,7 +19,7 @@
 
 mod required_indices;
 
-use crate::funded::freed;
+use crate::funded::{freed, recomputed};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -490,7 +490,7 @@ fn optimize_projections(
 
     // If any of the children are transformed, we need to potentially update the plan's schema
     if transformed_plan.transformed {
-        transformed_plan.map_data(|plan| plan.recompute_schema())
+        transformed_plan.map_data(|plan| recomputed(&config.funding(), plan))
     } else {
         Ok(transformed_plan)
     }
@@ -1059,7 +1059,13 @@ mod tests {
             let left_schema = left_child.schema();
             let right_schema = right_child.schema();
             let schema = Arc::new(
-                build_join_schema(left_schema, right_schema, &JoinType::Inner, &datafusion_common::funding::Funding::default()).unwrap(),
+                build_join_schema(
+                    left_schema,
+                    right_schema,
+                    &JoinType::Inner,
+                    &datafusion_common::funding::Funding::default(),
+                )
+                .unwrap(),
             );
             Self {
                 exprs: vec![],

@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::analyzer::AnalyzerRule;
 use crate::funded::{
-    Freed, HashIndex, aliased, binary, column_expr, nullable_cast,
+    Freed, HashIndex, aliased, binary, column_expr, freed, nullable_cast,
     transform_up_plan_with_subqueries,
 };
 
@@ -223,13 +223,16 @@ fn analyze_internal(
             schema,
             ..
         }) if contains_grouping_function(&aggr_expr) => {
-            Ok(Transformed::yes(replace_grouping_exprs(
+            let plan = replace_grouping_exprs(
                 funding,
                 input,
                 schema.as_ref(),
                 group_expr,
                 aggr_expr,
-            )?))
+            )?;
+            // The aggregate's schema is replaced by what the rewrite planned.
+            freed(funding, schema);
+            Ok(Transformed::yes(plan))
         }
         _ => Ok(Transformed::no(plan)),
     }
