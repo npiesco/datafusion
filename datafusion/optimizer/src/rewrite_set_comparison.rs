@@ -58,7 +58,7 @@ impl RewriteSetComparison {
             schema = schema.merge(
                 &DFSchema::try_from_qualified_schema(
                     table_name.clone(),
-                    &target.schema(),
+                    &target.schema(), &datafusion_common::funding::Funding::default(),
                 )?,
                 &datafusion_common::funding::Funding::default(),
             )?;

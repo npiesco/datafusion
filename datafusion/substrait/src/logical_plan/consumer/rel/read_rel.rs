@@ -67,6 +67,7 @@ pub async fn from_read_rel(
                 provider_as_source(Arc::clone(&provider)),
                 None,
                 filters,
+                &datafusion::common::funding::Funding::default(),
             )?
             .build()?
         };

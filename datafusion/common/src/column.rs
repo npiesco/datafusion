@@ -390,7 +390,11 @@ mod tests {
                 .map(|f| Field::new(*f, DataType::Boolean, true)),
         );
         let schema = Arc::new(schema_builder.finish());
-        DFSchema::try_from_qualified_schema(qualifier, &schema)
+        DFSchema::try_from_qualified_schema(
+            qualifier,
+            &schema,
+            &crate::funding::Funding::default(),
+        )
     }
 
     #[test]

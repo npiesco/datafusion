@@ -127,7 +127,7 @@ fn analyze_internal(
     if let LogicalPlan::TableScan(ts) = &plan {
         let source_schema = DFSchema::try_from_qualified_schema(
             ts.table_name.clone(),
-            &ts.source.schema(),
+            &ts.source.schema(), &datafusion_common::funding::Funding::default(),
         )?;
         schema = schema.merge(
             &source_schema,
@@ -146,7 +146,7 @@ fn analyze_internal(
     }) = &plan
     {
         let target_schema =
-            DFSchema::try_from_qualified_schema(table_name.clone(), &target.schema())?;
+            DFSchema::try_from_qualified_schema(table_name.clone(), &target.schema(), &datafusion_common::funding::Funding::default())?;
         schema = schema.merge(
             &target_schema,
             &datafusion_common::funding::Funding::default(),
@@ -217,7 +217,7 @@ impl<'a> TypeCoercionRewriter<'a> {
 
         let target_schema = DFSchema::try_from_qualified_schema(
             dml.table_name.clone(),
-            &dml.target.schema(),
+            &dml.target.schema(), &datafusion_common::funding::Funding::default(),
         )?;
         let mut merge_op = (**merge_op).clone();
         merge_op.on = self.coerce_predicate(merge_op.on, "MERGE ON condition")?;
@@ -1597,7 +1597,7 @@ mod test {
             schema: Arc::new(
                 DFSchema::try_from_qualified_schema(
                     TableReference::full("datafusion", "test", "foo"),
-                    &Schema::new(vec![Field::new("a", DataType::Int32, false)]),
+                    &Schema::new(vec![Field::new("a", DataType::Int32, false)]), &datafusion_common::funding::Funding::default(),
                 )
                 .unwrap(),
             ),
@@ -1607,7 +1607,7 @@ mod test {
             schema: Arc::new(
                 DFSchema::try_from_qualified_schema(
                     TableReference::full("datafusion", "test", "foo"),
-                    &Schema::new(vec![Field::new("a", DataType::Int64, false)]),
+                    &Schema::new(vec![Field::new("a", DataType::Int64, false)]), &datafusion_common::funding::Funding::default(),
                 )
                 .unwrap(),
             ),

@@ -275,7 +275,7 @@ fn optimize_projections(
             };
             let new_scan = TableScanBuilder::from(table_scan)
                 .with_projection(Some(projection))
-                .build()?;
+                .build(&datafusion_common::funding::Funding::default())?;
 
             return Transformed::yes(LogicalPlan::TableScan(new_scan))
                 .transform_data(|plan| optimize_subqueries(plan, config));

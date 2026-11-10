@@ -3613,6 +3613,7 @@ async fn roundtrip_custom_listing_tables_schema_table_scan_projection() -> Resul
         "hive_style",
         Arc::new(DefaultTableSource::new(listing_table)),
         Some(projection),
+        &datafusion_common::funding::Funding::default(),
     )?
     .limit(0, Some(1))?
     .build()?;

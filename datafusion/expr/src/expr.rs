@@ -213,7 +213,7 @@ impl From<sqlparser::ast::NullTreatment> for NullTreatment {
 ///     Field::new("c2", DataType::Float64, false),
 /// ]);
 /// // DFSchema is a an Arrow schema with optional relation name
-/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema).unwrap();
+/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema, &datafusion_common::funding::Funding::default()).unwrap();
 ///
 /// // Form Vec<Expr> with an expression for each column in the schema
 /// let exprs: Vec<_> = df_schema.iter().map(Expr::from).collect();

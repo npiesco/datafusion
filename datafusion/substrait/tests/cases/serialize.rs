@@ -96,7 +96,13 @@ mod tests {
     async fn table_scan_without_projection() -> Result<()> {
         let ctx = create_context().await?;
         let table = provider_as_source(ctx.table_provider("data").await?);
-        let table_scan = LogicalPlanBuilder::scan("data", table, None)?.build()?;
+        let table_scan = LogicalPlanBuilder::scan(
+            "data",
+            table,
+            None,
+            &datafusion::common::funding::Funding::default(),
+        )?
+        .build()?;
         let convert_result = to_substrait_plan(&table_scan, &ctx.state());
         assert!(convert_result.is_ok());
 

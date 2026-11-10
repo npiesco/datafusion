@@ -374,6 +374,7 @@ impl ContextWithParquet {
             "t",
             provider_as_source(self.provider.clone()),
             None,
+            &datafusion_common::funding::Funding::default(),
         )
         .unwrap()
         .filter(expr)

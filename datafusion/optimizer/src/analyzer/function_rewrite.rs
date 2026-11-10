@@ -56,7 +56,7 @@ impl ApplyFunctionRewrites {
         if let LogicalPlan::TableScan(ts) = &plan {
             let source_schema = DFSchema::try_from_qualified_schema(
                 ts.table_name.clone(),
-                &ts.source.schema(),
+                &ts.source.schema(), &datafusion_common::funding::Funding::default(),
             )?;
             schema = schema.merge(
                 &source_schema,
@@ -76,7 +76,7 @@ impl ApplyFunctionRewrites {
         {
             let target_schema = DFSchema::try_from_qualified_schema(
                 table_name.clone(),
-                &target.schema(),
+                &target.schema(), &datafusion_common::funding::Funding::default(),
             )?;
             schema = schema.merge(
                 &target_schema,

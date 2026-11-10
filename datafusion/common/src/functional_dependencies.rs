@@ -200,40 +200,40 @@ impl FunctionalDependencies {
         Self { deps: dependencies }
     }
 
-    /// Creates a new `FunctionalDependencies` object from the given constraints.
+    /// Creates a new `FunctionalDependencies` object from the given constraints, every list
+    /// it makes charged to `funding` before it is made.
     pub fn new_from_constraints(
         constraints: Option<&Constraints>,
         n_field: usize,
-    ) -> Self {
-        if let Some(Constraints { inner: constraints }) = constraints {
-            // Construct dependency objects based on each individual constraint:
-            let dependencies = constraints
-                .iter()
-                .map(|constraint| {
-                    // All the field indices are associated with the whole table
-                    // since we are dealing with table level constraints:
-                    let dependency = match constraint {
-                        Constraint::PrimaryKey(indices) => FunctionalDependence::new(
-                            indices.to_vec(),
-                            (0..n_field).collect::<Vec<_>>(),
-                            false,
-                        ),
-                        Constraint::Unique(indices) => FunctionalDependence::new(
-                            indices.to_vec(),
-                            (0..n_field).collect::<Vec<_>>(),
-                            true,
-                        ),
-                    };
-                    // As primary keys are guaranteed to be unique, set the
-                    // functional dependency mode to `Dependency::Single`:
-                    dependency.with_mode(Dependency::Single)
-                })
-                .collect::<Vec<_>>();
-            Self::new(dependencies)
-        } else {
+        funding: &Funding,
+    ) -> Result<Self> {
+        let Some(Constraints { inner: constraints }) = constraints else {
             // There is no constraint, return an empty object:
-            Self::empty()
+            return Ok(Self::empty());
+        };
+        // Construct dependency objects based on each individual constraint:
+        let mut dependencies = funding.vec_with_capacity(constraints.len())?;
+        for constraint in constraints {
+            let (indices, nullable) = match constraint {
+                Constraint::PrimaryKey(indices) => (indices, false),
+                Constraint::Unique(indices) => (indices, true),
+            };
+            // All the field indices are associated with the whole table
+            // since we are dealing with table level constraints:
+            let mut targets = funding.vec_with_capacity(n_field)?;
+            targets.extend(0..n_field);
+            // As primary keys are guaranteed to be unique, set the
+            // functional dependency mode to `Dependency::Single`:
+            dependencies.push(
+                FunctionalDependence::new(
+                    funding.vec_from_slice(indices)?,
+                    targets,
+                    nullable,
+                )
+                .with_mode(Dependency::Single),
+            );
         }
+        Ok(Self::new(dependencies))
     }
 
     pub fn with_dependency(mut self, mode: Dependency) -> Self {

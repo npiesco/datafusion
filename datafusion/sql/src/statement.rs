@@ -32,6 +32,7 @@ use crate::utils::normalize_ident;
 use arrow::datatypes::{Field, FieldRef, Fields};
 use datafusion_common::error::_plan_err;
 use datafusion_common::format::ExplainStatementOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
@@ -1691,8 +1692,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let table_ref = self.object_name_to_table_reference(object_name)?;
                 let table_source =
                     self.context_provider.get_table_source(table_ref.clone())?;
-                let plan =
-                    LogicalPlanBuilder::scan(table_name, table_source, None)?.build()?;
+                let plan = LogicalPlanBuilder::scan(
+                    table_name,
+                    table_source,
+                    None,
+                    &Funding::default(),
+                )?
+                .build()?;
                 let input_schema = Arc::clone(plan.schema());
                 (plan, input_schema, Some(table_ref))
             }
@@ -2271,10 +2277,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let schema = DFSchema::try_from_qualified_schema(
             table_ref.clone(),
             &table_source.schema(),
+            &Funding::default(),
         )?;
-        let scan =
-            LogicalPlanBuilder::scan(table_ref.clone(), Arc::clone(&table_source), None)?
-                .build()?;
+        let scan = LogicalPlanBuilder::scan(
+            table_ref.clone(),
+            Arc::clone(&table_source),
+            None,
+            &Funding::default(),
+        )?
+        .build()?;
         let mut planner_context = PlannerContext::new();
 
         let mut source = match predicate_expr {
@@ -2330,6 +2341,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let table_schema = Arc::new(DFSchema::try_from_qualified_schema(
             table_name.clone(),
             &table_source.schema(),
+            &Funding::default(),
         )?);
 
         // Overwrite with assignment expressions
@@ -2505,6 +2517,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let target_schema = Arc::new(DFSchema::try_from_qualified_schema(
             target_qualifier.clone(),
             &target_table_source.schema(),
+            &Funding::default(),
         )?);
 
         // 2. Plan the source (USING clause) as a LogicalPlan

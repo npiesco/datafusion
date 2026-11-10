@@ -92,7 +92,12 @@ async fn roundtrip_qualified_schema() -> Result<()> {
     let sql = "a < 5 OR a = 8";
     let expr = col("t.a").lt(lit(5_i64)).or(col("t.a").eq(lit(8_i64)));
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
-    let df_schema = DFSchema::try_from_qualified_schema("t", &schema).unwrap();
+    let df_schema = DFSchema::try_from_qualified_schema(
+        "t",
+        &schema,
+        &datafusion_common::funding::Funding::default(),
+    )
+    .unwrap();
     let ctx = SessionContext::new();
     let parsed_expr = ctx.parse_sql_expr(sql, &df_schema)?;
     assert_eq!(parsed_expr, expr);

@@ -121,7 +121,13 @@ fn inline_scan_projection_test() -> Result<()> {
     );
     let source = provider_as_source(Arc::new(provider));
 
-    let plan = LogicalPlanBuilder::scan(name, source, Some(projection))?.build()?;
+    let plan = LogicalPlanBuilder::scan(
+        name,
+        source,
+        Some(projection),
+        &datafusion_common::funding::Funding::default(),
+    )?
+    .build()?;
 
     assert_snapshot!(
         format!("{plan}"),

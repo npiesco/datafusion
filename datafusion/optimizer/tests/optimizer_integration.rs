@@ -764,7 +764,7 @@ fn extension_node_does_not_block_projection_pruning() -> Result<()> {
         None,
     );
 
-    let plan = LogicalPlanBuilder::scan("t", table_source, None)?
+    let plan = LogicalPlanBuilder::scan("t", table_source, None, &datafusion_common::funding::Funding::default())?
         .project(vec![col("t.a"), ts_cast.alias_qualified(Some("t"), "ts")])?
         .filter(
             col("t.ts")

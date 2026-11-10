@@ -98,6 +98,7 @@ async fn search_accounts(
         provider_as_source(Arc::new(db)),
         None,
         vec![],
+        &datafusion::common::funding::Funding::default(),
     )?
     .build()?;
 

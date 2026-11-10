@@ -91,7 +91,7 @@ impl SimplifyExpressions {
             let schema = schema.merge(
                 &DFSchema::try_from_qualified_schema(
                     table_name.clone(),
-                    &target.schema(),
+                    &target.schema(), &datafusion_common::funding::Funding::default(),
                 )?,
                 &datafusion_common::funding::Funding::default(),
             )?;
@@ -114,7 +114,7 @@ impl SimplifyExpressions {
             // projection applied for simplification
             Arc::new(DFSchema::try_from_qualified_schema(
                 scan.table_name.clone(),
-                &scan.source.schema(),
+                &scan.source.schema(), &datafusion_common::funding::Funding::default(),
             )?)
         } else {
             Arc::new(DFSchema::empty())
