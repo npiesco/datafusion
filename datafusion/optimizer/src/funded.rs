@@ -36,11 +36,13 @@
 //! What is freed is given back through the handle the plan was charged through: a plan
 //! handed to the optimizer is charged on the handle it optimizes within.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::cloned::CloneBytes;
-use datafusion_common::funding::{Funding, arc_bytes};
+use datafusion_common::funding::{Funding, Held, arc_bytes};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, RecursionUnnestOption, Result,
@@ -60,7 +62,7 @@ use datafusion_expr::logical_plan::{
     RecursiveQuery, Repartition, Sort as SortPlan, Statement, Subquery, SubqueryAlias,
     TableScan, Union, Unnest, Values, Window,
 };
-use datafusion_expr::{Expr, WindowFrame, WindowFrameBound, WriteOp};
+use datafusion_expr::{Expr, Operator, WindowFrame, WindowFrameBound, WriteOp};
 
 fn sum(parts: impl IntoIterator<Item = usize>) -> usize {
     parts.into_iter().fold(0, usize::saturating_add)
@@ -530,6 +532,226 @@ pub(crate) fn aliased(
         name: name.to_owned(),
         metadata: None,
     }))
+}
+
+/// `left op right`, its two boxes charged before they are made.
+pub(crate) fn binary(
+    funding: &Funding,
+    left: Expr,
+    op: Operator,
+    right: Expr,
+) -> Result<Expr> {
+    funding.charge(sum([size_of::<Expr>(), size_of::<Expr>()]))?;
+    Ok(Expr::BinaryExpr(BinaryExpr::new(
+        Box::new(left),
+        op,
+        Box::new(right),
+    )))
+}
+
+/// `left AND right`, its boxes charged first.
+pub(crate) fn conjoined(funding: &Funding, left: Expr, right: Expr) -> Result<Expr> {
+    binary(funding, left, Operator::And, right)
+}
+
+/// `left OR right`, its boxes charged first.
+pub(crate) fn disjoined(funding: &Funding, left: Expr, right: Expr) -> Result<Expr> {
+    binary(funding, left, Operator::Or, right)
+}
+
+/// `NOT expr` as [`std::ops::Not`] makes it: a negatable expression flipped in place, any
+/// other boxed, its box charged first.
+pub(crate) fn negated(funding: &Funding, expr: Expr) -> Result<Expr> {
+    Ok(match expr {
+        Expr::Like(_)
+        | Expr::SimilarTo(_)
+        | Expr::InList(_)
+        | Expr::Exists(_)
+        | Expr::InSubquery(_) => std::ops::Not::not(expr),
+        _ => Expr::Not(funding.boxed(expr)?),
+    })
+}
+
+/// What `keep` boxes, moved out of its box, and `dropped` freed: the box and what `dropped`
+/// held given back.
+pub(crate) fn kept<T: Freed>(funding: &Funding, keep: Box<Expr>, dropped: T) -> Expr {
+    freed(funding, dropped);
+    funding.unboxed(keep)
+}
+
+/// `made`, in place of `old`: what `old` held given back.
+pub(crate) fn replaced<T: Freed>(funding: &Funding, old: T, made: Expr) -> Expr {
+    freed(funding, old);
+    made
+}
+
+/// Whether `f` holds for any conjunct of `expr` (`A AND B AND C` gives `A`, `B` and `C`,
+/// aliases looked through), in order, found without allocating.
+pub(crate) fn any_conjunct<'a>(
+    expr: &'a Expr,
+    f: &mut impl FnMut(&'a Expr) -> bool,
+) -> bool {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => any_conjunct(left, f) || any_conjunct(right, f),
+        Expr::Alias(Alias { expr, .. }) => any_conjunct(expr, f),
+        other => f(other),
+    }
+}
+
+/// The conjuncts of `expr` ([`any_conjunct`]), in a list charged as it grows.
+pub(crate) fn conjuncts<'a>(
+    funding: &Funding,
+    expr: &'a Expr,
+) -> Result<Held<Vec<&'a Expr>>> {
+    let mut list = funding.held();
+    let mut refused = Ok(());
+    any_conjunct(expr, &mut |conjunct| {
+        refused = list.push(conjunct);
+        refused.is_err()
+    });
+    refused.map(|()| list)
+}
+
+/// The conjuncts of `expr`, moved out of it: the boxes and alias names that held them
+/// given back, the list they are moved into charged as it grows.
+pub(crate) fn conjuncts_owned(funding: &Funding, expr: Expr) -> Result<Held<Vec<Expr>>> {
+    fn push(funding: &Funding, expr: Expr, list: &mut Held<Vec<Expr>>) -> Result<()> {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::And,
+                right,
+            }) => {
+                push(funding, funding.unboxed(left), list)?;
+                push(funding, funding.unboxed(right), list)
+            }
+            Expr::Alias(Alias { expr, name, .. }) => {
+                freed(funding, name);
+                push(funding, funding.unboxed(expr), list)
+            }
+            other => list.push(other),
+        }
+    }
+    let mut list = funding.held();
+    push(funding, expr, &mut list)?;
+    Ok(list)
+}
+
+/// `exprs` joined by `op` from the left (`(A op B) op C`), each join's boxes charged first;
+/// `None` if there are none. The list's block is given back with it.
+pub(crate) fn joined(
+    funding: &Funding,
+    mut exprs: Held<Vec<Expr>>,
+    op: Operator,
+) -> Result<Option<Expr>> {
+    let mut joined = None;
+    for expr in exprs.drain(..) {
+        joined = Some(match joined {
+            None => expr,
+            Some(acc) => binary(funding, acc, op, expr)?,
+        });
+    }
+    Ok(joined)
+}
+
+/// What a null of `data_type` boxes: a dictionary's key type and value, a run-end encoded
+/// value.
+fn null_bytes(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Dictionary(key_type, value_type) => sum([
+            key_type.clone_bytes(),
+            size_of::<ScalarValue>(),
+            null_bytes(value_type),
+        ]),
+        DataType::RunEndEncoded(_, value_field) => sum([
+            size_of::<ScalarValue>(),
+            null_bytes(value_field.data_type()),
+        ]),
+        _ => 0,
+    }
+}
+
+/// A null of `data_type`, its boxes charged before they are made. A nested type's null is
+/// an array arrow allocates, held shared ([`Freed`] for [`ScalarValue`]).
+pub(crate) fn null_of(funding: &Funding, data_type: &DataType) -> Result<ScalarValue> {
+    funding.charge(null_bytes(data_type))?;
+    ScalarValue::try_new_null(data_type)
+}
+
+/// `list` with only the first of the items equal to each other, the rest freed and given
+/// back, found through a [`HashIndex`].
+pub(crate) fn deduplicated<T: Hash + Eq + Freed>(
+    funding: &Funding,
+    list: &mut Vec<T>,
+) -> Result<()> {
+    let mut firsts = funding.held::<Vec<bool>>();
+    {
+        let index = HashIndex::new(funding, list)?;
+        firsts.reserve_exact(list.len())?;
+        // Room for each is charged: extending allocates nothing.
+        firsts.extend((0..list.len()).map(|at| index.is_first(at)));
+    }
+    let mut at = 0;
+    list.retain(|item| {
+        let first = firsts[at];
+        at += 1;
+        if !first {
+            funding.discharge(item.freed_bytes());
+        }
+        first
+    });
+    Ok(())
+}
+
+fn hash_of<T: Hash>(item: &T) -> u64 {
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(item)
+}
+
+/// The items of a list found by their hashes, in place of a hash set: each item's hash
+/// with where it is, sorted, in a list of their number charged before it is made.
+pub(crate) struct HashIndex<'a, T> {
+    items: &'a [T],
+    hashes: Held<Vec<(u64, usize)>>,
+}
+
+impl<'a, T: Hash + Eq> HashIndex<'a, T> {
+    pub(crate) fn new(funding: &Funding, items: &'a [T]) -> Result<Self> {
+        let mut hashes = funding.held();
+        hashes.reserve_exact(items.len())?;
+        // Room for each is charged: extending allocates nothing.
+        hashes.extend(
+            items
+                .iter()
+                .enumerate()
+                .map(|(at, item)| (hash_of(item), at)),
+        );
+        hashes.sort_unstable();
+        Ok(Self { items, hashes })
+    }
+
+    /// Where the first item equal to `item` is.
+    pub(crate) fn position(&self, item: &T) -> Option<usize> {
+        let hash = hash_of(item);
+        let start = self.hashes.partition_point(|(other, _)| *other < hash);
+        self.hashes[start..]
+            .iter()
+            .take_while(|(other, _)| *other == hash)
+            .map(|(_, at)| *at)
+            .find(|at| self.items[*at] == *item)
+    }
+
+    pub(crate) fn contains(&self, item: &T) -> bool {
+        self.position(item).is_some()
+    }
+
+    /// Whether the item at `at` is the first of those equal to it.
+    pub(crate) fn is_first(&self, at: usize) -> bool {
+        self.position(&self.items[at]) == Some(at)
+    }
 }
 
 /// An empty relation of `schema`'s rows, `plan` (what it replaces) freed and given back.
