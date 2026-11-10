@@ -25,6 +25,7 @@ use arrow::array::{Array, RecordBatch, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::TableReference;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, Result, ScalarValue};
 use datafusion_expr::execution_props::ExecutionProps;
@@ -246,7 +247,9 @@ fn evaluate_expr_with_null_column<'a>(
 }
 
 fn coerce(expr: Expr, schema: &DFSchema) -> Result<Expr> {
-    let mut expr_rewrite = TypeCoercionRewriter { schema };
+    // The predicate is evaluated here and dropped: nothing coercing it makes is kept.
+    let funding = Funding::default();
+    let mut expr_rewrite = TypeCoercionRewriter::new(schema, &funding);
     expr.rewrite(&mut expr_rewrite).data()
 }
 

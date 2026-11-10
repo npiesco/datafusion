@@ -827,6 +827,24 @@ pub(crate) fn merged_with(
     Ok((merged, bytes))
 }
 
+/// What dropping `expr` frees, but for the plans of its subqueries: those are charged as
+/// they are rewritten, on their own.
+pub(crate) fn freed_bytes_outside_subqueries(expr: &Expr) -> usize {
+    let mut bytes = expr.freed_bytes();
+    // Visiting expressions only, never the plans of their subqueries.
+    let _ = expr.apply(|e| {
+        if let Expr::Exists(Exists { subquery, .. })
+        | Expr::ScalarSubquery(subquery)
+        | Expr::InSubquery(InSubquery { subquery, .. })
+        | Expr::SetComparison(SetComparison { subquery, .. }) = e
+        {
+            bytes = bytes.saturating_sub(subquery.subquery.freed_bytes());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    bytes
+}
+
 /// What a value held `before` and holds `after` it was changed by code that allocates on its
 /// own: the difference charged or given back once it is made.
 pub(crate) fn rebalanced(funding: &Funding, before: usize, after: usize) -> Result<()> {
