@@ -226,33 +226,43 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     /// Generate a logical plan from an DataFusion SQL statement
+    ///
+    /// What planning allocates is charged to [`SqlToRel::funding`] before it is made: the plan
+    /// holds what is charged since, and a failed planning keeps nothing charged.
     pub fn statement_to_plan(&self, statement: DFStatement) -> Result<LogicalPlan> {
-        match statement {
+        self.funded(|| match statement {
             DFStatement::CreateExternalTable(s) => self.external_table_to_plan(s),
-            DFStatement::Statement(s) => self.sql_statement_to_plan(*s),
+            DFStatement::Statement(s) => self
+                .sql_statement_to_plan_with_context_impl(*s, &mut PlannerContext::new()),
             DFStatement::CopyTo(s) => self.copy_to_plan(s),
             DFStatement::Explain(ExplainStatement { options, statement }) => {
                 self.explain_to_plan(options, *statement)
             }
             DFStatement::Reset(statement) => self.reset_statement_to_plan(statement),
-        }
+        })
     }
 
-    /// Generate a logical plan from an SQL statement
+    /// Generate a logical plan from an SQL statement, charged as
+    /// [`SqlToRel::statement_to_plan`] charges it.
     pub fn sql_statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
-        self.sql_statement_to_plan_with_context_impl(
-            statement,
-            &mut PlannerContext::new(),
-        )
+        self.funded(|| {
+            self.sql_statement_to_plan_with_context_impl(
+                statement,
+                &mut PlannerContext::new(),
+            )
+        })
     }
 
-    /// Generate a logical plan from an SQL statement
+    /// Generate a logical plan from an SQL statement, charged as
+    /// [`SqlToRel::statement_to_plan`] charges it.
     pub fn sql_statement_to_plan_with_context(
         &self,
         statement: Statement,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        self.sql_statement_to_plan_with_context_impl(statement, planner_context)
+        self.funded(|| {
+            self.sql_statement_to_plan_with_context_impl(statement, planner_context)
+        })
     }
 
     fn sql_statement_to_plan_with_context_impl(

@@ -256,8 +256,8 @@ impl IdentNormalizer {
 #[derive(Debug, Clone)]
 pub struct PlannerContext {
     /// Data types for numbered parameters ($1, $2, etc), if supplied
-    /// in `PREPARE` statement
-    prepare_param_data_types: Arc<Vec<Option<FieldRef>>>,
+    /// in `PREPARE` statement: none, without allocating for them
+    prepare_param_data_types: Option<Arc<Vec<Option<FieldRef>>>>,
     /// Map of CTE name to logical plan of the WITH clause.
     /// Use `Arc<LogicalPlan>` to allow cheap cloning
     ctes: HashMap<String, Arc<LogicalPlan>>,
@@ -288,7 +288,7 @@ impl PlannerContext {
     /// Create an empty PlannerContext
     pub fn new() -> Self {
         Self {
-            prepare_param_data_types: Arc::new(vec![]),
+            prepare_param_data_types: None,
             ctes: HashMap::new(),
             outer_queries_schemas_stack: vec![],
             outer_from_schema: None,
@@ -303,7 +303,7 @@ impl PlannerContext {
         mut self,
         prepare_param_data_types: Vec<Option<FieldRef>>,
     ) -> Self {
-        self.prepare_param_data_types = prepare_param_data_types.into();
+        self.prepare_param_data_types = Some(prepare_param_data_types.into());
         self
     }
 
@@ -382,7 +382,9 @@ impl PlannerContext {
 
     /// Return the types of parameters (`$1`, `$2`, etc) if known
     pub fn prepare_param_data_types(&self) -> &[Option<FieldRef>] {
-        &self.prepare_param_data_types
+        self.prepare_param_data_types
+            .as_deref()
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Returns true if there is a Common Table Expression (CTE) /
@@ -485,6 +487,19 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// The funding what this planner allocates is charged to ([`ContextProvider::funding`]).
     pub fn funding(&self) -> &datafusion_common::funding::Funding {
         self.context_provider.funding()
+    }
+
+    /// What `plan` makes, charged to [`SqlToRel::funding`]. Planned, the plan holds what the
+    /// funding has outstanding since; failed, all it made has been freed with the attempt,
+    /// and is given back.
+    pub(crate) fn funded<T>(&self, plan: impl FnOnce() -> Result<T>) -> Result<T> {
+        let funding = self.funding();
+        let before = funding.outstanding();
+        let planned = plan();
+        if planned.is_err() {
+            funding.unwound(before);
+        }
+        planned
     }
 
     pub(crate) fn add_warning(&self, warning: Diagnostic) {
