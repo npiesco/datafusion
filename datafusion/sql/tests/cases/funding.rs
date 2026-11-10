@@ -25,18 +25,19 @@ use datafusion_sql::planner::SqlToRel;
 
 use crate::common::{MockContextProvider, MockSessionState};
 
-/// Funding that refuses what would take it past `limit`, and keeps count of what it holds.
+/// Funding that refuses what would take it past `limit`, and keeps count of what it holds and
+/// the most it held at once.
 struct Limited {
     limit: usize,
-    held: Mutex<usize>,
+    held: Mutex<(usize, usize)>,
 }
 
 impl PlanningFunding for Limited {
     fn charge(&self, bytes: usize) -> bool {
         let mut held = self.held.lock().unwrap();
-        match held.checked_add(bytes) {
+        match held.0.checked_add(bytes) {
             Some(total) if total <= self.limit => {
-                *held = total;
+                *held = (total, held.1.max(total));
                 true
             }
             _ => false,
@@ -45,17 +46,19 @@ impl PlanningFunding for Limited {
 
     fn discharge(&self, bytes: usize) {
         let mut held = self.held.lock().unwrap();
-        *held = held
+        held.0 = held
+            .0
             .checked_sub(bytes)
             .expect("discharged more than was charged");
     }
 }
 
-/// `sql` planned within funding of `limit` bytes, and what the funding holds after.
-fn plan_within(sql: &str, limit: usize) -> (Result<LogicalPlan>, usize) {
+/// `sql` planned within funding of `limit` bytes, what the funding holds after, and the most it
+/// held while planning.
+fn plan_within(sql: &str, limit: usize) -> (Result<LogicalPlan>, usize, usize) {
     let source = Arc::new(Limited {
         limit,
-        held: Mutex::new(0),
+        held: Mutex::new((0, 0)),
     });
     let mut state = MockSessionState::default();
     state.config_options.funding =
@@ -64,19 +67,20 @@ fn plan_within(sql: &str, limit: usize) -> (Result<LogicalPlan>, usize) {
     let planner = SqlToRel::new(&context);
     let mut statements = DFParser::parse_sql(sql).unwrap();
     let plan = planner.statement_to_plan(statements.pop_front().unwrap());
-    let held = *source.held.lock().unwrap();
-    (plan, held)
+    let (held, peak) = *source.held.lock().unwrap();
+    (plan, held, peak)
 }
 
-/// Planning `sql` charges exactly what the plan holds: within any less it is refused, and
-/// nothing stays charged; within that much it is planned.
+/// Planning `sql` is charged all it makes: within less than the most it held at once it is
+/// refused, nothing staying charged; within that much it is planned, holding what the plan
+/// keeps.
 fn assert_funded(sql: &str) {
-    let (plan, needed) = plan_within(sql, usize::MAX);
+    let (plan, kept, needed) = plan_within(sql, usize::MAX);
     let plan = plan.unwrap();
-    assert!(needed > 0, "planning {sql} charged nothing");
+    assert!(kept > 0, "the plan of {sql} keeps nothing charged");
 
     for limit in 0..needed {
-        let (refused, held) = plan_within(sql, limit);
+        let (refused, held, _) = plan_within(sql, limit);
         let err = refused.expect_err("planned within less than it needs");
         assert!(
             err.refused().is_some(),
@@ -88,9 +92,9 @@ fn assert_funded(sql: &str) {
         );
     }
 
-    let (funded, held) = plan_within(sql, needed);
+    let (funded, held, _) = plan_within(sql, needed);
     assert_eq!(funded.unwrap(), plan);
-    assert_eq!(held, needed);
+    assert_eq!(held, kept);
 }
 
 #[test]
