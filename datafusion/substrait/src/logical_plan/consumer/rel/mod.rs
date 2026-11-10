@@ -108,7 +108,11 @@ fn apply_emit_kind(
                     }
 
                     let input = Arc::unwrap_or_clone(proj.input);
-                    project(input, exprs)
+                    project(
+                        input,
+                        exprs,
+                        &datafusion::common::funding::Funding::default(),
+                    )
                 }
                 // Otherwise we just handle the output_mapping as a projection
                 _ => {
@@ -123,7 +127,11 @@ fn apply_emit_kind(
                         exprs.push(expr);
                     }
 
-                    project(plan, exprs)
+                    project(
+                        plan,
+                        exprs,
+                        &datafusion::common::funding::Funding::default(),
+                    )
                 }
             }
         }

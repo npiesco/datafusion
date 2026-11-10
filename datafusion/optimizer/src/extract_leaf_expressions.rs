@@ -483,13 +483,13 @@ fn build_recovery_projection(
                 );
             }
         }
-        let projection = Projection::try_new(proj_exprs, Arc::new(input))?;
+        let projection = Projection::try_new(proj_exprs, Arc::new(input), &datafusion_common::funding::Funding::default())?;
         Ok(LogicalPlan::Projection(projection))
     } else {
         // Schema-preserving nodes: new schema has extra extraction columns.
         // Original columns still exist by name; select them to hide extras.
         let col_exprs: Vec<Expr> = original_schema.iter().map(Expr::from).collect();
-        let projection = Projection::try_new(col_exprs, Arc::new(input))?;
+        let projection = Projection::try_new(col_exprs, Arc::new(input), &datafusion_common::funding::Funding::default())?;
         Ok(LogicalPlan::Projection(projection))
     }
 }
@@ -662,7 +662,7 @@ fn build_extraction_projection_impl(
             // If resolved to non-column expr, it's already computed by existing projection
         }
 
-        Projection::try_new(proj_exprs, Arc::clone(&existing.input))
+        Projection::try_new(proj_exprs, Arc::clone(&existing.input), &datafusion_common::funding::Funding::default())
     } else {
         // Build new projection with extracted expressions + all input columns
         let mut proj_exprs = Vec::new();
@@ -672,7 +672,7 @@ fn build_extraction_projection_impl(
         for (qualifier, field) in target_schema.iter() {
             proj_exprs.push(Expr::from((qualifier, field)));
         }
-        Projection::try_new(proj_exprs, Arc::clone(target))
+        Projection::try_new(proj_exprs, Arc::clone(target), &datafusion_common::funding::Funding::default())
     }
 }
 
@@ -969,7 +969,7 @@ fn split_and_push_projection(
     if needs_recovery {
         let recovery = LogicalPlan::Projection(Projection::try_new(
             recovery_exprs,
-            Arc::new(base_plan),
+            Arc::new(base_plan), &datafusion_common::funding::Funding::default(),
         )?);
         Ok(Some(recovery))
     } else {

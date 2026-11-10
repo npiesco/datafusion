@@ -23,6 +23,8 @@ use std::ops::Deref;
 use std::vec::IntoIter;
 
 use crate::cloned::CloneBytes;
+use crate::error::Result;
+use crate::funding::Funding;
 use crate::utils::{merge_and_order_indices, set_difference};
 use crate::{DFSchema, HashSet, JoinType};
 
@@ -296,8 +298,9 @@ impl FunctionalDependencies {
         // The argument `n_out` denotes the schema field length, which is needed
         // to correctly associate a `Single`-mode dependence with the whole table.
         n_out: usize,
-    ) -> FunctionalDependencies {
-        let mut projected_func_dependencies = vec![];
+        funding: &Funding,
+    ) -> Result<FunctionalDependencies> {
+        let mut projected_func_dependencies = Vec::new();
         for FunctionalDependence {
             source_indices,
             target_indices,
@@ -306,27 +309,31 @@ impl FunctionalDependencies {
         } in &self.deps
         {
             let new_source_indices =
-                update_elements_with_matching_indices(source_indices, proj_indices);
-            let new_target_indices = if *mode == Dependency::Single {
-                // Associate with all of the fields in the schema:
-                (0..n_out).collect()
-            } else {
-                // Update associations according to projection:
-                update_elements_with_matching_indices(target_indices, proj_indices)
-            };
+                matching_indices(source_indices, proj_indices, funding)?;
             // All of the composite indices should still be valid after projection;
             // otherwise, functional dependency cannot be propagated.
-            if new_source_indices.len() == source_indices.len() {
-                let new_func_dependence = FunctionalDependence::new(
-                    new_source_indices,
-                    new_target_indices,
-                    *nullable,
-                )
-                .with_mode(*mode);
-                projected_func_dependencies.push(new_func_dependence);
+            if new_source_indices.len() != source_indices.len() {
+                funding.released(new_source_indices);
+                continue;
             }
+            let new_target_indices = if *mode == Dependency::Single {
+                // Associate with all of the fields in the schema:
+                let mut all = funding.vec_with_capacity(n_out)?;
+                all.extend(0..n_out);
+                all
+            } else {
+                // Update associations according to projection:
+                matching_indices(target_indices, proj_indices, funding)?
+            };
+            let new_func_dependence = FunctionalDependence::new(
+                new_source_indices,
+                new_target_indices,
+                *nullable,
+            )
+            .with_mode(*mode);
+            funding.push(&mut projected_func_dependencies, new_func_dependence)?;
         }
-        FunctionalDependencies::new(projected_func_dependencies)
+        Ok(FunctionalDependencies::new(projected_func_dependencies))
     }
 
     /// This function joins this set of functional dependencies with the `other`
@@ -652,6 +659,25 @@ fn update_elements_with_matching_indices(
         .collect()
 }
 
+/// The positions in `proj_indices` of the `entries` it holds, listed through `funding`.
+fn matching_indices(
+    entries: &[usize],
+    proj_indices: &[usize],
+    funding: &Funding,
+) -> Result<Vec<usize>> {
+    let matching = entries
+        .iter()
+        .filter(|val| proj_indices.contains(val))
+        .count();
+    let mut indices = funding.vec_with_capacity(matching)?;
+    indices.extend(
+        entries
+            .iter()
+            .filter_map(|val| proj_indices.iter().position(|proj_idx| proj_idx == val)),
+    );
+    Ok(indices)
+}
+
 /// Adds `offset` value to each entry inside `in_data`.
 fn add_offset_to_vec<T: Copy + std::ops::Add<Output = T>>(
     in_data: &[T],
@@ -732,7 +758,9 @@ mod tests {
                 vec![0, 1, 2],
                 true,
             )]);
-        let res = fund_dependencies.project_functional_dependencies(&[1, 2], 2);
+        let res = fund_dependencies
+            .project_functional_dependencies(&[1, 2], 2, &Funding::default())
+            .unwrap();
         let expected = FunctionalDependencies::new(vec![FunctionalDependence::new(
             vec![0],
             vec![0, 1],

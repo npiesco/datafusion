@@ -2416,10 +2416,30 @@ fn test_unparse_optimized_multi_union() -> Result<()> {
 
     let plan = LogicalPlan::Union(Union {
         inputs: vec![
-            project(empty.clone(), vec![lit(1).alias("x"), lit("a").alias("y")])?.into(),
-            project(empty.clone(), vec![lit(1).alias("x"), lit("b").alias("y")])?.into(),
-            project(empty.clone(), vec![lit(2).alias("x"), lit("a").alias("y")])?.into(),
-            project(empty.clone(), vec![lit(2).alias("x"), lit("c").alias("y")])?.into(),
+            project(
+                empty.clone(),
+                vec![lit(1).alias("x"), lit("a").alias("y")],
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .into(),
+            project(
+                empty.clone(),
+                vec![lit(1).alias("x"), lit("b").alias("y")],
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .into(),
+            project(
+                empty.clone(),
+                vec![lit(2).alias("x"), lit("a").alias("y")],
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .into(),
+            project(
+                empty.clone(),
+                vec![lit(2).alias("x"), lit("c").alias("y")],
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .into(),
         ],
         schema: dfschema.clone(),
     });
@@ -2430,7 +2450,12 @@ fn test_unparse_optimized_multi_union() -> Result<()> {
 
     let plan = LogicalPlan::Union(Union {
         inputs: vec![
-            project(empty.clone(), vec![lit(1).alias("x"), lit("a").alias("y")])?.into(),
+            project(
+                empty.clone(),
+                vec![lit(1).alias("x"), lit("a").alias("y")],
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .into(),
         ],
         schema: dfschema.clone(),
     });

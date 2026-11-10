@@ -919,7 +919,7 @@ impl MyAnalyzerRule {
                     let expr = Self::analyze_expr(projection.expr.clone())?;
                     Transformed::yes(LogicalPlan::Projection(Projection::try_new(
                         expr,
-                        projection.input,
+                        projection.input, &datafusion::common::funding::Funding::default(),
                     )?))
                 }
                 _ => Transformed::no(plan),

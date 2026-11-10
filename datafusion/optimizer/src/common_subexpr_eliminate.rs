@@ -380,7 +380,7 @@ impl CommonSubexprEliminate {
                             new_group_expr,
                             agg_exprs,
                         )?);
-                        Projection::try_new(proj_exprs, Arc::new(agg))
+                        Projection::try_new(proj_exprs, Arc::new(agg), &datafusion_common::funding::Funding::default())
                             .map(|p| Transformed::yes(LogicalPlan::Projection(p)))
                     }
 
@@ -803,7 +803,7 @@ fn build_common_expr_project_plan(
         }
     }
 
-    Projection::try_new(project_exprs, Arc::new(input)).map(LogicalPlan::Projection)
+    Projection::try_new(project_exprs, Arc::new(input), &datafusion_common::funding::Funding::default()).map(LogicalPlan::Projection)
 }
 
 /// Build the projection plan to eliminate unnecessary columns produced by
@@ -816,7 +816,7 @@ fn build_recover_project_plan(
     input: LogicalPlan,
 ) -> Result<LogicalPlan> {
     let col_exprs = schema.iter().map(Expr::from).collect();
-    Projection::try_new(col_exprs, Arc::new(input)).map(LogicalPlan::Projection)
+    Projection::try_new(col_exprs, Arc::new(input), &datafusion_common::funding::Funding::default()).map(LogicalPlan::Projection)
 }
 
 fn extract_expressions(expr: &Expr, result: &mut Vec<Expr>) {

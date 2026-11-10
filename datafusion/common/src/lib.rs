@@ -73,6 +73,7 @@ pub use arrow;
 pub use column::Column;
 pub use dfschema::{
     DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema, qualified_name,
+    qualified_name_is, qualified_names_equal,
 };
 pub use diagnostic::Diagnostic;
 pub use display::human_readable::{

@@ -240,7 +240,7 @@ fn rewrite_aggregate_non_aggregate_aggr_expr(
         .collect::<Result<Vec<_>>>()?;
 
     Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(projection_exprs, inner_aggregate)?,
+        Projection::try_new(projection_exprs, inner_aggregate, &datafusion_common::funding::Funding::default())?,
     )))
 }
 

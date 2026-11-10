@@ -174,7 +174,7 @@ impl SimpleCsvTable {
                 normalize_col(self.exprs[0].clone(), &plan)?,
                 &plan,
             )?],
-            Arc::new(plan),
+            Arc::new(plan), &datafusion::common::funding::Funding::default(),
         )
         .map(LogicalPlan::Projection)?;
         let rbs = collect(

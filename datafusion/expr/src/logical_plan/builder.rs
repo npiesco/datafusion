@@ -52,6 +52,7 @@ use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::file_options::file_type::FileType;
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
     Column, Constraints, DFSchema, DFSchemaRef, NullEquality, Result, ScalarValue,
@@ -592,7 +593,7 @@ impl LogicalPlanBuilder {
         self,
         expr: impl IntoIterator<Item = impl Into<SelectExpr>>,
     ) -> Result<Self> {
-        project(Arc::unwrap_or_clone(self.plan), expr).map(Self::new)
+        project(Arc::unwrap_or_clone(self.plan), expr, &Funding::default()).map(Self::new)
     }
 
     /// Apply a projection without alias with optional validation
@@ -601,8 +602,13 @@ impl LogicalPlanBuilder {
         self,
         expr: Vec<(impl Into<SelectExpr>, bool)>,
     ) -> Result<Self> {
-        project_with_validation(Arc::unwrap_or_clone(self.plan), expr, None)
-            .map(Self::new)
+        project_with_validation(
+            Arc::unwrap_or_clone(self.plan),
+            expr,
+            None,
+            &Funding::default(),
+        )
+        .map(Self::new)
     }
 
     /// Apply a projection, aliasing non-Column/non-Alias expressions to
@@ -612,10 +618,11 @@ impl LogicalPlanBuilder {
         expr: impl IntoIterator<Item = impl Into<SelectExpr>>,
         schema: &DFSchemaRef,
     ) -> Result<Self> {
-        project_with_validation(
+        project_with_schema(
             Arc::unwrap_or_clone(self.plan),
-            expr.into_iter().map(|e| (e, true)),
-            Some(schema),
+            expr,
+            schema,
+            &Funding::default(),
         )
         .map(Self::new)
     }
@@ -740,7 +747,7 @@ impl LogicalPlanBuilder {
                     Self::ambiguous_distinct_check(&missing_exprs, missing_cols, &expr)?;
                 }
                 expr.extend(missing_exprs);
-                project(Arc::unwrap_or_clone(input), expr)
+                project(Arc::unwrap_or_clone(input), expr, &Funding::default())
             }
             _ => {
                 let is_distinct =
@@ -868,7 +875,7 @@ impl LogicalPlanBuilder {
             fetch,
         });
 
-        Projection::try_new(new_expr, Arc::new(sort_plan))
+        Projection::try_new(new_expr, Arc::new(sort_plan), &Funding::default())
             .map(LogicalPlan::Projection)
             .map(Self::new)
     }
@@ -1282,7 +1289,7 @@ impl LogicalPlanBuilder {
         window_expr: impl IntoIterator<Item = impl Into<Expr>>,
     ) -> Result<Self> {
         let window_expr = normalize_cols(window_expr, &self.plan)?;
-        validate_unique_names("Windows", &window_expr)?;
+        validate_unique_names("Windows", &window_expr, &Funding::default())?;
         Ok(Self::new(LogicalPlan::Window(Window::try_new(
             window_expr,
             self.plan,
@@ -1772,11 +1779,8 @@ pub fn build_join_schema(
         .chain(schema2.metadata().clone())
         .collect();
 
-    let dfschema = DFSchema::new_with_metadata(
-        &qualified_fields,
-        metadata,
-        &datafusion_common::funding::Funding::default(),
-    )?;
+    let dfschema =
+        DFSchema::new_with_metadata(&qualified_fields, metadata, &Funding::default())?;
     dfschema.with_functional_dependencies(func_dependencies)
 }
 
@@ -1889,24 +1893,31 @@ pub fn add_group_by_exprs_from_dependencies(
 pub fn validate_unique_names<'a>(
     node_name: &str,
     expressions: impl IntoIterator<Item = &'a Expr>,
+    funding: &Funding,
 ) -> Result<()> {
-    let mut unique_names = HashMap::new();
-
-    expressions.into_iter().enumerate().try_for_each(|(position, expr)| {
-        let name = expr.schema_name().to_string();
-        match unique_names.get(&name) {
-            None => {
-                unique_names.insert(name, (position, expr));
-                Ok(())
-            },
-            Some((existing_position, existing_expr)) => {
+    let expressions = expressions.into_iter();
+    // Each expression's name, made through `funding`, beside it.
+    let mut named: Vec<(String, &Expr)> =
+        funding.vec_with_capacity(expressions.size_hint().0)?;
+    let checked = expressions.enumerate().try_for_each(|(position, expr)| {
+        let name = funding.format(format_args!("{}", expr.schema_name()))?;
+        match named.iter().position(|(existing, _)| *existing == name) {
+            None => funding.push(&mut named, (name, expr)),
+            Some(existing_position) => {
+                let existing_expr = named[existing_position].1;
+                funding.released(name);
                 plan_err!("{node_name} require unique expression names \
                              but the expression \"{existing_expr}\" at position {existing_position} and \"{expr}\" \
                              at position {position} have the same name. Consider aliasing (\"AS\") one of them."
                             )
             }
         }
-    })
+    });
+    for (name, _) in named.drain(..) {
+        funding.released(name);
+    }
+    funding.released(named);
+    checked
 }
 
 /// Union two [`LogicalPlan`]s.
@@ -1947,8 +1958,25 @@ pub fn union_by_name(
 pub fn project(
     plan: LogicalPlan,
     expr: impl IntoIterator<Item = impl Into<SelectExpr>>,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
-    project_with_validation(plan, expr.into_iter().map(|e| (e, true)), None)
+    project_with_validation(plan, expr.into_iter().map(|e| (e, true)), None, funding)
+}
+
+/// Create Projection as [`project`] does, aliasing non-Column/non-Alias expressions to
+/// match the field names of `schema`.
+pub fn project_with_schema(
+    plan: LogicalPlan,
+    expr: impl IntoIterator<Item = impl Into<SelectExpr>>,
+    schema: &DFSchemaRef,
+    funding: &Funding,
+) -> Result<LogicalPlan> {
+    project_with_validation(
+        plan,
+        expr.into_iter().map(|e| (e, true)),
+        Some(schema),
+        funding,
+    )
 }
 
 /// Create Projection. Similar to project except that the expressions
@@ -1962,8 +1990,9 @@ fn project_with_validation(
     plan: LogicalPlan,
     expr: impl IntoIterator<Item = (impl Into<SelectExpr>, bool)>,
     schema: Option<&DFSchemaRef>,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
-    let mut projected_expr = vec![];
+    let mut projected_expr = Vec::new();
     let mut has_wildcard = false;
     for (e, validate) in expr {
         let e = e.into();
@@ -1981,12 +2010,12 @@ fn project_with_validation(
                 };
 
                 for e in expanded {
-                    if validate {
-                        projected_expr
-                            .push(columnize_expr(normalize_col(e, &plan)?, &plan)?)
+                    let e = if validate {
+                        columnize_expr(normalize_col(e, &plan)?, &plan)?
                     } else {
-                        projected_expr.push(e)
-                    }
+                        e
+                    };
+                    funding.push(&mut projected_expr, e)?;
                 }
             }
             SelectExpr::QualifiedWildcard(table_ref, opt) => {
@@ -2003,20 +2032,21 @@ fn project_with_validation(
                 };
 
                 for e in expanded {
-                    if validate {
-                        projected_expr
-                            .push(columnize_expr(normalize_col(e, &plan)?, &plan)?)
+                    let e = if validate {
+                        columnize_expr(normalize_col(e, &plan)?, &plan)?
                     } else {
-                        projected_expr.push(e)
-                    }
+                        e
+                    };
+                    funding.push(&mut projected_expr, e)?;
                 }
             }
             SelectExpr::Expression(e) => {
-                if validate {
-                    projected_expr.push(columnize_expr(normalize_col(e, &plan)?, &plan)?)
+                let e = if validate {
+                    columnize_expr(normalize_col(e, &plan)?, &plan)?
                 } else {
-                    projected_expr.push(e)
-                }
+                    e
+                };
+                funding.push(&mut projected_expr, e)?;
             }
         }
     }
@@ -2038,9 +2068,10 @@ fn project_with_validation(
         }
     }
 
-    validate_unique_names("Projections", projected_expr.iter())?;
+    validate_unique_names("Projections", projected_expr.iter(), funding)?;
 
-    Projection::try_new(projected_expr, Arc::new(plan)).map(LogicalPlan::Projection)
+    Projection::try_new(projected_expr, funding.arc(plan)?, funding)
+        .map(LogicalPlan::Projection)
 }
 
 /// If there is a REPLACE statement in the projected expression in the form of
@@ -2951,12 +2982,12 @@ mod tests {
         let left_schema = DFSchema::new_with_metadata(
             &vec![(None, Arc::new(Field::new("a", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "left".to_string())]),
-            &datafusion_common::funding::Funding::default(),
+            &Funding::default(),
         )?;
         let right_schema = DFSchema::new_with_metadata(
             &vec![(None, Arc::new(Field::new("b", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "right".to_string())]),
-            &datafusion_common::funding::Funding::default(),
+            &Funding::default(),
         )?;
 
         let join_schema =

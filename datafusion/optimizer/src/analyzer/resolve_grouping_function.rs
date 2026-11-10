@@ -147,7 +147,7 @@ fn replace_grouping_exprs(
     // Create projection with grouping functions calculations
     let projection = LogicalPlan::Projection(Projection::try_new(
         projection_exprs,
-        new_aggregate.into(),
+        new_aggregate.into(), &datafusion_common::funding::Funding::default(),
     )?);
     Ok(projection)
 }

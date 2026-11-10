@@ -236,7 +236,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let mut expr =
             self.sql_expr_to_logical_expr_with_alias(sql, schema, planner_context)?;
         expr = self.rewrite_partial_qualifier(expr, schema);
-        self.validate_schema_satisfies_exprs(schema, &[expr.clone()])?;
+        self.validate_schema_satisfies_exprs(schema, [&expr])?;
         let (expr, _) = expr.infer_placeholder_types(schema)?;
         Ok(expr)
     }

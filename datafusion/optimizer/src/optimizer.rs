@@ -942,7 +942,7 @@ mod tests {
             let expr = Expr::from(Column::from(projection.schema.qualified_field(0)));
 
             Ok(Transformed::yes(LogicalPlan::Projection(
-                Projection::try_new(vec![expr], Arc::clone(&projection.input))?,
+                Projection::try_new(vec![expr], Arc::clone(&projection.input), &datafusion_common::funding::Funding::default())?,
             )))
         }
     }
@@ -998,7 +998,7 @@ mod tests {
             }
 
             Ok(Transformed::yes(LogicalPlan::Projection(
-                Projection::try_new(exprs, Arc::clone(&projection.input))?,
+                Projection::try_new(exprs, Arc::clone(&projection.input), &datafusion_common::funding::Funding::default())?,
             )))
         }
     }

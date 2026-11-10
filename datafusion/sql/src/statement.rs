@@ -2417,7 +2417,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let source = project(source, exprs)?;
+        let source = project(source, exprs, self.funding())?;
 
         let plan = LogicalPlan::Dml(DmlStatement::new(
             table_name,
@@ -2967,7 +2967,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 Ok(expr.alias(target_field.name()))
             })
             .collect::<Result<Vec<Expr>>>()?;
-        let source = project(source, exprs)?;
+        let source = project(source, exprs, self.funding())?;
 
         let insert_op = match (overwrite, replace_into) {
             (false, false) => InsertOp::Append,

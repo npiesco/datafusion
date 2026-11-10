@@ -1401,7 +1401,7 @@ impl DefaultPhysicalPlanner {
                             .collect::<Vec<_>>();
                         let projection = LogicalPlan::Projection(Projection::try_new(
                             final_join_result,
-                            Arc::new(new_join),
+                            Arc::new(new_join), &datafusion_common::funding::Funding::default(),
                         )?);
                         // LogicalPlan mutated
                         (Cow::Owned(projection), physical_left, physical_right)
@@ -3717,7 +3717,7 @@ mod tests {
             FieldMetadata::from(HashMap::from([("foo".to_string(), "bar".to_string())]));
         let projection = LogicalPlan::Projection(Projection::try_new(
             vec![col("value").alias_with_metadata("value", Some(metadata))],
-            Arc::new(input),
+            Arc::new(input), &datafusion_common::funding::Funding::default(),
         )?);
         let aggregate = LogicalPlan::Aggregate(Aggregate::try_new(
             Arc::new(projection),

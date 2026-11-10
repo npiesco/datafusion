@@ -35,7 +35,8 @@ pub fn from_scalar_function(
     fun: &expr::ScalarFunction,
     schema: &DFSchemaRef,
 ) -> datafusion::common::Result<Expression> {
-    let (_, output_field) = Expr::ScalarFunction(fun.clone()).to_field(schema)?;
+    let (_, output_field) = Expr::ScalarFunction(fun.clone())
+        .to_field(schema, &datafusion::common::funding::Funding::default())?;
     from_function(
         producer,
         fun.name(),
@@ -114,7 +115,8 @@ pub fn from_higher_order_function(
 
     let function_anchor = producer.register_function(fun.name().to_string());
 
-    let (_, output_field) = Expr::HigherOrderFunction(fun.clone()).to_field(schema)?;
+    let (_, output_field) = Expr::HigherOrderFunction(fun.clone())
+        .to_field(schema, &datafusion::common::funding::Funding::default())?;
     let output_type = to_substrait_type(
         producer,
         output_field.data_type(),
@@ -201,7 +203,8 @@ pub fn from_unary_expr(
         Expr::Negative(arg) => ("negate", arg),
         expr => not_impl_err!("Unsupported expression: {expr:?}")?,
     };
-    let (_, output_field) = expr.to_field(schema)?;
+    let (_, output_field) =
+        expr.to_field(schema, &datafusion::common::funding::Funding::default())?;
     let output_type = to_substrait_type(
         producer,
         output_field.data_type(),
@@ -218,7 +221,8 @@ pub fn from_binary_expr(
     let BinaryExpr { left, op, right } = expr;
     let l = producer.handle_expr(left, schema)?;
     let r = producer.handle_expr(right, schema)?;
-    let (_, output_field) = Expr::BinaryExpr(expr.clone()).to_field(schema)?;
+    let (_, output_field) = Expr::BinaryExpr(expr.clone())
+        .to_field(schema, &datafusion::common::funding::Funding::default())?;
     let output_type = to_substrait_type(
         producer,
         output_field.data_type(),

@@ -403,9 +403,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             let current_fields = partially_planned
                 .iter()
                 .map(|e| match e {
-                    ExprOrLambda::Expr(expr) => {
-                        Ok(ValueOrLambda::Value(expr.to_field(schema)?.1))
-                    }
+                    ExprOrLambda::Expr(expr) => Ok(ValueOrLambda::Value(
+                        expr.to_field(schema, self.funding())?.1,
+                    )),
                     ExprOrLambda::Lambda(_lambda_function) => {
                         Ok(ValueOrLambda::Lambda(()))
                     }
@@ -463,7 +463,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                             params,
                                         )?;
 
-                                        *field = Some(lambda.body.to_field(schema)?.1);
+                                        *field = Some(
+                                            lambda
+                                                .body
+                                                .to_field(schema, self.funding())?
+                                                .1,
+                                        );
                                     }
                                 }
                                 (ExprOrLambda::Expr(_), ValueOrLambda::Value(_)) => {} // nothing to do
