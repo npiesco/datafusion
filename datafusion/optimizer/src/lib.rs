@@ -82,6 +82,7 @@ pub use optimizer::{
 };
 
 pub(crate) mod join_key_set;
+mod funded;
 mod plan_signature;
 
 #[cfg(test)]

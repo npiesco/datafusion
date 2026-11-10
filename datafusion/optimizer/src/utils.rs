@@ -18,6 +18,7 @@
 //! Utility functions leveraged by the query optimizer rules
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use crate::analyzer::type_coercion::TypeCoercionRewriter;
 use arrow::array::{Array, RecordBatch, new_null_array};
@@ -154,8 +155,9 @@ pub(crate) fn schema_columns<'a>(schema: &'a DFSchema) -> HashSet<ColumnReferenc
         .collect::<HashSet<_>>()
 }
 
-/// Log the plan in debug/tracing mode after some part of the optimizer runs
-pub fn log_plan(description: &str, plan: &LogicalPlan) {
+/// Log the plan in debug/tracing mode after some part of the optimizer runs. The
+/// description is written only if the plan is logged: nothing is allocated for it here.
+pub fn log_plan(description: fmt::Arguments<'_>, plan: &LogicalPlan) {
     debug!("{description}:\n{}\n", plan.display_indent());
     trace!("{description}::\n{}\n", plan.display_indent_schema());
 }

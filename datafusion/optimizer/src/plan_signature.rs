@@ -21,8 +21,9 @@ use std::{
     num::NonZeroUsize,
 };
 
-use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_expr::LogicalPlan;
+
+use crate::funded::count_plans;
 
 /// Non-unique identifier of a [`LogicalPlan`].
 ///
@@ -70,18 +71,10 @@ impl LogicalPlanSignature {
     }
 }
 
-/// Get total number of [`LogicalPlan`]s in the plan.
+/// Get total number of [`LogicalPlan`]s in the plan, counted without allocating.
 fn get_node_number(plan: &LogicalPlan) -> NonZeroUsize {
-    let mut node_number = 0;
-    plan.apply_with_subqueries(|_plan| {
-        node_number += 1;
-        Ok(TreeNodeRecursion::Continue)
-    })
-    // Closure always return Ok
-    .unwrap();
-    // Visitor must have at least visited the root,
-    // so v.node_number is at least 1.
-    NonZeroUsize::new(node_number).unwrap()
+    // The root is counted: the count is at least 1.
+    NonZeroUsize::new(count_plans(plan)).unwrap_or(NonZeroUsize::MIN)
 }
 
 #[cfg(test)]
