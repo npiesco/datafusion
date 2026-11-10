@@ -16,14 +16,14 @@
 // under the License.
 
 //! [`ExtractEquijoinPredicate`] identifies equality join (equijoin) predicates
+use crate::funded::{conjuncts_owned, equijoin_sides, hashable, joined};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::funding::{Funding, Held};
 use datafusion_common::tree_node::Transformed;
 use datafusion_common::{DFSchema, assert_or_internal_err};
 use datafusion_common::{NullEquality, Result};
-use datafusion_expr::utils::split_conjunction_owned;
-use datafusion_expr::utils::{can_hash, find_valid_equijoin_key_pair};
-use datafusion_expr::{BinaryExpr, Expr, ExprSchemable, Join, LogicalPlan, Operator};
+use datafusion_expr::{BinaryExpr, Expr, Join, LogicalPlan, Operator};
 // equijoin predicate
 type EquijoinPredicate = (Expr, Expr);
 
@@ -36,8 +36,8 @@ type EquijoinPredicate = (Expr, Expr);
 ///
 /// For example, `SELECT ... FROM A JOIN B ON (A.x = B.y AND B.z > 50)`
 /// has one equijoin predicate (`A.x = B.y`) and one filter predicate (`B.z > 50`).
-/// See [find_valid_equijoin_key_pair] for more information on what predicates
-/// are considered equijoins.
+/// See [datafusion_expr::utils::find_valid_equijoin_key_pair] for more information on
+/// what predicates are considered equijoins.
 #[derive(Default, Debug)]
 pub struct ExtractEquijoinPredicate;
 
@@ -64,7 +64,7 @@ impl OptimizerRule for ExtractEquijoinPredicate {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Join(Join {
@@ -75,13 +75,22 @@ impl OptimizerRule for ExtractEquijoinPredicate {
                 join_type,
                 join_constraint,
                 schema,
-                null_equality,
+                mut null_equality,
                 null_aware,
             }) => {
+                let funding = config.funding();
                 let left_schema = left.schema();
                 let right_schema = right.schema();
-                let (equijoin_predicates, non_equijoin_expr) =
-                    split_eq_and_noneq_join_predicate(expr, left_schema, right_schema)?;
+                let had_keys = !on.is_empty();
+                let mut conjuncts = conjuncts_owned(&funding, expr)?;
+                let mut extracted = split_op_and_other_join_predicates(
+                    &funding,
+                    &mut conjuncts,
+                    &mut on,
+                    left_schema,
+                    right_schema,
+                    Operator::Eq,
+                )?;
 
                 // Equi-join operators like HashJoin support a special behavior
                 // that evaluates `NULL = NULL` as true instead of NULL. Therefore,
@@ -91,142 +100,74 @@ impl OptimizerRule for ExtractEquijoinPredicate {
                 // Nested Loop Join, resulting in better performance.
                 //
                 // Only convert when there are NO equijoin predicates, to be conservative.
-                if on.is_empty()
-                    && equijoin_predicates.is_empty()
-                    && non_equijoin_expr.is_some()
-                {
-                    // SAFETY: checked in the outer `if`
-                    let expr = non_equijoin_expr.clone().unwrap();
-                    let (equijoin_predicates, non_equijoin_expr) =
-                        split_is_not_distinct_from_and_other_join_predicate(
-                            expr,
-                            left_schema,
-                            right_schema,
-                        )?;
-
-                    if !equijoin_predicates.is_empty() {
-                        on.extend(equijoin_predicates);
-
-                        return Ok(Transformed::yes(LogicalPlan::Join(Join {
-                            left,
-                            right,
-                            on,
-                            filter: non_equijoin_expr,
-                            join_type,
-                            join_constraint,
-                            schema,
-                            // According to `is not distinct from`'s semantics, it's
-                            // safe to override it
-                            null_equality: NullEquality::NullEqualsNull,
-                            null_aware,
-                        })));
+                if !had_keys && !extracted && !conjuncts.is_empty() {
+                    extracted = split_op_and_other_join_predicates(
+                        &funding,
+                        &mut conjuncts,
+                        &mut on,
+                        left_schema,
+                        right_schema,
+                        Operator::IsNotDistinctFrom,
+                    )?;
+                    if extracted {
+                        // According to `is not distinct from`'s semantics, it's
+                        // safe to override it
+                        null_equality = NullEquality::NullEqualsNull;
                     }
                 }
 
-                if !equijoin_predicates.is_empty() {
-                    on.extend(equijoin_predicates);
-                    Ok(Transformed::yes(LogicalPlan::Join(Join {
-                        left,
-                        right,
-                        on,
-                        filter: non_equijoin_expr,
-                        join_type,
-                        join_constraint,
-                        schema,
-                        null_equality,
-                        null_aware,
-                    })))
+                let join = LogicalPlan::Join(Join {
+                    left,
+                    right,
+                    on,
+                    filter: joined(&funding, conjuncts, Operator::And)?,
+                    join_type,
+                    join_constraint,
+                    schema,
+                    null_equality,
+                    null_aware,
+                });
+                Ok(if extracted {
+                    Transformed::yes(join)
                 } else {
-                    Ok(Transformed::no(LogicalPlan::Join(Join {
-                        left,
-                        right,
-                        on,
-                        filter: non_equijoin_expr,
-                        join_type,
-                        join_constraint,
-                        schema,
-                        null_equality,
-                        null_aware,
-                    })))
-                }
+                    Transformed::no(join)
+                })
             }
             _ => Ok(Transformed::no(plan)),
         }
     }
 }
 
-/// Splits an ANDed filter expression into equijoin predicates and remaining filters.
-/// Returns all equijoin predicates and the remaining filters combined with AND.
+/// Moves the `operator` predicates among `conjuncts` that are join keys of `left_schema`
+/// and `right_schema` into `on`, its growth charged first and their boxes given back;
+/// whether any were.
 ///
 /// # Example
 ///
-/// For the expression `a.id = b.id AND a.x > 10 AND b.x > b.id`, this function will extract `a.id = b.id` as an equijoin predicate.
-///
-/// It first splits the ANDed sub-expressions:
-/// - expr1: a.id = b.id
-/// - expr2: a.x > 10
-/// - expr3: b.x > b.id
-///
-/// Then, it filters out the equijoin predicates and collects the non-equality expressions.
-/// The equijoin condition is:
+/// For the conjuncts of `a.id = b.id AND a.x > 10 AND b.x > b.id` and [`Operator::Eq`],
+/// `(a.id, b.id)` is moved into `on`, and `a.x > 10` and `b.x > b.id` stay:
 /// - It is an equality expression like `lhs == rhs`
-/// - All column references in `lhs` are from the left schema, and all in `rhs` are from the right schema
-///
-/// According to the above rule, `expr1` is the equijoin predicate, while `expr2` and `expr3` are not.
-/// The function returns Ok(\[expr1\], Some(expr2 AND expr3))
-fn split_eq_and_noneq_join_predicate(
-    filter: Expr,
-    left_schema: &DFSchema,
-    right_schema: &DFSchema,
-) -> Result<(Vec<EquijoinPredicate>, Option<Expr>)> {
-    split_op_and_other_join_predicates(filter, left_schema, right_schema, Operator::Eq)
-}
-
-/// See `split_eq_and_noneq_join_predicate`'s comment for the idea. This function
-/// is splitting out `is not distinct from` expressions instead of equal exprs.
-/// The `is not distinct from` exprs will be return as `EquijoinPredicate`.
-///
-/// # Example
-/// - Input: `a.id IS NOT DISTINCT FROM b.id AND a.x > 10 AND b.x > b.id`
-/// - Output from this splitter: `Ok([a.id, b.id], Some((a.x > 10) AND (b.x > b.id)))`
+/// - All column references in `lhs` are from the left schema, and all in `rhs` are from
+///   the right schema (or the other way round, the sides then swapped)
+/// - Both sides have hashable types
 ///
 /// # Note
-/// Caller should be cautious -- `is not distinct from` is not equivalent to an
-/// equal expression; the caller is responsible for correctly setting the
-/// `nulls equals nulls` property in the join operator (if it supports it) to
-/// make the transformation valid.
-///
-/// For the above example: in downstream, a valid plan that uses the extracted
-/// equijoin keys should look like:
+/// For [`Operator::IsNotDistinctFrom`], the caller is responsible for setting
+/// `NullEquality::NullEqualsNull` in the join operator: `IS NOT DISTINCT FROM` treats
+/// `NULL = NULL` as true, so a valid plan using the extracted keys looks like:
 ///
 /// HashJoin
 /// - on: `a.id = b.id` (equality)
 /// - join_filter: `(a.x > 10) AND (b.x > b.id)`
 /// - nulls_equals_null: `true`
-///
-/// This reflects that `IS NOT DISTINCT FROM` treats `NULL = NULL` as true and
-/// thus requires setting `NullEquality::NullEqualsNull` in the join operator to
-/// preserve semantics while enabling an equi-join implementation (e.g., HashJoin).
-fn split_is_not_distinct_from_and_other_join_predicate(
-    filter: Expr,
-    left_schema: &DFSchema,
-    right_schema: &DFSchema,
-) -> Result<(Vec<EquijoinPredicate>, Option<Expr>)> {
-    split_op_and_other_join_predicates(
-        filter,
-        left_schema,
-        right_schema,
-        Operator::IsNotDistinctFrom,
-    )
-}
-
-/// See comments in `split_eq_and_noneq_join_predicate` for details.
 fn split_op_and_other_join_predicates(
-    filter: Expr,
+    funding: &Funding,
+    conjuncts: &mut Held<Vec<Expr>>,
+    on: &mut Vec<EquijoinPredicate>,
     left_schema: &DFSchema,
     right_schema: &DFSchema,
     operator: Operator,
-) -> Result<(Vec<EquijoinPredicate>, Option<Expr>)> {
+) -> Result<bool> {
     assert_or_internal_err!(
         matches!(operator, Operator::Eq | Operator::IsNotDistinctFrom),
         "split_op_and_other_join_predicates only supports 'Eq' or 'IsNotDistinctFrom' operators, \
@@ -234,50 +175,60 @@ fn split_op_and_other_join_predicates(
         operator
     );
 
-    let exprs = split_conjunction_owned(filter);
-
-    // Treat 'is not distinct from' comparison as join key in equal joins
-    let mut accum_join_keys: Vec<(Expr, Expr)> = vec![];
-    let mut accum_filters: Vec<Expr> = vec![];
-    for expr in exprs {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr {
-                ref left,
-                ref op,
-                ref right,
-            }) if *op == operator => {
-                let join_key_pair =
-                    find_valid_equijoin_key_pair(left, right, left_schema, right_schema)?;
-
-                if let Some((left_expr, right_expr)) = join_key_pair {
-                    let left_expr_type = left_expr.get_type(left_schema)?;
-                    let right_expr_type = right_expr.get_type(right_schema)?;
-
-                    if can_hash(&left_expr_type) && can_hash(&right_expr_type) {
-                        accum_join_keys.push((left_expr, right_expr));
-                    } else {
-                        accum_filters.push(expr);
+    let mut extracted = false;
+    let mut index = 0;
+    while index < conjuncts.len() {
+        let swapped = match &conjuncts[index] {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == operator => {
+                match equijoin_sides(left, right, left_schema, right_schema)? {
+                    Some(swapped) => {
+                        let (left_key, right_key) = if swapped {
+                            (right, left)
+                        } else {
+                            (left, right)
+                        };
+                        (hashable(left_key, left_schema)?
+                            && hashable(right_key, right_schema)?)
+                        .then_some(swapped)
                     }
-                } else {
-                    accum_filters.push(expr);
+                    None => None,
                 }
             }
-            _ => accum_filters.push(expr),
+            _ => None,
+        };
+        if let Some(swapped) = swapped
+            && let Expr::BinaryExpr(BinaryExpr { left, right, .. }) =
+                conjuncts.remove(index)
+        {
+            let (left, right) = (funding.unboxed(left), funding.unboxed(right));
+            funding.push(
+                on,
+                if swapped {
+                    (right, left)
+                } else {
+                    (left, right)
+                },
+            )?;
+            extracted = true;
+        } else {
+            index += 1;
         }
     }
-
-    let result_filter = accum_filters.into_iter().reduce(Expr::and);
-    Ok((accum_join_keys, result_filter))
+    Ok(extracted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OptimizerContext;
     use crate::assert_optimized_plan_eq_display_indent_snapshot;
+    use crate::funded::Freed;
     use crate::test::*;
     use arrow::datatypes::DataType;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::PlanningFunding;
     use datafusion_expr::{
-        JoinType, col, lit, logical_plan::builder::LogicalPlanBuilder,
+        ExprSchemable, JoinType, col, lit, logical_plan::builder::LogicalPlanBuilder,
     };
     use std::sync::Arc;
 
@@ -529,5 +480,71 @@ mod tests {
           TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]
         "
         )
+    }
+
+    struct Refusing;
+
+    impl PlanningFunding for Refusing {
+        fn charge(&self, _bytes: usize) -> bool {
+            false
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    struct Unlimited;
+
+    impl PlanningFunding for Unlimited {
+        fn charge(&self, _bytes: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    fn join_with_key_in_filter() -> Result<LogicalPlan> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+        LogicalPlanBuilder::from(t1)
+            .join_on(
+                t2,
+                JoinType::Inner,
+                Some(col("t1.a").eq(col("t2.a")).and(col("t1.b").gt(lit(10u32)))),
+            )?
+            .build()
+    }
+
+    #[test]
+    fn extracting_a_key_is_refused_unfunded() -> Result<()> {
+        let mut options = ConfigOptions::default();
+        options.funding = Funding::new(Arc::new(Refusing));
+        let config = OptimizerContext::new_with_config_options(Arc::new(options));
+
+        let refused = ExtractEquijoinPredicate::new()
+            .rewrite(join_with_key_in_filter()?, &config)
+            .unwrap_err();
+
+        assert!(refused.refused().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn extracted_keys_hold_what_was_charged() -> Result<()> {
+        let plan = join_with_key_in_filter()?;
+        let mut options = ConfigOptions::default();
+        options.funding = Funding::new(Arc::new(Unlimited));
+        // Planned through the same funding.
+        options.funding.charge(plan.freed_bytes())?;
+        let config = OptimizerContext::new_with_config_options(Arc::new(options));
+
+        let extracted = ExtractEquijoinPredicate::new().rewrite(plan, &config)?;
+
+        assert!(extracted.transformed);
+        // The key's boxes and the conjunction's are given back, the key list charged.
+        assert_eq!(
+            config.options().funding.outstanding(),
+            extracted.data.freed_bytes()
+        );
+        Ok(())
     }
 }

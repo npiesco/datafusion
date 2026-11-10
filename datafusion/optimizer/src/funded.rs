@@ -46,8 +46,8 @@ use datafusion_common::cloned::CloneBytes;
 use datafusion_common::funding::{Funding, Held, arc_bytes};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    Column, DFSchema, DFSchemaRef, DataFusionError, RecursionUnnestOption, Result,
-    ScalarValue, Spans, TableReference, internal_err,
+    Column, DFSchema, DFSchemaRef, DataFusionError, ExprSchema, RecursionUnnestOption,
+    Result, ScalarValue, Spans, TableReference, internal_err,
 };
 use datafusion_expr::dml::CopyTo;
 use datafusion_expr::expr::{
@@ -63,7 +63,10 @@ use datafusion_expr::logical_plan::{
     RecursiveQuery, Repartition, Sort as SortPlan, Statement, Subquery, SubqueryAlias,
     TableScan, Union, Unnest, Values, Window,
 };
-use datafusion_expr::{Expr, Operator, WindowFrame, WindowFrameBound, WriteOp};
+use datafusion_expr::utils::can_hash;
+use datafusion_expr::{
+    Expr, ExprSchemable, Operator, WindowFrame, WindowFrameBound, WriteOp,
+};
 
 fn sum(parts: impl IntoIterator<Item = usize>) -> usize {
     parts.into_iter().fold(0, usize::saturating_add)
@@ -659,6 +662,52 @@ pub(crate) fn joined(
     Ok(joined)
 }
 
+/// Whether `expr` refers to any column, and whether every column it refers to is in
+/// `schema`: [`Expr::column_refs`] checked in place, nothing collected.
+fn columns_in(expr: &Expr, schema: &DFSchema) -> Result<(bool, bool)> {
+    let (mut any, mut all) = (false, true);
+    expr.apply(|expr| {
+        if let Expr::Column(column) = expr {
+            any = true;
+            all &= schema.is_column_from_schema(column);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok((any, all))
+}
+
+/// How `left = right` joins `left_schema` to `right_schema`, as
+/// [`datafusion_expr::utils::find_valid_equijoin_key_pair`] finds it without collecting
+/// columns or copying keys: `Some(false)` as written, `Some(true)` with the sides swapped,
+/// `None` if they are not a key pair.
+pub(crate) fn equijoin_sides(
+    left: &Expr,
+    right: &Expr,
+    left_schema: &DFSchema,
+    right_schema: &DFSchema,
+) -> Result<Option<bool>> {
+    let (left_any, left_in_left) = columns_in(left, left_schema)?;
+    let (right_any, right_in_right) = columns_in(right, right_schema)?;
+    if !left_any || !right_any {
+        return Ok(None);
+    }
+    if left_in_left && right_in_right {
+        return Ok(Some(false));
+    }
+    let (_, right_in_left) = columns_in(right, left_schema)?;
+    let (_, left_in_right) = columns_in(left, right_schema)?;
+    Ok((right_in_left && left_in_right).then_some(true))
+}
+
+/// Whether `expr` has a hashable type in `schema`: a column's type read in place, any other
+/// expression's through [`ExprSchemable::get_type`].
+pub(crate) fn hashable(expr: &Expr, schema: &DFSchema) -> Result<bool> {
+    Ok(match expr {
+        Expr::Column(column) => can_hash(schema.data_type(column)?),
+        _ => can_hash(&expr.get_type(schema)?),
+    })
+}
+
 /// What a null of `data_type` boxes: a dictionary's key type and value, a run-end encoded
 /// value.
 fn null_bytes(data_type: &DataType) -> usize {
@@ -936,7 +985,10 @@ pub(crate) fn plan_mut<'a>(
     arc: &'a mut Arc<LogicalPlan>,
 ) -> Result<&'a mut LogicalPlan> {
     if Arc::get_mut(arc).is_none() {
-        funding.charge(sum([LogicalPlan::clone_bytes(arc), arc_bytes::<LogicalPlan>()]))?;
+        funding.charge(sum([
+            LogicalPlan::clone_bytes(arc),
+            arc_bytes::<LogicalPlan>(),
+        ]))?;
     }
     Ok(Arc::make_mut(arc))
 }
