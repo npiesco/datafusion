@@ -17,12 +17,15 @@
 
 //! Utility functions for expression simplification
 
+use arrow::datatypes::DataType;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{
     Case, Expr, Like, Operator,
     expr::{Between, BinaryExpr, InList},
-    expr_fn::{and, bitwise_and, bitwise_or, or},
 };
+
+use crate::funded::{binary, conjoined, disjoined, replaced};
 
 /// returns true if `needle` is found in a chain of search_op
 /// expressions. Such as: (A AND B) AND C
@@ -42,77 +45,85 @@ pub fn expr_contains(expr: &Expr, needle: &Expr, search_op: Operator) -> bool {
 }
 
 /// Deletes all 'needles' or remains one 'needle' that are found in a chain of xor
-/// expressions. Such as: A ^ (A ^ (B ^ A))
-pub fn delete_xor_in_complex_expr(expr: &Expr, needle: &Expr, is_left: bool) -> Expr {
+/// expressions. Such as: A ^ (A ^ (B ^ A)). What it copies and boxes is charged before it
+/// is made.
+pub fn delete_xor_in_complex_expr(
+    funding: &Funding,
+    expr: &Expr,
+    needle: &Expr,
+    is_left: bool,
+) -> Result<Expr> {
     /// Deletes recursively 'needles' in a chain of xor expressions
     fn recursive_delete_xor_in_expr(
+        funding: &Funding,
         expr: &Expr,
         needle: &Expr,
         xor_counter: &mut i32,
-    ) -> Expr {
+    ) -> Result<Expr> {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right })
                 if *op == Operator::BitwiseXor =>
             {
-                let left_expr = recursive_delete_xor_in_expr(left, needle, xor_counter);
-                let right_expr = recursive_delete_xor_in_expr(right, needle, xor_counter);
+                let left_expr =
+                    recursive_delete_xor_in_expr(funding, left, needle, xor_counter)?;
+                let right_expr =
+                    recursive_delete_xor_in_expr(funding, right, needle, xor_counter)?;
                 if left_expr == *needle {
                     *xor_counter += 1;
-                    return right_expr;
+                    return Ok(replaced(funding, left_expr, right_expr));
                 } else if right_expr == *needle {
                     *xor_counter += 1;
-                    return left_expr;
+                    return Ok(replaced(funding, right_expr, left_expr));
                 }
 
-                Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(left_expr),
-                    *op,
-                    Box::new(right_expr),
-                ))
+                binary(funding, left_expr, *op, right_expr)
             }
-            _ => expr.clone(),
+            _ => funding.cloned(expr),
         }
     }
 
     let mut xor_counter: i32 = 0;
-    let result_expr = recursive_delete_xor_in_expr(expr, needle, &mut xor_counter);
+    let result_expr =
+        recursive_delete_xor_in_expr(funding, expr, needle, &mut xor_counter)?;
     if result_expr == *needle {
-        return needle.clone();
+        // Equal to the needle: it is returned as the needle's copy.
+        return Ok(result_expr);
     } else if xor_counter % 2 == 0 {
-        if is_left {
-            return Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(needle.clone()),
-                Operator::BitwiseXor,
-                Box::new(result_expr),
-            ));
+        let needle = funding.cloned(needle)?;
+        return if is_left {
+            binary(funding, needle, Operator::BitwiseXor, result_expr)
         } else {
-            return Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(result_expr),
-                Operator::BitwiseXor,
-                Box::new(needle.clone()),
-            ));
-        }
+            binary(funding, result_expr, Operator::BitwiseXor, needle)
+        };
     }
-    result_expr
+    Ok(result_expr)
+}
+
+/// A numeric literal's type: no other literal's is built (a dictionary's would be boxed).
+fn numeric_type(s: &Expr) -> Option<(&ScalarValue, DataType)> {
+    match s {
+        Expr::Literal(ScalarValue::Dictionary(..), _) => None,
+        Expr::Literal(sv, _) => {
+            Some((sv, sv.data_type())).filter(|(_, t)| t.is_numeric())
+        }
+        _ => None,
+    }
 }
 
 pub fn is_zero(s: &Expr) -> bool {
-    if let Expr::Literal(sv, _) = s
-        && sv.data_type().is_numeric()
-    {
+    if let Some((sv, data_type)) = numeric_type(s) {
         // unwrap safe since numeric types always have a 0 value
-        sv == &ScalarValue::new_zero(&sv.data_type()).unwrap()
+        sv == &ScalarValue::new_zero(&data_type).unwrap()
     } else {
         false
     }
 }
 
 pub fn is_one(s: &Expr) -> bool {
-    if let Expr::Literal(sv, _) = s
-        && sv.data_type().is_numeric()
+    if let Some((sv, data_type)) = numeric_type(s)
         // there are edge cases like negative scale decimals not being able to
         // create a one value so this can fail
-        && let Ok(one) = ScalarValue::new_one(&sv.data_type())
+        && let Ok(one) = ScalarValue::new_one(&data_type)
     {
         sv == &one
     } else {
@@ -282,46 +293,48 @@ pub fn is_eq_and_ne_with_different_literal(eq_expr: &Expr, ne_expr: &Expr) -> bo
 /// For Between, not (A between B and C) ===> (A not between B and C)
 ///     not (A not between B and C) ===> (A between B and C)
 /// For others, use Not clause
-pub fn negate_clause(expr: Expr) -> Expr {
-    match expr {
+///
+/// Each box it makes is charged before it is made, each it frees given back.
+pub fn negate_clause(funding: &Funding, expr: Expr) -> Result<Expr> {
+    Ok(match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             if let Some(negated_op) = op.negate() {
-                return Expr::BinaryExpr(BinaryExpr::new(left, negated_op, right));
+                return Ok(Expr::BinaryExpr(BinaryExpr::new(left, negated_op, right)));
             }
             match op {
                 // not (A and B) ===> (not A) or (not B)
                 Operator::And => {
-                    let left = negate_clause(*left);
-                    let right = negate_clause(*right);
+                    let left = negate_clause(funding, funding.unboxed(left))?;
+                    let right = negate_clause(funding, funding.unboxed(right))?;
 
-                    or(left, right)
+                    disjoined(funding, left, right)?
                 }
                 // not (A or B) ===> (not A) and (not B)
                 Operator::Or => {
-                    let left = negate_clause(*left);
-                    let right = negate_clause(*right);
+                    let left = negate_clause(funding, funding.unboxed(left))?;
+                    let right = negate_clause(funding, funding.unboxed(right))?;
 
-                    and(left, right)
+                    conjoined(funding, left, right)?
                 }
                 // use not clause
-                _ => Expr::Not(Box::new(Expr::BinaryExpr(BinaryExpr::new(
-                    left, op, right,
-                )))),
+                _ => Expr::Not(
+                    funding.boxed(Expr::BinaryExpr(BinaryExpr::new(left, op, right)))?,
+                ),
             }
         }
         // not (not A) ===> A
-        Expr::Not(expr) => *expr,
+        Expr::Not(expr) => funding.unboxed(expr),
         // not (A is not null) ===> A is null
-        Expr::IsNotNull(expr) => expr.is_null(),
+        Expr::IsNotNull(expr) => Expr::IsNull(expr),
         // not (A is null) ===> A is not null
-        Expr::IsNull(expr) => expr.is_not_null(),
+        Expr::IsNull(expr) => Expr::IsNotNull(expr),
         // not (A not in (..)) ===> A in (..)
         // not (A in (..)) ===> A not in (..)
         Expr::InList(InList {
             expr,
             list,
             negated,
-        }) => expr.in_list(list, !negated),
+        }) => Expr::InList(InList::new(expr, list, !negated)),
         // not (A between B and C) ===> (A not between B and C)
         // not (A not between B and C) ===> (A between B and C)
         Expr::Between(between) => Expr::Between(Between::new(
@@ -339,8 +352,8 @@ pub fn negate_clause(expr: Expr) -> Expr {
             like.case_insensitive,
         )),
         // use not clause
-        _ => Expr::Not(Box::new(expr)),
-    }
+        _ => Expr::Not(funding.boxed(expr)?),
+    })
 }
 
 /// bitwise negate a Negative clause
@@ -351,35 +364,37 @@ pub fn negate_clause(expr: Expr) -> Expr {
 /// For Negative:
 ///    ~(~A) ===> A
 /// For others, use Negative clause
-pub fn distribute_negation(expr: Expr) -> Expr {
-    match expr {
+///
+/// Each box it makes is charged before it is made, each it frees given back.
+pub fn distribute_negation(funding: &Funding, expr: Expr) -> Result<Expr> {
+    Ok(match expr {
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             match op {
                 // ~(A & B) ===> ~A | ~B
                 Operator::BitwiseAnd => {
-                    let left = distribute_negation(*left);
-                    let right = distribute_negation(*right);
+                    let left = distribute_negation(funding, funding.unboxed(left))?;
+                    let right = distribute_negation(funding, funding.unboxed(right))?;
 
-                    bitwise_or(left, right)
+                    binary(funding, left, Operator::BitwiseOr, right)?
                 }
                 // ~(A | B) ===> ~A & ~B
                 Operator::BitwiseOr => {
-                    let left = distribute_negation(*left);
-                    let right = distribute_negation(*right);
+                    let left = distribute_negation(funding, funding.unboxed(left))?;
+                    let right = distribute_negation(funding, funding.unboxed(right))?;
 
-                    bitwise_and(left, right)
+                    binary(funding, left, Operator::BitwiseAnd, right)?
                 }
                 // use negative clause
-                _ => Expr::Negative(Box::new(Expr::BinaryExpr(BinaryExpr::new(
-                    left, op, right,
-                )))),
+                _ => Expr::Negative(
+                    funding.boxed(Expr::BinaryExpr(BinaryExpr::new(left, op, right)))?,
+                ),
             }
         }
         // ~(~A) ===> A
-        Expr::Negative(expr) => *expr,
+        Expr::Negative(expr) => funding.unboxed(expr),
         // use negative clause
-        _ => Expr::Negative(Box::new(expr)),
-    }
+        _ => Expr::Negative(funding.boxed(expr)?),
+    })
 }
 
 #[cfg(test)]

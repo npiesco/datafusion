@@ -22,13 +22,13 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::ops::Not;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
+use datafusion_common::alias::AliasGenerator;
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::{Funding, Held, arc_bytes};
 use datafusion_common::nested_struct::has_one_of_more_common_fields;
 use datafusion_common::{
     DFSchema, DataFusionError, Result, ScalarValue, exec_datafusion_err, internal_err,
@@ -40,21 +40,22 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_expr::expr::HigherOrderFunction;
+use datafusion_expr::expr::{InList, InSubquery};
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{
-    BinaryExpr, Case, ColumnarValue, Expr, ExprSchemable, Like, Operator, Volatility,
-    and, binary::BinaryTypeCoercer, lit, or, preimage::PreimageResult,
+    Between, BinaryExpr, Case, ColumnarValue, Expr, ExprSchemable, Like, Operator,
+    Volatility, binary::BinaryTypeCoercer, lit, preimage::PreimageResult,
 };
 use datafusion_expr::{Cast, TryCast, simplify::ExprSimplifyResult};
 use datafusion_expr::{expr::ScalarFunction, interval_arithmetic::NullableInterval};
-use datafusion_expr::{
-    expr::{InList, InSubquery},
-    utils::{iter_conjunction, iter_conjunction_owned},
-};
 use datafusion_physical_expr::{create_physical_expr, execution_props::ExecutionProps};
 
 use super::inlist_simplifier::ShortenInListSimplifier;
 use super::utils::*;
+use crate::funded::{
+    Freed, HashIndex, any_conjunct, binary, conjoined, conjuncts, conjuncts_owned,
+    deduplicated, disjoined, freed, joined, kept, negated, null_of, replaced,
+};
 use crate::simplify_expressions::SimplifyContext;
 use crate::simplify_expressions::regex::simplify_regex_expr;
 use crate::simplify_expressions::unwrap_cast::{
@@ -68,8 +69,6 @@ use crate::{
 };
 use datafusion_expr::expr_rewriter::rewrite_with_guarantees_map;
 use datafusion_expr_common::casts::try_cast_literal_to_type;
-use indexmap::IndexSet;
-use regex::Regex;
 
 /// This structure handles API for expression simplification
 ///
@@ -210,10 +209,13 @@ impl ExprSimplifier {
         &self,
         mut expr: Expr,
     ) -> Result<(Transformed<Expr>, u32)> {
+        let funding = &self.info.config_options().funding;
         let mut simplifier = Simplifier::new(&self.info);
         let config_options = Some(Arc::clone(self.info.config_options()));
-        let mut const_evaluator = ConstEvaluator::try_new(config_options)?;
-        let mut shorten_in_list_simplifier = ShortenInListSimplifier::new();
+        let mut const_evaluator = ConstEvaluator::try_new(config_options, funding)?;
+        let mut shorten_in_list_simplifier = ShortenInListSimplifier::new(funding);
+        // Without guarantees (the optimizer gives none) the map is empty, allocating
+        // nothing.
         let guarantees_map: HashMap<&Expr, &NullableInterval> =
             self.guarantees.iter().map(|(k, v)| (k, v)).collect();
 
@@ -257,7 +259,8 @@ impl ExprSimplifier {
     /// See the [type coercion module](datafusion_expr::type_coercion)
     /// documentation for more details on type coercion
     pub fn coerce(&self, expr: Expr, schema: &DFSchema) -> Result<Expr> {
-        let mut expr_rewrite = TypeCoercionRewriter { schema };
+        let mut expr_rewrite =
+            TypeCoercionRewriter::new(schema, &self.info.config_options().funding);
         expr.rewrite(&mut expr_rewrite).data()
     }
 
@@ -493,7 +496,9 @@ struct ConstEvaluator {
     /// After visiting all siblings if `can_evaluate.top()` is true, that
     /// means there were no non evaluatable siblings (or their
     /// descendants) so this `Expr` can be evaluated
-    can_evaluate: Vec<bool>,
+    can_evaluate: Held<Vec<bool>>,
+    /// What evaluating frees and makes is charged and given back through.
+    funding: Funding,
     /// Execution properties needed to call [`create_physical_expr`].
     /// `ConstEvaluator` only evaluates expressions without column references
     /// (i.e. constant expressions) and doesn't use the variable binding features
@@ -503,10 +508,20 @@ struct ConstEvaluator {
     execution_props: ExecutionProps,
 }
 
+impl Drop for ConstEvaluator {
+    fn drop(&mut self) {
+        // The alias generator's block, freed with the properties unless it is shared.
+        if Arc::strong_count(&self.execution_props.alias_generator) == 1 {
+            self.funding.discharge(arc_bytes::<AliasGenerator>());
+        }
+    }
+}
+
 /// The simplify result of ConstEvaluator
 enum ConstSimplifyResult {
-    // Expr was simplified and contains the new expression
-    Simplified(ScalarValue, Option<FieldMetadata>),
+    // Expr was simplified and contains the new expression, and what the expression it
+    // replaced freed
+    Simplified(ScalarValue, Option<FieldMetadata>, usize),
     // Expr was not simplified and original value is returned
     NotSimplified(ScalarValue, Option<FieldMetadata>),
     // Evaluation encountered an error, contains the original expression
@@ -518,7 +533,7 @@ impl TreeNodeRewriter for ConstEvaluator {
 
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         // Default to being able to evaluate this node
-        self.can_evaluate.push(true);
+        self.can_evaluate.push(true)?;
 
         // if this expr is not ok to evaluate, mark entire parent
         // stack as not ok (as all parents have at least one child or
@@ -550,7 +565,11 @@ impl TreeNodeRewriter for ConstEvaluator {
             // any error is countered during simplification, return the original
             // so that normal evaluation can occur
             Some(true) => match self.evaluate_to_scalar(expr) {
-                ConstSimplifyResult::Simplified(s, m) => {
+                ConstSimplifyResult::Simplified(s, m, freed_bytes) => {
+                    // The value arrow evaluated it to is charged as it is made: its
+                    // blocks are allocated by the kernels, which take no funding.
+                    self.funding.discharge(freed_bytes);
+                    self.funding.charge(s.freed_bytes())?;
                     Ok(Transformed::yes(Expr::Literal(s, m)))
                 }
                 ConstSimplifyResult::NotSimplified(s, m) => {
@@ -598,15 +617,24 @@ impl ConstEvaluator {
     ///
     /// The `config_options` parameter is used to pass session configuration
     /// (like timezone) to scalar functions during constant evaluation.
-    pub fn try_new(config_options: Option<Arc<ConfigOptions>>) -> Result<Self> {
+    pub fn try_new(
+        config_options: Option<Arc<ConfigOptions>>,
+        funding: &Funding,
+    ) -> Result<Self> {
         // The dummy column name is unused and doesn't matter as only
         // expressions without column references can be evaluated
 
-        let mut execution_props = ExecutionProps::new();
-        execution_props.config_options = config_options;
+        // As `ExecutionProps::new` makes them, the alias generator's block charged first.
+        let execution_props = ExecutionProps {
+            query_execution_start_time: None,
+            alias_generator: funding.arc(AliasGenerator::new())?,
+            config_options,
+            var_providers: None,
+        };
 
         Ok(Self {
-            can_evaluate: vec![],
+            can_evaluate: funding.held(),
+            funding: funding.clone(),
             execution_props,
         })
     }
@@ -727,6 +755,7 @@ impl ConstEvaluator {
                     false => Some(FieldMetadata::from(m)),
                 }
             });
+        let freed_bytes = expr.freed_bytes();
         let col_val = match phys_expr.evaluate(&DUMMY_BATCH) {
             Ok(v) => v,
             Err(err) => return ConstSimplifyResult::SimplifyRuntimeError(err, expr),
@@ -745,21 +774,27 @@ impl ConstEvaluator {
                     ConstSimplifyResult::Simplified(
                         ScalarValue::List(a.as_list::<i32>().to_owned().into()),
                         metadata,
+                        freed_bytes,
                     )
                 } else if as_large_list_array(&a).is_ok() {
                     ConstSimplifyResult::Simplified(
                         ScalarValue::LargeList(a.as_list::<i64>().to_owned().into()),
                         metadata,
+                        freed_bytes,
                     )
                 } else {
                     // Non-ListArray
                     match ScalarValue::try_from_array(&a, 0) {
-                        Ok(s) => ConstSimplifyResult::Simplified(s, metadata),
+                        Ok(s) => {
+                            ConstSimplifyResult::Simplified(s, metadata, freed_bytes)
+                        }
                         Err(err) => ConstSimplifyResult::SimplifyRuntimeError(err, expr),
                     }
                 }
             }
-            ColumnarValue::Scalar(s) => ConstSimplifyResult::Simplified(s, metadata),
+            ColumnarValue::Scalar(s) => {
+                ConstSimplifyResult::Simplified(s, metadata, freed_bytes)
+            }
         }
     }
 }
@@ -775,11 +810,16 @@ impl ConstEvaluator {
 /// * `expr = null` and `expr != null` to `null`
 struct Simplifier<'a> {
     info: &'a SimplifyContext,
+    /// What each rewrite frees and makes is given back and charged through.
+    funding: &'a Funding,
 }
 
 impl<'a> Simplifier<'a> {
     pub fn new(info: &'a SimplifyContext) -> Self {
-        Self { info }
+        Self {
+            info,
+            funding: &info.config_options().funding,
+        }
     }
 }
 
@@ -790,26 +830,23 @@ impl TreeNodeRewriter for Simplifier<'_> {
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         use datafusion_expr::Operator::{
             And, BitwiseAnd, BitwiseOr, BitwiseShiftLeft, BitwiseShiftRight, BitwiseXor,
-            Divide, Eq, Modulo, Multiply, NotEq, Or, RegexIMatch, RegexMatch,
-            RegexNotIMatch, RegexNotMatch,
+            Divide, Eq, Gt, GtEq, Lt, LtEq, Modulo, Multiply, NotEq, Or, RegexIMatch,
+            RegexMatch, RegexNotIMatch, RegexNotMatch,
         };
 
         let info = self.info;
+        let f = self.funding;
         Ok(match expr {
             // `value op NULL` -> `NULL`
             // `NULL op value` -> `NULL`
             // except for few operators that can return non-null value even when one of the operands is NULL
-            ref expr @ Expr::BinaryExpr(BinaryExpr {
-                ref left,
-                ref op,
-                ref right,
-            }) if op.returns_null_on_null()
-                && (is_null(left.as_ref()) || is_null(right.as_ref())) =>
+            Expr::BinaryExpr(BinaryExpr { left, op, right })
+                if op.returns_null_on_null()
+                    && (is_null(left.as_ref()) || is_null(right.as_ref())) =>
             {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::try_new_null(&info.get_data_type(expr)?)?,
-                    None,
-                ))
+                let expr = Expr::BinaryExpr(BinaryExpr { left, op, right });
+                let null = null_of(f, &info.get_data_type(&expr)?)?;
+                Transformed::yes(replaced(f, expr, Expr::Literal(null, None)))
             }
 
             // `NULL {AND, OR} NULL` -> `NULL`
@@ -817,7 +854,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: And | Or,
                 right,
-            }) if is_null(&left) && is_null(&right) => Transformed::yes(lit_bool_null()),
+            }) if is_null(&left) && is_null(&right) => {
+                Transformed::yes(replaced(f, (left, right), lit_bool_null()))
+            }
 
             //
             // Rules for Eq
@@ -832,9 +871,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 right,
             }) if is_bool_lit(&left) && info.is_boolean_type(&right)? => {
                 Transformed::yes(match as_bool_lit(&left)? {
-                    Some(true) => *right,
-                    Some(false) => Expr::Not(right),
-                    None => lit_bool_null(),
+                    Some(true) => kept(f, right, left),
+                    Some(false) => replaced(f, left, Expr::Not(right)),
+                    None => replaced(f, (left, right), lit_bool_null()),
                 })
             }
             // A = true  --> A
@@ -846,9 +885,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 right,
             }) if is_bool_lit(&right) && info.is_boolean_type(&left)? => {
                 Transformed::yes(match as_bool_lit(&right)? {
-                    Some(true) => *left,
-                    Some(false) => Expr::Not(left),
-                    None => lit_bool_null(),
+                    Some(true) => kept(f, left, right),
+                    Some(false) => replaced(f, right, Expr::Not(left)),
+                    None => replaced(f, (left, right), lit_bool_null()),
                 })
             }
             // According to SQL's null semantics, NULL = NULL evaluates to NULL
@@ -861,12 +900,11 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 right,
             }) if (left == right) & !left.is_volatile() => {
                 Transformed::yes(match !info.nullable(&left)? {
-                    true => lit(true),
-                    false => Expr::BinaryExpr(BinaryExpr {
-                        left: Box::new(Expr::IsNotNull(left)),
-                        op: Or,
-                        right: Box::new(lit_bool_null()),
-                    }),
+                    true => replaced(f, (left, right), lit(true)),
+                    false => {
+                        freed(f, right);
+                        disjoined(f, Expr::IsNotNull(left), lit_bool_null())?
+                    }
                 })
             }
 
@@ -882,9 +920,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 right,
             }) if is_bool_lit(&left) && info.is_boolean_type(&right)? => {
                 Transformed::yes(match as_bool_lit(&left)? {
-                    Some(true) => Expr::Not(right),
-                    Some(false) => *right,
-                    None => lit_bool_null(),
+                    Some(true) => replaced(f, left, Expr::Not(right)),
+                    Some(false) => kept(f, right, left),
+                    None => replaced(f, (left, right), lit_bool_null()),
                 })
             }
             // A != true  --> !A
@@ -896,9 +934,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 right,
             }) if is_bool_lit(&right) && info.is_boolean_type(&left)? => {
                 Transformed::yes(match as_bool_lit(&right)? {
-                    Some(true) => Expr::Not(left),
-                    Some(false) => *left,
-                    None => lit_bool_null(),
+                    Some(true) => replaced(f, right, Expr::Not(left)),
+                    Some(false) => kept(f, left, right),
+                    None => replaced(f, (left, right), lit_bool_null()),
                 })
             }
 
@@ -910,33 +948,33 @@ impl TreeNodeRewriter for Simplifier<'_> {
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
-                right: _,
-            }) if is_true(&left) => Transformed::yes(*left),
+                right,
+            }) if is_true(&left) => Transformed::yes(kept(f, left, right)),
             // false OR A --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if is_false(&left) => Transformed::yes(*right),
+            }) if is_false(&left) => Transformed::yes(kept(f, right, left)),
             // A OR true --> true (even if A is null)
             Expr::BinaryExpr(BinaryExpr {
-                left: _,
+                left,
                 op: Or,
                 right,
-            }) if is_true(&right) => Transformed::yes(*right),
+            }) if is_true(&right) => Transformed::yes(kept(f, right, left)),
             // A OR false --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if is_false(&right) => Transformed::yes(*left),
+            }) if is_false(&right) => Transformed::yes(kept(f, left, right)),
             // A OR !A ---> true (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
             }) if is_not_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(lit(true))
+                Transformed::yes(replaced(f, (left, right), lit(true)))
             }
             // !A OR A ---> true (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -944,50 +982,86 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: Or,
                 right,
             }) if is_not_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(lit(true))
+                Transformed::yes(replaced(f, (left, right), lit(true)))
             }
             // (..A..) OR A --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if expr_contains(&left, &right, Or) => Transformed::yes(*left),
+            }) if expr_contains(&left, &right, Or) => {
+                Transformed::yes(kept(f, left, right))
+            }
             // A OR (..A..) --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if expr_contains(&right, &left, Or) => Transformed::yes(*right),
+            }) if expr_contains(&right, &left, Or) => {
+                Transformed::yes(kept(f, right, left))
+            }
             // A OR (A AND B) --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if is_op_with(And, &right, &left) => Transformed::yes(*left),
+            }) if is_op_with(And, &right, &left) => {
+                Transformed::yes(kept(f, left, right))
+            }
             // (A AND B) OR A --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if is_op_with(And, &left, &right) => Transformed::yes(*right),
+            }) if is_op_with(And, &left, &right) => {
+                Transformed::yes(kept(f, right, left))
+            }
             // Eliminate common factors in conjunctions e.g
             // (A AND B) OR (A AND C) -> A AND (B OR C)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: Or,
                 right,
-            }) if has_common_conjunction(&left, &right) => {
-                let lhs: IndexSet<Expr> = iter_conjunction_owned(*left).collect();
-                let (common, rhs): (Vec<_>, Vec<_>) = iter_conjunction_owned(*right)
-                    .partition(|e| lhs.contains(e) && !e.is_volatile());
+            }) if has_common_conjunction(f, &left, &right)? => {
+                let mut lhs = conjuncts_owned(f, f.unboxed(left))?;
+                deduplicated(f, &mut *lhs)?;
+                let mut right = conjuncts_owned(f, f.unboxed(right))?;
+                let (mut common, mut rhs): (Held<Vec<Expr>>, Held<Vec<Expr>>) =
+                    (f.held(), f.held());
+                common.reserve_exact(right.len())?;
+                rhs.reserve_exact(right.len())?;
+                {
+                    let lhs = HashIndex::new(f, &lhs[..])?;
+                    for e in right.drain(..) {
+                        if lhs.contains(&e) && !e.is_volatile() {
+                            common.push(e)?;
+                        } else {
+                            rhs.push(e)?;
+                        }
+                    }
+                }
+                {
+                    let common = HashIndex::new(f, &common[..])?;
+                    lhs.retain(|e| {
+                        let kept = !common.contains(e);
+                        if !kept {
+                            f.discharge(e.freed_bytes());
+                        }
+                        kept
+                    });
+                }
 
-                let new_rhs = rhs.into_iter().reduce(and);
-                let new_lhs = lhs.into_iter().filter(|e| !common.contains(e)).reduce(and);
-                let common_conjunction = common.into_iter().reduce(and).unwrap();
+                let new_rhs = joined(f, rhs, And)?;
+                let new_lhs = joined(f, lhs, And)?;
+                let Some(common_conjunction) = joined(f, common, And)? else {
+                    return internal_err!("Expected a common conjunct");
+                };
 
                 let new_expr = match (new_lhs, new_rhs) {
-                    (Some(lhs), Some(rhs)) => and(common_conjunction, or(lhs, rhs)),
-                    (_, _) => common_conjunction,
+                    (Some(lhs), Some(rhs)) => {
+                        conjoined(f, common_conjunction, disjoined(f, lhs, rhs)?)?
+                    }
+                    (lhs, rhs) => replaced(f, (lhs, rhs), common_conjunction),
                 };
                 Transformed::yes(new_expr)
             }
@@ -1001,32 +1075,32 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: And,
                 right,
-            }) if is_true(&left) => Transformed::yes(*right),
+            }) if is_true(&left) => Transformed::yes(kept(f, right, left)),
             // false AND A --> false (even if A is null)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
-                right: _,
-            }) if is_false(&left) => Transformed::yes(*left),
+                right,
+            }) if is_false(&left) => Transformed::yes(kept(f, left, right)),
             // A AND true --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
                 right,
-            }) if is_true(&right) => Transformed::yes(*left),
+            }) if is_true(&right) => Transformed::yes(kept(f, left, right)),
             // A AND false --> false (even if A is null)
             Expr::BinaryExpr(BinaryExpr {
-                left: _,
+                left,
                 op: And,
                 right,
-            }) if is_false(&right) => Transformed::yes(*right),
+            }) if is_false(&right) => Transformed::yes(kept(f, right, left)),
             // A AND !A ---> false (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
                 right,
             }) if is_not_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(lit(false))
+                Transformed::yes(replaced(f, (left, right), lit(false)))
             }
             // !A AND A ---> false (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -1034,32 +1108,36 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: And,
                 right,
             }) if is_not_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(lit(false))
+                Transformed::yes(replaced(f, (left, right), lit(false)))
             }
             // (..A..) AND A --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
                 right,
-            }) if expr_contains(&left, &right, And) => Transformed::yes(*left),
+            }) if expr_contains(&left, &right, And) => {
+                Transformed::yes(kept(f, left, right))
+            }
             // A AND (..A..) --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
                 right,
-            }) if expr_contains(&right, &left, And) => Transformed::yes(*right),
+            }) if expr_contains(&right, &left, And) => {
+                Transformed::yes(kept(f, right, left))
+            }
             // A AND (A OR B) --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
                 right,
-            }) if is_op_with(Or, &right, &left) => Transformed::yes(*left),
+            }) if is_op_with(Or, &right, &left) => Transformed::yes(kept(f, left, right)),
             // (A OR B) AND A --> A
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: And,
                 right,
-            }) if is_op_with(Or, &left, &right) => Transformed::yes(*right),
+            }) if is_op_with(Or, &left, &right) => Transformed::yes(kept(f, right, left)),
             // A >= constant AND constant <= A --> A = constant
             Expr::BinaryExpr(BinaryExpr {
                 left,
@@ -1070,8 +1148,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     left: left_left,
                     right: left_right,
                     ..
-                }) = *left
+                }) = f.unboxed(left)
                 {
+                    freed(f, right);
                     Transformed::yes(Expr::BinaryExpr(BinaryExpr {
                         left: left_left,
                         op: Eq,
@@ -1089,7 +1168,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: And,
                 right,
             }) if is_eq_and_ne_with_different_literal(&left, &right) => {
-                Transformed::yes(*left)
+                Transformed::yes(kept(f, left, right))
             }
             // A != L2 AND A = L1 --> A = L1 (when L1 != L2)
             Expr::BinaryExpr(BinaryExpr {
@@ -1097,7 +1176,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: And,
                 right,
             }) if is_eq_and_ne_with_different_literal(&right, &left) => {
-                Transformed::yes(*right)
+                Transformed::yes(kept(f, right, left))
             }
 
             //
@@ -1110,7 +1189,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: Multiply,
                 right,
             }) if is_one(&right) => {
-                simplify_right_is_one_case(info, left, &Multiply, &right)?
+                simplify_right_is_one_case(f, info, left, &Multiply, right)?
             }
             // 1 * A --> A
             Expr::BinaryExpr(BinaryExpr {
@@ -1119,7 +1198,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 right,
             }) if is_one(&left) => {
                 // 1 * A is equivalent to A * 1
-                simplify_right_is_one_case(info, right, &Multiply, &left)?
+                simplify_right_is_one_case(f, info, right, &Multiply, left)?
             }
 
             // A * 0 --> 0 (if A is not null and not floating, since NAN * 0 -> NAN)
@@ -1131,7 +1210,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 && !info.get_data_type(&left)?.is_floating()
                 && is_zero(&right) =>
             {
-                Transformed::yes(*right)
+                Transformed::yes(kept(f, right, left))
             }
             // 0 * A --> 0 (if A is not null and not floating, since 0 * NAN -> NAN)
             Expr::BinaryExpr(BinaryExpr {
@@ -1142,7 +1221,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 && !info.get_data_type(&right)?.is_floating()
                 && is_zero(&left) =>
             {
-                Transformed::yes(*left)
+                Transformed::yes(kept(f, left, right))
             }
 
             //
@@ -1155,7 +1234,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: Divide,
                 right,
             }) if is_one(&right) => {
-                simplify_right_is_one_case(info, left, &Divide, &right)?
+                simplify_right_is_one_case(f, info, left, &Divide, right)?
             }
 
             //
@@ -1171,10 +1250,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 && !info.get_data_type(&left)?.is_floating()
                 && is_one(&right) =>
             {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             //
@@ -1186,14 +1263,18 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseAnd,
                 right,
-            }) if !info.nullable(&left)? && is_zero(&right) => Transformed::yes(*right),
+            }) if !info.nullable(&left)? && is_zero(&right) => {
+                Transformed::yes(kept(f, right, left))
+            }
 
             // 0 & A -> 0 (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: BitwiseAnd,
                 right,
-            }) if !info.nullable(&right)? && is_zero(&left) => Transformed::yes(*left),
+            }) if !info.nullable(&right)? && is_zero(&left) => {
+                Transformed::yes(kept(f, left, right))
+            }
 
             // !A & A -> 0 (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -1201,10 +1282,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseAnd,
                 right,
             }) if is_negative_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // A & !A -> 0 (if A not nullable)
@@ -1213,10 +1292,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseAnd,
                 right,
             }) if is_negative_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // (..A..) & A --> (..A..)
@@ -1224,14 +1301,18 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseAnd,
                 right,
-            }) if expr_contains(&left, &right, BitwiseAnd) => Transformed::yes(*left),
+            }) if expr_contains(&left, &right, BitwiseAnd) => {
+                Transformed::yes(kept(f, left, right))
+            }
 
             // A & (..A..) --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: BitwiseAnd,
                 right,
-            }) if expr_contains(&right, &left, BitwiseAnd) => Transformed::yes(*right),
+            }) if expr_contains(&right, &left, BitwiseAnd) => {
+                Transformed::yes(kept(f, right, left))
+            }
 
             // A & (A | B) --> A (if B not null)
             Expr::BinaryExpr(BinaryExpr {
@@ -1239,7 +1320,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseAnd,
                 right,
             }) if !info.nullable(&right)? && is_op_with(BitwiseOr, &right, &left) => {
-                Transformed::yes(*left)
+                Transformed::yes(kept(f, left, right))
             }
 
             // (A | B) & A --> A (if B not null)
@@ -1248,7 +1329,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseAnd,
                 right,
             }) if !info.nullable(&left)? && is_op_with(BitwiseOr, &left, &right) => {
-                Transformed::yes(*right)
+                Transformed::yes(kept(f, right, left))
             }
 
             //
@@ -1260,14 +1341,14 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseOr,
                 right,
-            }) if is_zero(&right) => Transformed::yes(*left),
+            }) if is_zero(&right) => Transformed::yes(kept(f, left, right)),
 
             // 0 | A -> A (even if A is null)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: BitwiseOr,
                 right,
-            }) if is_zero(&left) => Transformed::yes(*right),
+            }) if is_zero(&left) => Transformed::yes(kept(f, right, left)),
 
             // !A | A -> -1 (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -1275,10 +1356,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseOr,
                 right,
             }) if is_negative_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // A | !A -> -1 (if A not nullable)
@@ -1287,10 +1366,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseOr,
                 right,
             }) if is_negative_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // (..A..) | A --> (..A..)
@@ -1298,14 +1375,18 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseOr,
                 right,
-            }) if expr_contains(&left, &right, BitwiseOr) => Transformed::yes(*left),
+            }) if expr_contains(&left, &right, BitwiseOr) => {
+                Transformed::yes(kept(f, left, right))
+            }
 
             // A | (..A..) --> (..A..)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: BitwiseOr,
                 right,
-            }) if expr_contains(&right, &left, BitwiseOr) => Transformed::yes(*right),
+            }) if expr_contains(&right, &left, BitwiseOr) => {
+                Transformed::yes(kept(f, right, left))
+            }
 
             // A | (A & B) --> A (if B not null)
             Expr::BinaryExpr(BinaryExpr {
@@ -1313,7 +1394,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseOr,
                 right,
             }) if !info.nullable(&right)? && is_op_with(BitwiseAnd, &right, &left) => {
-                Transformed::yes(*left)
+                Transformed::yes(kept(f, left, right))
             }
 
             // (A & B) | A --> A (if B not null)
@@ -1322,7 +1403,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseOr,
                 right,
             }) if !info.nullable(&left)? && is_op_with(BitwiseAnd, &left, &right) => {
-                Transformed::yes(*right)
+                Transformed::yes(kept(f, right, left))
             }
 
             //
@@ -1334,14 +1415,18 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseXor,
                 right,
-            }) if !info.nullable(&left)? && is_zero(&right) => Transformed::yes(*left),
+            }) if !info.nullable(&left)? && is_zero(&right) => {
+                Transformed::yes(kept(f, left, right))
+            }
 
             // 0 ^ A -> A (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
                 left,
                 op: BitwiseXor,
                 right,
-            }) if !info.nullable(&right)? && is_zero(&left) => Transformed::yes(*right),
+            }) if !info.nullable(&right)? && is_zero(&left) => {
+                Transformed::yes(kept(f, right, left))
+            }
 
             // !A ^ A -> -1 (if A not nullable)
             Expr::BinaryExpr(BinaryExpr {
@@ -1349,10 +1434,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseXor,
                 right,
             }) if is_negative_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // A ^ !A -> -1 (if A not nullable)
@@ -1361,10 +1444,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseXor,
                 right,
             }) if is_negative_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(Expr::Literal(
-                    ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                    None,
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // (..A..) ^ A --> (the expression without A, if number of A is odd, otherwise one A)
@@ -1373,14 +1454,12 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseXor,
                 right,
             }) if expr_contains(&left, &right, BitwiseXor) => {
-                let expr = delete_xor_in_complex_expr(&left, &right, false);
+                let expr = delete_xor_in_complex_expr(f, &left, &right, false)?;
                 Transformed::yes(if expr == *right {
-                    Expr::Literal(
-                        ScalarValue::new_zero(&info.get_data_type(&right)?)?,
-                        None,
-                    )
+                    let zero = ScalarValue::new_zero(&info.get_data_type(&right)?)?;
+                    replaced(f, (expr, (left, right)), Expr::Literal(zero, None))
                 } else {
-                    expr
+                    replaced(f, (left, right), expr)
                 })
             }
 
@@ -1390,14 +1469,12 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseXor,
                 right,
             }) if expr_contains(&right, &left, BitwiseXor) => {
-                let expr = delete_xor_in_complex_expr(&right, &left, true);
+                let expr = delete_xor_in_complex_expr(f, &right, &left, true)?;
                 Transformed::yes(if expr == *left {
-                    Expr::Literal(
-                        ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                        None,
-                    )
+                    let zero = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                    replaced(f, (expr, (left, right)), Expr::Literal(zero, None))
                 } else {
-                    expr
+                    replaced(f, (left, right), expr)
                 })
             }
 
@@ -1410,7 +1487,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseShiftRight,
                 right,
-            }) if is_zero(&right) => Transformed::yes(*left),
+            }) if is_zero(&right) => Transformed::yes(kept(f, left, right)),
 
             //
             // Rules for BitwiseShiftRight
@@ -1421,17 +1498,19 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: BitwiseShiftLeft,
                 right,
-            }) if is_zero(&right) => Transformed::yes(*left),
+            }) if is_zero(&right) => Transformed::yes(kept(f, left, right)),
 
             //
             // Rules for Not
             //
-            Expr::Not(inner) => Transformed::yes(negate_clause(*inner)),
+            Expr::Not(inner) => Transformed::yes(negate_clause(f, f.unboxed(inner))?),
 
             //
             // Rules for Negative
             //
-            Expr::Negative(inner) => Transformed::yes(distribute_negation(*inner)),
+            Expr::Negative(inner) => {
+                Transformed::yes(distribute_negation(f, f.unboxed(inner))?)
+            }
 
             //
             // Rules for Case
@@ -1445,31 +1524,30 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: op @ (Eq | NotEq),
                 right,
             }) if is_case_with_literal_outputs(&left) && is_lit(&right) => {
-                let case = into_case(*left)?;
-                Transformed::yes(Expr::Case(Case {
-                    expr: None,
-                    when_then_expr: case
-                        .when_then_expr
-                        .into_iter()
-                        .map(|(when, then)| {
-                            (
-                                when,
-                                Box::new(Expr::BinaryExpr(BinaryExpr {
-                                    left: then,
-                                    op,
-                                    right: right.clone(),
-                                })),
-                            )
-                        })
-                        .collect(),
-                    else_expr: case.else_expr.map(|els| {
-                        Box::new(Expr::BinaryExpr(BinaryExpr {
-                            left: els,
-                            op,
-                            right,
-                        }))
-                    }),
-                }))
+                let mut case = into_case(f.unboxed(left))?;
+                // Each `THEN`'s box holds its comparison, the output boxed anew beside a
+                // copy of the literal, each charged first.
+                for (_, then) in case.when_then_expr.iter_mut() {
+                    let compared = f.boxed(f.cloned(right.as_ref())?)?;
+                    let output = f.boxed(std::mem::take(then.as_mut()))?;
+                    **then = Expr::BinaryExpr(BinaryExpr {
+                        left: output,
+                        op,
+                        right: compared,
+                    });
+                }
+                case.else_expr = match case.else_expr {
+                    Some(els) => Some(f.boxed(Expr::BinaryExpr(BinaryExpr {
+                        left: els,
+                        op,
+                        right,
+                    }))?),
+                    None => {
+                        freed(f, right);
+                        None
+                    }
+                };
+                Transformed::yes(Expr::Case(case))
             }
 
             // CASE WHEN true THEN A ... END --> A
@@ -1486,29 +1564,44 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 .any(|(when, _)| is_true(when.as_ref()) || is_false(when.as_ref())) =>
             {
                 let out_type = info.get_data_type(&when_then_expr[0].1)?;
-                let mut new_when_then_expr = Vec::with_capacity(when_then_expr.len());
+                let pairs_bytes =
+                    when_then_expr
+                        .capacity()
+                        .saturating_mul(size_of::<(Box<Expr>, Box<Expr>)>());
+                let mut new_when_then_expr = f.vec_with_capacity(when_then_expr.len())?;
 
-                for (when, then) in when_then_expr.into_iter() {
+                let mut pairs = when_then_expr.into_iter();
+                for (when, then) in pairs.by_ref() {
                     if is_true(when.as_ref()) {
                         // Skip adding the rest of the when-then expressions after WHEN true
                         // CASE WHEN X THEN A WHEN TRUE THEN B ... END --> CASE WHEN X THEN A ELSE B END
-                        else_expr = Some(then);
+                        freed(f, when);
+                        freed(f, else_expr.replace(then));
                         break;
                     } else if !is_false(when.as_ref()) {
+                        // Within the room charged for it: pushing allocates nothing.
                         new_when_then_expr.push((when, then));
+                    } else {
+                        // skip WHEN false cases
+                        freed(f, (when, then));
                     }
-                    // else: skip WHEN false cases
                 }
+                // The pairs skipped after WHEN true, and the old list's block, given back.
+                let rest = pairs.as_slice().iter().fold(pairs_bytes, |bytes, pair| {
+                    bytes.saturating_add(pair.freed_bytes())
+                });
+                drop(pairs);
+                f.discharge(rest);
 
                 // Exclude CASE statement altogether if there are no when-then expressions left
                 if new_when_then_expr.is_empty() {
+                    f.released(new_when_then_expr);
                     // CASE WHEN false THEN A ELSE B END --> B
                     if let Some(else_expr) = else_expr {
-                        return Ok(Transformed::yes(*else_expr));
+                        return Ok(Transformed::yes(f.unboxed(else_expr)));
                     // CASE WHEN false THEN A END --> NULL
                     } else {
-                        let null =
-                            Expr::Literal(ScalarValue::try_new_null(&out_type)?, None);
+                        let null = Expr::Literal(null_of(f, &out_type)?, None);
                         return Ok(Transformed::yes(null));
                     }
                 }
@@ -1548,18 +1641,29 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 // The disjunction of all the cases
                 let mut out_expr = lit(false);
 
+                let pairs_bytes =
+                    when_then_expr
+                        .capacity()
+                        .saturating_mul(size_of::<(Box<Expr>, Box<Expr>)>());
                 for (when, then) in when_then_expr {
-                    let when = is_exactly_true(*when, info)?;
-                    let case_expr =
-                        when.clone().and(filter_expr.clone().not()).and(*then);
+                    let when = is_exactly_true(f, f.unboxed(when), info)?;
+                    let not_filter = negated(f, f.cloned(&filter_expr)?)?;
+                    let case_expr = conjoined(
+                        f,
+                        conjoined(f, f.cloned(&when)?, not_filter)?,
+                        f.unboxed(then),
+                    )?;
 
-                    out_expr = out_expr.or(case_expr);
-                    filter_expr = filter_expr.or(when);
+                    out_expr = disjoined(f, out_expr, case_expr)?;
+                    filter_expr = disjoined(f, filter_expr, when)?;
                 }
+                f.discharge(pairs_bytes);
 
-                let else_expr = else_expr.map(|b| *b).unwrap_or_else(lit_bool_null);
-                let case_expr = filter_expr.not().and(else_expr);
-                out_expr = out_expr.or(case_expr);
+                let else_expr = else_expr
+                    .map(|b| f.unboxed(b))
+                    .unwrap_or_else(lit_bool_null);
+                let case_expr = conjoined(f, negated(f, filter_expr)?, else_expr)?;
+                out_expr = disjoined(f, out_expr, case_expr)?;
 
                 // Do a first pass at simplification
                 out_expr.rewrite(self)?
@@ -1586,7 +1690,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
             // simplified into a small number of ANDs and ORs
             Expr::Case(Case {
                 expr: None,
-                when_then_expr,
+                mut when_then_expr,
                 else_expr,
             }) if !when_then_expr.is_empty()
                 && when_then_expr
@@ -1600,28 +1704,42 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     < 3
                 && else_expr.as_deref().is_none_or(is_bool_lit) =>
             {
-                Transformed::yes(
+                // Each `THEN`'s box holds its negation, the output boxed anew, charged
+                // first.
+                for (_, then) in when_then_expr.iter_mut() {
+                    **then = Expr::Not(f.boxed(std::mem::take(then.as_mut()))?);
+                }
+                let else_expr = match else_expr {
+                    Some(else_expr) => Some(f.boxed(Expr::Not(else_expr))?),
+                    None => None,
+                };
+                Transformed::yes(negated(
+                    f,
                     Expr::Case(Case {
                         expr: None,
-                        when_then_expr: when_then_expr
-                            .into_iter()
-                            .map(|(when, then)| (when, Box::new(Expr::Not(then))))
-                            .collect(),
-                        else_expr: else_expr
-                            .map(|else_expr| Box::new(Expr::Not(else_expr))),
-                    })
-                    .not(),
-                )
+                        when_then_expr,
+                        else_expr,
+                    }),
+                )?)
             }
+            // A function's own simplification takes no funding: what it frees is given back
+            // and what it makes charged as soon as it is made.
             Expr::ScalarFunction(ScalarFunction { func: udf, args }) => {
+                let freed_bytes = args.freed_bytes();
                 match udf.simplify(args, info)? {
                     ExprSimplifyResult::Original(args) => {
+                        f.discharge(freed_bytes);
+                        f.charge(args.freed_bytes())?;
                         Transformed::no(Expr::ScalarFunction(ScalarFunction {
                             func: udf,
                             args,
                         }))
                     }
-                    ExprSimplifyResult::Simplified(expr) => Transformed::yes(expr),
+                    ExprSimplifyResult::Simplified(expr) => {
+                        f.discharge(freed_bytes);
+                        f.charge(expr.freed_bytes())?;
+                        Transformed::yes(expr)
+                    }
                 }
             }
 
@@ -1629,15 +1747,29 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 ref func,
                 ..
             }) => match (func.simplify(), expr) {
-                (Some(simplify_function), Expr::AggregateFunction(af)) => {
-                    Transformed::yes(simplify_function(af, info)?)
+                (Some(simplify_function), expr @ Expr::AggregateFunction(_)) => {
+                    let freed_bytes = expr.freed_bytes();
+                    let Expr::AggregateFunction(af) = expr else {
+                        unreachable!()
+                    };
+                    let expr = simplify_function(af, info)?;
+                    f.discharge(freed_bytes);
+                    f.charge(expr.freed_bytes())?;
+                    Transformed::yes(expr)
                 }
                 (_, expr) => Transformed::no(expr),
             },
 
             Expr::WindowFunction(ref window_fun) => match (window_fun.simplify(), expr) {
-                (Some(simplify_function), Expr::WindowFunction(wf)) => {
-                    Transformed::yes(simplify_function(*wf, info)?)
+                (Some(simplify_function), expr @ Expr::WindowFunction(_)) => {
+                    let freed_bytes = expr.freed_bytes();
+                    let Expr::WindowFunction(wf) = expr else {
+                        unreachable!()
+                    };
+                    let expr = simplify_function(*wf, info)?;
+                    f.discharge(freed_bytes);
+                    f.charge(expr.freed_bytes())?;
+                    Transformed::yes(expr)
                 }
                 (_, expr) => Transformed::no(expr),
             },
@@ -1648,16 +1780,22 @@ impl TreeNodeRewriter for Simplifier<'_> {
 
             // a between 3 and 5  -->  a >= 3 AND a <=5
             // a not between 3 and 5  -->  a < 3 OR a > 5
-            Expr::Between(between) => Transformed::yes(if between.negated {
-                let l = *between.expr.clone();
-                let r = *between.expr;
-                or(l.lt(*between.low), r.gt(*between.high))
-            } else {
-                and(
-                    between.expr.clone().gt_eq(*between.low),
-                    between.expr.lt_eq(*between.high),
-                )
-            }),
+            Expr::Between(Between {
+                expr,
+                negated,
+                low,
+                high,
+            }) => {
+                let (low_op, high_op, join) = if negated {
+                    (Lt, Gt, Or)
+                } else {
+                    (GtEq, LtEq, And)
+                };
+                let copy = f.boxed(f.cloned(expr.as_ref())?)?;
+                let low = Expr::BinaryExpr(BinaryExpr::new(copy, low_op, low));
+                let high = Expr::BinaryExpr(BinaryExpr::new(expr, high_op, high));
+                Transformed::yes(binary(f, low, join, high)?)
+            }
 
             //
             // Rules for regexes
@@ -1666,7 +1804,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 left,
                 op: op @ (RegexMatch | RegexNotMatch | RegexIMatch | RegexNotIMatch),
                 right,
-            }) => simplify_regex_expr(left, op, right)?,
+            }) => simplify_regex_expr(f, left, op, right)?,
 
             // Rules for Like
             Expr::Like(like) => {
@@ -1677,7 +1815,13 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     Some(string_scalar) => {
                         let pattern_str = string_scalar.as_str();
                         match pattern_str {
-                            None => return Ok(Transformed::yes(lit_bool_null())),
+                            None => {
+                                return Ok(Transformed::yes(replaced(
+                                    f,
+                                    Expr::Like(like),
+                                    lit_bool_null(),
+                                )));
+                            }
                             Some("%") => {
                                 // exp LIKE '%' is
                                 //   - when exp is not NULL, it's true
@@ -1687,14 +1831,17 @@ impl TreeNodeRewriter for Simplifier<'_> {
                                 //   - when exp is NULL, it's NULL
                                 let result_for_non_null = lit(!like.negated);
                                 Transformed::yes(if !info.nullable(&like.expr)? {
-                                    result_for_non_null
+                                    replaced(f, Expr::Like(like), result_for_non_null)
                                 } else {
+                                    let Like { expr, pattern, .. } = like;
+                                    freed(f, pattern);
+                                    let when_then_expr = f.vec_of([(
+                                        f.boxed(lit(true))?,
+                                        f.boxed(result_for_non_null)?,
+                                    )])?;
                                     Expr::Case(Case {
-                                        expr: Some(Box::new(Expr::IsNotNull(like.expr))),
-                                        when_then_expr: vec![(
-                                            Box::new(lit(true)),
-                                            Box::new(result_for_non_null),
-                                        )],
+                                        expr: Some(f.boxed(Expr::IsNotNull(expr))?),
+                                        when_then_expr,
                                         else_expr: None,
                                     })
                                 })
@@ -1706,16 +1853,15 @@ impl TreeNodeRewriter for Simplifier<'_> {
                                 // Repeated occurrences of wildcard are redundant so remove them
                                 // exp LIKE '%%'  --> exp LIKE '%'
 
-                                static LIKE_REGEX: LazyLock<Regex> =
-                                    LazyLock::new(|| Regex::new("%%+").unwrap());
                                 let simplified_pattern =
-                                    LIKE_REGEX.replace_all(pattern_str, "%").to_string();
-                                Transformed::yes(Expr::Like(Like {
-                                    pattern: Box::new(
-                                        string_scalar.to_expr(&simplified_pattern),
-                                    ),
-                                    ..like
-                                }))
+                                    collapsed_wildcards(f, pattern_str)?;
+                                let pattern = string_scalar.to_expr(simplified_pattern);
+                                let mut like = like;
+                                freed(
+                                    f,
+                                    std::mem::replace(like.pattern.as_mut(), pattern),
+                                );
+                                Transformed::yes(Expr::Like(like))
                             }
                             Some(pattern_str)
                                 if !like.case_insensitive
@@ -1725,9 +1871,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                                 // If the pattern does not contain any wildcards, we can simplify the like expression to an equality expression
                                 // TODO: handle escape characters
                                 Transformed::yes(Expr::BinaryExpr(BinaryExpr {
-                                    left: like.expr.clone(),
+                                    left: like.expr,
                                     op: if like.negated { NotEq } else { Eq },
-                                    right: like.pattern.clone(),
+                                    right: like.pattern,
                                 }))
                             }
 
@@ -1742,21 +1888,23 @@ impl TreeNodeRewriter for Simplifier<'_> {
             Expr::IsNotNull(expr) | Expr::IsNotUnknown(expr)
                 if !info.nullable(&expr)? =>
             {
-                Transformed::yes(lit(true))
+                Transformed::yes(replaced(f, expr, lit(true)))
             }
 
             // a is null/unknown --> false (if a is not nullable)
             Expr::IsNull(expr) | Expr::IsUnknown(expr) if !info.nullable(&expr)? => {
-                Transformed::yes(lit(false))
+                Transformed::yes(replaced(f, expr, lit(false)))
             }
 
             // expr IN () --> false
             // expr NOT IN () --> true
             Expr::InList(InList {
-                expr: _,
+                expr,
                 list,
                 negated,
-            }) if list.is_empty() => Transformed::yes(lit(negated)),
+            }) if list.is_empty() => {
+                Transformed::yes(replaced(f, (expr, list), lit(negated)))
+            }
 
             // null in (x, y, z) --> null
             // null not in (x, y, z) --> null
@@ -1765,7 +1913,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 list,
                 negated: _,
             }) if is_null(expr.as_ref()) && !list.is_empty() => {
-                Transformed::yes(lit_bool_null())
+                Transformed::yes(replaced(f, (expr, list), lit_bool_null()))
             }
 
             // expr IN ((subquery)) -> expr IN (subquery), see ##5529
@@ -1779,6 +1927,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 let Expr::ScalarSubquery(subquery) = list.remove(0) else {
                     unreachable!()
                 };
+                f.released(list);
 
                 Transformed::yes(Expr::InSubquery(InSubquery::new(
                     expr, subquery, negated,
@@ -1793,17 +1942,16 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: Or,
                 right,
             }) if are_inlist_and_eq(left.as_ref(), right.as_ref()) => {
-                let lhs = to_inlist(*left).unwrap();
-                let rhs = to_inlist(*right).unwrap();
-                #[allow(clippy::allow_attributes, clippy::mutable_key_type)]
-                // Expr contains Arc with interior mutability but is intentionally used as hash key
-                let mut seen: HashSet<Expr> = HashSet::new();
-                let list = lhs
-                    .list
-                    .into_iter()
-                    .chain(rhs.list)
-                    .filter(|e| seen.insert(e.to_owned()))
-                    .collect::<Vec<_>>();
+                let lhs = to_inlist(f, f.unboxed(left))?;
+                let rhs = to_inlist(f, f.unboxed(right))?;
+                freed(f, rhs.expr);
+                let mut list = lhs.list;
+                let mut rhs_list = rhs.list;
+                f.reserve(&mut list, rhs_list.len())?;
+                // Within the room charged for it: extending allocates nothing.
+                list.extend(rhs_list.drain(..));
+                f.released(rhs_list);
+                deduplicated(f, &mut list)?;
 
                 let merged_inlist = InList {
                     expr: lhs.expr,
@@ -1841,9 +1989,10 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 false,
             ) =>
             {
-                match (*left, *right) {
+                match (f.unboxed(left), f.unboxed(right)) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_intersection(l1, &l2, false).map(Transformed::yes);
+                        return inlist_intersection(f, l1, l2, false)
+                            .map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1861,9 +2010,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 true,
             ) =>
             {
-                match (*left, *right) {
+                match (f.unboxed(left), f.unboxed(right)) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_union(l1, l2, true).map(Transformed::yes);
+                        return inlist_union(f, l1, l2, true).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1881,9 +2030,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 true,
             ) =>
             {
-                match (*left, *right) {
+                match (f.unboxed(left), f.unboxed(right)) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_except(l1, &l2).map(Transformed::yes);
+                        return inlist_except(f, l1, l2).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1901,9 +2050,9 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 false,
             ) =>
             {
-                match (*left, *right) {
+                match (f.unboxed(left), f.unboxed(right)) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_except(l2, &l1).map(Transformed::yes);
+                        return inlist_except(f, l2, l1).map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1921,9 +2070,10 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 true,
             ) =>
             {
-                match (*left, *right) {
+                match (f.unboxed(left), f.unboxed(right)) {
                     (Expr::InList(l1), Expr::InList(l2)) => {
-                        return inlist_intersection(l1, &l2, true).map(Transformed::yes);
+                        return inlist_intersection(f, l1, l2, true)
+                            .map(Transformed::yes);
                     }
                     // Matched previously once
                     _ => unreachable!(),
@@ -1941,7 +2091,13 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     info, &left, op, &right,
                 ) && op.supports_propagation() =>
             {
-                unwrap_cast_in_comparison_for_binary(info, *left, *right, op)?
+                unwrap_cast_in_comparison_for_binary(
+                    f,
+                    info,
+                    f.unboxed(left),
+                    f.unboxed(right),
+                    op,
+                )?
             }
             // literal op try_cast/cast(expr as data_type)
             // -->
@@ -1953,59 +2109,60 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     && op.swap().is_some() =>
             {
                 unwrap_cast_in_comparison_for_binary(
+                    f,
                     info,
-                    *right,
-                    *left,
+                    f.unboxed(right),
+                    f.unboxed(left),
                     op.swap().unwrap(),
                 )?
             }
             // For case:
             // try_cast/cast(expr as left_type) in (expr1,expr2,expr3)
             Expr::InList(InList {
-                expr: mut left,
-                list,
+                expr: left,
+                mut list,
                 negated,
             }) if is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
                 info, &left, &list,
             ) =>
             {
-                let (Expr::TryCast(TryCast {
-                    expr: left_expr, ..
-                })
-                | Expr::Cast(Cast {
-                    expr: left_expr, ..
-                })) = left.as_mut()
-                else {
-                    return internal_err!("Expect cast expr, but got {:?}", left)?;
+                // The cast's own box is given back; the box it holds is the list's.
+                let left_expr = match f.unboxed(left) {
+                    Expr::TryCast(TryCast { expr, .. })
+                    | Expr::Cast(Cast { expr, .. }) => expr,
+                    other => {
+                        return internal_err!("Expect cast expr, but got {:?}", other);
+                    }
                 };
 
-                let expr_type = info.get_data_type(left_expr)?;
-                let right_exprs = list
-                    .into_iter()
-                    .map(|right| {
-                        match right {
-                            Expr::Literal(right_lit_value, _) => {
-                                // if the right_lit_value can be casted to the type of internal_left_expr
-                                // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
-                                let Some(value) = try_cast_literal_to_type(&right_lit_value, &expr_type) else {
-                                    internal_err!(
-                                        "Can't cast the list expr {:?} to type {}",
-                                        right_lit_value, &expr_type
-                                    )?
-                                };
-                                Ok(lit(value))
-                            }
-                            other_expr => internal_err!(
-                                "Only support literal expr to optimize, but the expr is {:?}",
-                                &other_expr
-                            ),
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let expr_type = info.get_data_type(&left_expr)?;
+                // Each literal replaced in place by its cast. The cast kernels take no
+                // funding: what a cast value holds is charged as soon as it is made.
+                for right in list.iter_mut() {
+                    let Expr::Literal(right_lit_value, _) = right else {
+                        return internal_err!(
+                            "Only support literal expr to optimize, but the expr is {:?}",
+                            right
+                        );
+                    };
+                    // if the right_lit_value can be casted to the type of internal_left_expr
+                    // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
+                    let Some(value) =
+                        try_cast_literal_to_type(right_lit_value, &expr_type)
+                    else {
+                        return internal_err!(
+                            "Can't cast the list expr {:?} to type {}",
+                            right_lit_value,
+                            &expr_type
+                        );
+                    };
+                    f.charge(value.freed_bytes())?;
+                    freed(f, std::mem::replace(right, lit(value)));
+                }
 
                 Transformed::yes(Expr::InList(InList {
-                    expr: std::mem::take(left_expr),
-                    list: right_exprs,
+                    expr: left_expr,
+                    list,
                     negated,
                 }))
             }
@@ -2039,14 +2196,20 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 }
 
                 if let PreimageResult::Range { interval, expr } =
-                    get_preimage(left.as_ref(), right.as_ref(), info)?
+                    get_preimage(f, left.as_ref(), right.as_ref(), info)?
                 {
-                    rewrite_with_preimage(*interval, op, expr)?
+                    let rewritten = rewrite_with_preimage(f, *interval, op, expr)?;
+                    rewritten
+                        .update_data(|rewritten| replaced(f, (left, right), rewritten))
                 } else if let Some(swapped) = op.swap() {
                     if let PreimageResult::Range { interval, expr } =
-                        get_preimage(right.as_ref(), left.as_ref(), info)?
+                        get_preimage(f, right.as_ref(), left.as_ref(), info)?
                     {
-                        rewrite_with_preimage(*interval, swapped, expr)?
+                        let rewritten =
+                            rewrite_with_preimage(f, *interval, swapped, expr)?;
+                        rewritten.update_data(|rewritten| {
+                            replaced(f, (left, right), rewritten)
+                        })
                     } else {
                         Transformed::no(Expr::BinaryExpr(BinaryExpr { left, op, right }))
                     }
@@ -2069,14 +2232,15 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     })));
                 }
 
-                let (op, combiner): (Operator, fn(Expr, Expr) -> Expr) =
-                    if negated { (NotEq, and) } else { (Eq, or) };
+                let (op, combiner) = if negated { (NotEq, And) } else { (Eq, Or) };
 
                 let mut rewritten: Option<Expr> = None;
                 for item in &list {
                     let PreimageResult::Range { interval, expr } =
-                        get_preimage(expr.as_ref(), item, info)?
+                        get_preimage(f, expr.as_ref(), item, info)?
                     else {
+                        // What the items rewritten so far made is given back.
+                        freed(f, rewritten);
                         return Ok(Transformed::no(Expr::InList(InList {
                             expr,
                             list,
@@ -2084,15 +2248,15 @@ impl TreeNodeRewriter for Simplifier<'_> {
                         })));
                     };
 
-                    let range_expr = rewrite_with_preimage(*interval, op, expr)?.data;
+                    let range_expr = rewrite_with_preimage(f, *interval, op, expr)?.data;
                     rewritten = Some(match rewritten {
                         None => range_expr,
-                        Some(acc) => combiner(acc, range_expr),
+                        Some(acc) => binary(f, acc, combiner, range_expr)?,
                     });
                 }
 
                 if let Some(rewritten) = rewritten {
-                    Transformed::yes(rewritten)
+                    Transformed::yes(replaced(f, (expr, list), rewritten))
                 } else {
                     Transformed::no(Expr::InList(InList {
                         expr,
@@ -2108,7 +2272,10 @@ impl TreeNodeRewriter for Simplifier<'_> {
     }
 }
 
+/// The preimage of `left_expr`, if it has one. A function's preimage takes no funding: the
+/// expression it makes is charged as soon as it is made.
 fn get_preimage(
+    f: &Funding,
     left_expr: &Expr,
     right_expr: &Expr,
     info: &SimplifyContext,
@@ -2122,7 +2289,11 @@ fn get_preimage(
     if func.signature().volatility != Volatility::Immutable {
         return Ok(PreimageResult::None);
     }
-    func.preimage(args, right_expr, info)
+    let preimage = func.preimage(args, right_expr, info)?;
+    if let PreimageResult::Range { expr, .. } = &preimage {
+        f.charge(expr.freed_bytes())?;
+    }
+    Ok(preimage)
 }
 
 fn is_literal_or_literal_cast(expr: &Expr) -> bool {
@@ -2173,24 +2344,24 @@ impl<'a> StringScalar<'a> {
         }
     }
 
-    /// Build a new `Expr` of the same string type with the given value.
-    pub(crate) fn to_expr(&self, val: &str) -> Expr {
+    /// Build a new `Expr` of the same string type holding the given value.
+    pub(crate) fn to_expr(&self, val: String) -> Expr {
         match self {
-            Self::Utf8(_) => Expr::Literal(ScalarValue::Utf8(Some(val.to_owned())), None),
-            Self::LargeUtf8(_) => {
-                Expr::Literal(ScalarValue::LargeUtf8(Some(val.to_owned())), None)
-            }
-            Self::Utf8View(_) => {
-                Expr::Literal(ScalarValue::Utf8View(Some(val.to_owned())), None)
-            }
+            Self::Utf8(_) => Expr::Literal(ScalarValue::Utf8(Some(val)), None),
+            Self::LargeUtf8(_) => Expr::Literal(ScalarValue::LargeUtf8(Some(val)), None),
+            Self::Utf8View(_) => Expr::Literal(ScalarValue::Utf8View(Some(val)), None),
         }
     }
 }
 
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
-fn has_common_conjunction(lhs: &Expr, rhs: &Expr) -> bool {
-    let lhs_set: HashSet<&Expr> = iter_conjunction(lhs).collect();
-    iter_conjunction(rhs).any(|e| lhs_set.contains(&e) && !e.is_volatile())
+/// Whether a non-volatile conjunct of `rhs` is a conjunct of `lhs` too, found through a
+/// [`HashIndex`] of `lhs`'s conjuncts, charged first.
+fn has_common_conjunction(f: &Funding, lhs: &Expr, rhs: &Expr) -> Result<bool> {
+    let lhs = conjuncts(f, lhs)?;
+    let lhs = HashIndex::new(f, &lhs[..])?;
+    Ok(any_conjunct(rhs, &mut |e| {
+        lhs.contains(&e) && !e.is_volatile()
+    }))
 }
 
 // TODO: We might not need this after defer pattern for Box is stabilized. https://github.com/rust-lang/rust/issues/87121
@@ -2212,33 +2383,27 @@ fn are_inlist_and_eq_and_match_neg(
 fn are_inlist_and_eq(left: &Expr, right: &Expr) -> bool {
     let left = as_inlist(left);
     let right = as_inlist(right);
-    if let (Some(lhs), Some(rhs)) = (left, right) {
-        matches!(lhs.expr.as_ref(), Expr::Column(_))
-            && matches!(rhs.expr.as_ref(), Expr::Column(_))
-            && lhs.expr == rhs.expr
-            && !lhs.negated
-            && !rhs.negated
+    if let (Some((lhs_expr, lhs_negated)), Some((rhs_expr, rhs_negated))) = (left, right)
+    {
+        matches!(lhs_expr, Expr::Column(_))
+            && matches!(rhs_expr, Expr::Column(_))
+            && lhs_expr == rhs_expr
+            && !lhs_negated
+            && !rhs_negated
     } else {
         false
     }
 }
 
-/// Try to convert an expression to an in-list expression
-fn as_inlist(expr: &'_ Expr) -> Option<Cow<'_, InList>> {
+/// What an expression would test as an in-list expression (its expression and whether it
+/// is negated), found without making the list
+fn as_inlist(expr: &Expr) -> Option<(&Expr, bool)> {
     match expr {
-        Expr::InList(inlist) => Some(Cow::Borrowed(inlist)),
+        Expr::InList(inlist) => Some((inlist.expr.as_ref(), inlist.negated)),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(_), Expr::Literal(_, _)) => Some(Cow::Owned(InList {
-                    expr: left.clone(),
-                    list: vec![*right.clone()],
-                    negated: false,
-                })),
-                (Expr::Literal(_, _), Expr::Column(_)) => Some(Cow::Owned(InList {
-                    expr: right.clone(),
-                    list: vec![*left.clone()],
-                    negated: false,
-                })),
+                (Expr::Column(_), Expr::Literal(_, _)) => Some((left.as_ref(), false)),
+                (Expr::Literal(_, _), Expr::Column(_)) => Some((right.as_ref(), false)),
                 _ => None,
             }
         }
@@ -2246,91 +2411,111 @@ fn as_inlist(expr: &'_ Expr) -> Option<Cow<'_, InList>> {
     }
 }
 
-fn to_inlist(expr: Expr) -> Option<InList> {
+/// Convert an expression to an in-list expression, its list charged first
+fn to_inlist(f: &Funding, expr: Expr) -> Result<InList> {
     match expr {
-        Expr::InList(inlist) => Some(inlist),
+        Expr::InList(inlist) => Ok(inlist),
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,
             right,
         }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(_), Expr::Literal(_, _)) => Some(InList {
+            (Expr::Column(_), Expr::Literal(_, _)) => Ok(InList {
                 expr: left,
-                list: vec![*right],
+                list: f.vec_of([f.unboxed(right)])?,
                 negated: false,
             }),
-            (Expr::Literal(_, _), Expr::Column(_)) => Some(InList {
+            (Expr::Literal(_, _), Expr::Column(_)) => Ok(InList {
                 expr: right,
-                list: vec![*left],
+                list: f.vec_of([f.unboxed(left)])?,
                 negated: false,
             }),
-            _ => None,
+            _ => internal_err!("Expected an equality to a literal"),
         },
-        _ => None,
+        _ => internal_err!("Expected an IN list or an equality"),
     }
+}
+
+/// `list` with the items found in `index` removed, each removed freed and given back.
+fn retained(f: &Funding, list: &mut Vec<Expr>, index: &HashIndex<'_, Expr>, found: bool) {
+    list.retain(|e| {
+        let kept = index.contains(e) == found;
+        if !kept {
+            f.discharge(e.freed_bytes());
+        }
+        kept
+    });
 }
 
 /// Return the union of two inlist expressions
 /// maintaining the order of the elements in the two lists
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
-fn inlist_union(mut l1: InList, l2: InList, negated: bool) -> Result<Expr> {
+fn inlist_union(f: &Funding, mut l1: InList, l2: InList, negated: bool) -> Result<Expr> {
     // extend the list in l1 with the elements in l2 that are not already in l1
-    let l1_items: HashSet<_> = l1.list.iter().collect();
+    let InList {
+        expr,
+        list: mut keep_l2,
+        ..
+    } = l2;
+    freed(f, expr);
+    {
+        let l1_items = HashIndex::new(f, &l1.list)?;
+        // keep all l2 items that do not also appear in l1
+        retained(f, &mut keep_l2, &l1_items, false);
+    }
 
-    // keep all l2 items that do not also appear in l1
-    let keep_l2: Vec<_> = l2
-        .list
-        .into_iter()
-        .filter_map(|e| if l1_items.contains(&e) { None } else { Some(e) })
-        .collect();
-
-    l1.list.extend(keep_l2);
+    f.reserve(&mut l1.list, keep_l2.len())?;
+    // Within the room charged for it: extending allocates nothing.
+    l1.list.extend(keep_l2.drain(..));
+    f.released(keep_l2);
     l1.negated = negated;
     Ok(Expr::InList(l1))
 }
 
 /// Return the intersection of two inlist expressions
 /// maintaining the order of the elements in the two lists
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
-fn inlist_intersection(mut l1: InList, l2: &InList, negated: bool) -> Result<Expr> {
-    let l2_items = l2.list.iter().collect::<HashSet<_>>();
-
-    // remove all items from l1 that are not in l2
-    l1.list.retain(|e| l2_items.contains(e));
+fn inlist_intersection(
+    f: &Funding,
+    mut l1: InList,
+    l2: InList,
+    negated: bool,
+) -> Result<Expr> {
+    {
+        let l2_items = HashIndex::new(f, &l2.list)?;
+        // remove all items from l1 that are not in l2
+        retained(f, &mut l1.list, &l2_items, true);
+    }
+    freed(f, Expr::InList(l2));
 
     // e in () is always false
     // e not in () is always true
     if l1.list.is_empty() {
-        return Ok(lit(negated));
+        return Ok(replaced(f, Expr::InList(l1), lit(negated)));
     }
     Ok(Expr::InList(l1))
 }
 
 /// Return the all items in l1 that are not in l2
 /// maintaining the order of the elements in the two lists
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
-fn inlist_except(mut l1: InList, l2: &InList) -> Result<Expr> {
-    let l2_items = l2.list.iter().collect::<HashSet<_>>();
-
-    // keep only items from l1 that are not in l2
-    l1.list.retain(|e| !l2_items.contains(e));
+fn inlist_except(f: &Funding, mut l1: InList, l2: InList) -> Result<Expr> {
+    {
+        let l2_items = HashIndex::new(f, &l2.list)?;
+        // keep only items from l1 that are not in l2
+        retained(f, &mut l1.list, &l2_items, false);
+    }
+    freed(f, Expr::InList(l2));
 
     if l1.list.is_empty() {
-        return Ok(lit(false));
+        return Ok(replaced(f, Expr::InList(l1), lit(false)));
     }
     Ok(Expr::InList(l1))
 }
 
 /// Returns expression testing a boolean `expr` for being exactly `true` (not `false` or NULL).
-fn is_exactly_true(expr: Expr, info: &SimplifyContext) -> Result<Expr> {
+fn is_exactly_true(f: &Funding, expr: Expr, info: &SimplifyContext) -> Result<Expr> {
     if !info.nullable(&expr)? {
         Ok(expr)
     } else {
-        Ok(Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(expr),
-            op: Operator::IsNotDistinctFrom,
-            right: Box::new(lit(true)),
-        }))
+        binary(f, expr, Operator::IsNotDistinctFrom, lit(true))
     }
 }
 
@@ -2339,25 +2524,51 @@ fn is_exactly_true(expr: Expr, info: &SimplifyContext) -> Result<Expr> {
 //
 // Move this function body out of the large match branch avoid stack overflow
 fn simplify_right_is_one_case(
+    f: &Funding,
     info: &SimplifyContext,
     left: Box<Expr>,
     op: &Operator,
-    right: &Expr,
+    right: Box<Expr>,
 ) -> Result<Transformed<Expr>> {
     // Check if resulting type would be different due to coercion
     let left_type = info.get_data_type(&left)?;
-    let right_type = info.get_data_type(right)?;
+    let right_type = info.get_data_type(&right)?;
+    freed(f, right);
     match BinaryTypeCoercer::new(&left_type, op, &right_type).get_result_type() {
         Ok(result_type) => {
             // Only cast if the types differ
             if left_type != result_type {
+                // The cast's field, holding the type, charged before it is made; `left`'s
+                // box is the cast's.
+                f.charge(arc_bytes::<Field>().saturating_add(result_type.clone_bytes()))?;
                 Ok(Transformed::yes(Expr::Cast(Cast::new(left, result_type))))
             } else {
-                Ok(Transformed::yes(*left))
+                Ok(Transformed::yes(f.unboxed(left)))
             }
         }
-        Err(_) => Ok(Transformed::yes(*left)),
+        Err(_) => Ok(Transformed::yes(f.unboxed(left))),
     }
+}
+
+/// `pattern` with each run of `%` wildcards collapsed into one, in a text of exactly its
+/// bytes, charged before it is made.
+fn collapsed_wildcards(f: &Funding, pattern: &str) -> Result<String> {
+    let doubled = pattern
+        .as_bytes()
+        .windows(2)
+        .filter(|pair| pair == b"%%")
+        .count();
+    let mut collapsed = String::new();
+    f.reserve_exact(&mut collapsed, pattern.len() - doubled)?;
+    let mut after_wildcard = false;
+    for c in pattern.chars() {
+        if !(c == '%' && after_wildcard) {
+            // Within the room charged for it: pushing allocates nothing.
+            collapsed.push(c);
+        }
+        after_wildcard = c == '%';
+    }
+    Ok(collapsed)
 }
 
 #[cfg(test)]
@@ -2385,7 +2596,7 @@ mod tests {
     use std::sync::LazyLock;
     use std::{
         collections::HashMap,
-        ops::{BitAnd, BitOr, BitXor},
+        ops::{BitAnd, BitOr, BitXor, Not},
         sync::Arc,
     };
 
@@ -2550,7 +2761,7 @@ mod tests {
     fn in_subquery_expr(a_nullable: bool) -> Expr {
         let schema = Schema::new(vec![Field::new("a", DataType::Int64, a_nullable)]);
         let source = Arc::new(LogicalTableSource::new(Arc::new(schema)));
-        let subquery = LogicalPlanBuilder::scan("t", source, None, &datafusion_common::funding::Funding::default())
+        let subquery = LogicalPlanBuilder::scan("t", source, None, &Funding::default())
             .unwrap()
             .project(vec![col("a")])
             .unwrap()

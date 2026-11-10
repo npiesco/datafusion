@@ -16,11 +16,14 @@
 // under the License.
 
 //! [`EliminateLimit`] eliminates `LIMIT` when possible
+use crate::funded::{freed, unwrapped};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
 use datafusion_common::tree_node::Transformed;
-use datafusion_expr::logical_plan::{EmptyRelation, FetchType, LogicalPlan, SkipType};
+use datafusion_expr::logical_plan::{
+    EmptyRelation, FetchType, Limit, LogicalPlan, SkipType,
+};
 use std::sync::Arc;
 
 /// Optimizer rule to replace `LIMIT 0` or `LIMIT` whose ancestor LIMIT's skip is
@@ -56,7 +59,7 @@ impl OptimizerRule for EliminateLimit {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>, datafusion_common::DataFusionError> {
         match plan {
             LogicalPlan::Limit(limit) => {
@@ -67,18 +70,23 @@ impl OptimizerRule for EliminateLimit {
 
                 if let Some(v) = fetch {
                     if v == 0 {
+                        let schema = Arc::clone(limit.input.schema());
+                        // The limit is dropped: what it held alone is given back.
+                        freed(&config.funding(), LogicalPlan::Limit(limit));
                         return Ok(Transformed::yes(LogicalPlan::EmptyRelation(
                             EmptyRelation {
                                 produce_one_row: false,
-                                schema: Arc::clone(limit.input.schema()),
+                                schema,
                             },
                         )));
                     }
                 } else if matches!(limit.get_skip_type()?, SkipType::Literal(0)) {
                     // If fetch is `None` and skip is 0, then Limit takes no effect and
                     // we can remove it. Its input also can be Limit, so we should apply again.
-                    #[expect(clippy::used_underscore_binding)]
-                    return self.rewrite(Arc::unwrap_or_clone(limit.input), _config);
+                    let funding = config.funding();
+                    let Limit { skip, fetch, input } = limit;
+                    freed(&funding, (skip, fetch));
+                    return self.rewrite(unwrapped(&funding, input)?, config);
                 }
                 Ok(Transformed::no(LogicalPlan::Limit(limit)))
             }

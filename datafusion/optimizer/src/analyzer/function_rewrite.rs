@@ -22,9 +22,12 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{DFSchema, Result};
 
+use crate::funded::{
+    Freed, Released, map_plan_exprs_mut, merged_input_schema, merged_with, rebalanced,
+    transform_up_plan_with_subqueries,
+};
 use crate::utils::NamePreserver;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
-use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{DmlStatement, LogicalPlan, WriteOp};
 use std::sync::Arc;
 
@@ -46,22 +49,18 @@ impl ApplyFunctionRewrites {
         plan: LogicalPlan,
         options: &ConfigOptions,
     ) -> Result<Transformed<LogicalPlan>> {
+        let f = &options.funding;
         // get schema representing all available input fields. This is used for data type
         // resolution only, so order does not matter here
-        let mut schema = merge_schema(
-            &plan.inputs(),
-            &datafusion_common::funding::Funding::default(),
-        )?;
+        let mut schema = merged_input_schema(f, &plan)?;
 
         if let LogicalPlan::TableScan(ts) = &plan {
             let source_schema = DFSchema::try_from_qualified_schema(
                 ts.table_name.clone(),
-                &ts.source.schema(), &datafusion_common::funding::Funding::default(),
-            )?;
-            schema = schema.merge(
-                &source_schema,
+                &ts.source.schema(),
                 &datafusion_common::funding::Funding::default(),
             )?;
+            schema = merged_with(f, schema, &source_schema)?;
         }
 
         // MERGE expressions reference the target table, which is not one of
@@ -76,21 +75,24 @@ impl ApplyFunctionRewrites {
         {
             let target_schema = DFSchema::try_from_qualified_schema(
                 table_name.clone(),
-                &target.schema(), &datafusion_common::funding::Funding::default(),
-            )?;
-            schema = schema.merge(
-                &target_schema,
+                &target.schema(),
                 &datafusion_common::funding::Funding::default(),
             )?;
+            schema = merged_with(f, schema, &target_schema)?;
         }
+        // Freed once the expressions are rewritten.
+        let (schema, bytes) = schema;
+        let schema = Released::new(f, schema, bytes);
 
         let name_preserver = NamePreserver::new(&plan);
 
-        plan.map_expressions(|expr| {
-            let original_name = name_preserver.save(&expr);
+        let mut plan = plan;
+        let changed = map_plan_exprs_mut(&mut plan, &mut |expr| {
+            let original_name = name_preserver.save(expr, f)?;
+            let before = expr.freed_bytes();
 
             // recursively transform the expression, applying the rewrites at each step
-            let transformed_expr = expr.transform_up(|expr| {
+            let transformed_expr = std::mem::take(expr).transform_up(|expr| {
                 let mut result = Transformed::no(expr);
                 for rewriter in self.function_rewrites.iter() {
                     result = result.transform_data(|expr| {
@@ -99,9 +101,15 @@ impl ApplyFunctionRewrites {
                 }
                 Ok(result)
             })?;
+            // The rewrites allocate on their own: what they changed is charged once made.
+            if transformed_expr.transformed {
+                rebalanced(f, before, transformed_expr.data.freed_bytes())?;
+            }
 
-            Ok(transformed_expr.update_data(|expr| original_name.restore(expr)))
-        })
+            *expr = original_name.restore(transformed_expr.data, f)?;
+            Ok(transformed_expr.transformed)
+        })?;
+        Ok(Transformed::new_transformed(plan, changed))
     }
 }
 
@@ -111,7 +119,9 @@ impl AnalyzerRule for ApplyFunctionRewrites {
     }
 
     fn analyze(&self, plan: LogicalPlan, options: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up_with_subqueries(|plan| self.rewrite_plan(plan, options))
-            .map(|res| res.data)
+        transform_up_plan_with_subqueries(&options.funding, plan, |plan| {
+            self.rewrite_plan(plan, options)
+        })
+        .map(|res| res.data)
     }
 }

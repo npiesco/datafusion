@@ -58,7 +58,10 @@ impl ExprPlanner for WindowFunctionPlanner {
             },
         });
 
-        let saved_name = NamePreserver::new_for_projection().save(&origin_expr);
+        let saved_name = NamePreserver::new_for_projection().save(
+            &origin_expr,
+            &datafusion_common::funding::Funding::default(),
+        )?;
 
         let Expr::WindowFunction(window_fun) = origin_expr else {
             unreachable!("")
@@ -117,7 +120,8 @@ impl ExprPlanner for WindowFunctionPlanner {
                     distinct,
                 },
             });
-            let new_expr = saved_name.restore(new_expr);
+            let new_expr = saved_name
+                .restore(new_expr, &datafusion_common::funding::Funding::default())?;
 
             return Ok(PlannerResult::Planned(new_expr));
         }

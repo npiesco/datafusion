@@ -19,75 +19,97 @@
 
 use super::THRESHOLD_INLINE_INLIST;
 
-use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNodeRewriter};
-use datafusion_expr::Expr;
+use datafusion_common::{Result, internal_err};
 use datafusion_expr::expr::InList;
+use datafusion_expr::{Expr, Operator};
 
-pub(super) struct ShortenInListSimplifier {}
+use crate::funded::binary;
 
-impl ShortenInListSimplifier {
-    pub(super) fn new() -> Self {
-        Self {}
+pub(super) struct ShortenInListSimplifier<'a> {
+    funding: &'a Funding,
+}
+
+impl<'a> ShortenInListSimplifier<'a> {
+    pub(super) fn new(funding: &'a Funding) -> Self {
+        Self { funding }
     }
 }
 
-impl TreeNodeRewriter for ShortenInListSimplifier {
+impl TreeNodeRewriter for ShortenInListSimplifier<'_> {
     type Node = Expr;
 
     fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         // if expr is a single column reference:
         // expr IN (A, B, ...) --> (expr = A) OR (expr = B) OR (expr = C)
-        if let Expr::InList(InList {
-            ref expr,
-            ref list,
-            negated,
-        }) = expr
-            && !list.is_empty()
-            && (
-                // For lists with only 1 value we allow more complex expressions to be simplified
-                // e.g SUBSTR(c1, 2, 3) IN ('1') -> SUBSTR(c1, 2, 3) = '1'
-                // for more than one we avoid repeating this potentially expensive
-                // expressions
-                list.len() == 1
-                    || list.len() <= THRESHOLD_INLINE_INLIST
-                        && expr.try_as_col().is_some()
-            )
-        {
-            let first_val = list[0].clone();
-            if negated {
-                return Ok(Transformed::yes(list.iter().skip(1).cloned().fold(
-                    (*expr.clone()).not_eq(first_val),
-                    |acc, y| {
-                        // Note that `A and B and C and D` is a left-deep tree structure
-                        // as such we want to maintain this structure as much as possible
-                        // to avoid reordering the expression during each optimization
-                        // pass.
-                        //
-                        // Left-deep tree structure for `A and B and C and D`:
-                        // ```
-                        //        &
-                        //       / \
-                        //      &   D
-                        //     / \
-                        //    &   C
-                        //   / \
-                        //  A   B
-                        // ```
-                        //
-                        // The code below maintain the left-deep tree structure.
-                        acc.and((*expr.clone()).not_eq(y))
-                    },
-                )));
+        let shortened = matches!(
+            &expr,
+            Expr::InList(InList { expr, list, .. })
+                if !list.is_empty()
+                    && (
+                        // For lists with only 1 value we allow more complex expressions to be simplified
+                        // e.g SUBSTR(c1, 2, 3) IN ('1') -> SUBSTR(c1, 2, 3) = '1'
+                        // for more than one we avoid repeating this potentially expensive
+                        // expressions
+                        list.len() == 1
+                            || list.len() <= THRESHOLD_INLINE_INLIST
+                                && expr.try_as_col().is_some()
+                    )
+        );
+        if shortened {
+            let Expr::InList(InList {
+                mut expr,
+                mut list,
+                negated,
+            }) = expr
+            else {
+                return internal_err!("Expected an IN list");
+            };
+            let funding = self.funding;
+            let (op, join) = if negated {
+                (Operator::NotEq, Operator::And)
             } else {
-                return Ok(Transformed::yes(list.iter().skip(1).cloned().fold(
-                    (*expr.clone()).eq(first_val),
-                    |acc, y| {
-                        // Same reasoning as above
-                        acc.or((*expr.clone()).eq(y))
-                    },
-                )));
+                (Operator::Eq, Operator::Or)
+            };
+            // Each item compared to a copy of `expr`, charged first, the last to `expr`
+            // itself; the list's block and `expr`'s box are given back.
+            //
+            // Note that `A and B and C and D` is a left-deep tree structure
+            // as such we want to maintain this structure as much as possible
+            // to avoid reordering the expression during each optimization
+            // pass.
+            //
+            // Left-deep tree structure for `A and B and C and D`:
+            // ```
+            //        &
+            //       / \
+            //      &   D
+            //     / \
+            //    &   C
+            //   / \
+            //  A   B
+            // ```
+            let count = list.len();
+            let mut joined: Option<Expr> = None;
+            for (at, item) in list.drain(..).enumerate() {
+                let compared = if at + 1 < count {
+                    funding.cloned(expr.as_ref())?
+                } else {
+                    std::mem::take(expr.as_mut())
+                };
+                let comparison = binary(funding, compared, op, item)?;
+                joined = Some(match joined {
+                    None => comparison,
+                    Some(acc) => binary(funding, acc, join, comparison)?,
+                });
             }
+            funding.released(list);
+            funding.released_box(expr);
+            return match joined {
+                Some(joined) => Ok(Transformed::yes(joined)),
+                None => internal_err!("Expected a non-empty IN list"),
+            };
         }
 
         Ok(Transformed::no(expr))

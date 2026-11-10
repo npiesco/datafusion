@@ -27,6 +27,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 
 use crate::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion_common::alias::AliasGenerator;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
 };
@@ -123,7 +124,7 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                 let mut cur_input = filter.input.as_ref().clone();
                 for (subquery, alias) in subqueries {
                     if let Some((optimized_subquery, compensation_exprs)) =
-                        build_join(&subquery, &cur_input, &alias)?
+                        build_join(&subquery, &cur_input, &alias, &config.funding())?
                     {
                         if !compensation_exprs.is_empty() {
                             rewrite_expr = rewrite_expr
@@ -192,7 +193,7 @@ impl OptimizerRule for ScalarSubqueryToJoin {
                 let mut cur_input = projection.input.as_ref().clone();
                 for (subquery, alias) in all_subqueries {
                     if let Some((optimized_subquery, compensation_exprs)) =
-                        build_join(&subquery, &cur_input, &alias)?
+                        build_join(&subquery, &cur_input, &alias, &config.funding())?
                     {
                         cur_input = optimized_subquery;
                         if !compensation_exprs.is_empty()
@@ -346,6 +347,7 @@ fn build_join(
     subquery: &Subquery,
     outer_input: &LogicalPlan,
     subquery_alias: &str,
+    funding: &Funding,
 ) -> Result<Option<(LogicalPlan, HashMap<Column, Expr>)>> {
     // `build_join` also handles uncorrelated scalar subqueries (as a left
     // join with `Boolean(true)`) when the
@@ -398,9 +400,7 @@ fn build_join(
     // itself be NULL) otherwise.
     let mut compensation_exprs = HashMap::new();
     if let Some(expr_map) = collected_count_expr_map {
-        let mut expr_rewrite = TypeCoercionRewriter {
-            schema: new_plan.schema(),
-        };
+        let mut expr_rewrite = TypeCoercionRewriter::new(new_plan.schema(), funding);
         let having_arm = pull_up
             .pull_up_having_expr
             .as_ref()

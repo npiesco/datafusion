@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use datafusion_common::alias::AliasGenerator;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, Result, qualified_name};
 use datafusion_expr::logical_plan::LogicalPlan;
@@ -127,9 +128,10 @@ impl OptimizerRule for ExtractLeafExpressions {
         // Advance the alias generator past any user-provided __datafusion_extracted_N
         // aliases to prevent collisions when generating new extraction aliases.
         advance_generator_past_existing(&plan, alias_generator)?;
+        let funding = config.funding();
 
         plan.transform_down_with_subqueries(|plan| {
-            extract_from_plan(plan, alias_generator)
+            extract_from_plan(plan, alias_generator, &funding)
         })
     }
 }
@@ -171,6 +173,7 @@ fn advance_generator_past_existing(
 fn extract_from_plan(
     plan: LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
+    funding: &Funding,
 ) -> Result<Transformed<LogicalPlan>> {
     // Only extract from plan types whose output schema is predictable after
     // expression rewriting.  Nodes like Window derive column names from
@@ -243,7 +246,7 @@ fn extract_from_plan(
         .into_iter()
         .zip(extractors.iter())
         .map(|(input_arc, extractor)| {
-            match extractor.build_extraction_projection(&input_arc)? {
+            match extractor.build_extraction_projection(&input_arc, funding)? {
                 Some(plan) => Ok(plan),
                 // No extractions for this input — recover the LogicalPlan
                 // without cloning (refcount is 1 since build returned None).
@@ -259,7 +262,8 @@ fn extract_from_plan(
         .with_new_exprs(transformed.data.expressions(), new_inputs)?;
 
     // Add recovery projection if the output schema changed
-    let recovered = build_recovery_projection(original_schema.as_ref(), new_plan)?;
+    let recovered =
+        build_recovery_projection(original_schema.as_ref(), new_plan, funding)?;
 
     Ok(Transformed::yes(recovered))
 }
@@ -443,6 +447,7 @@ fn build_projection_replace_map(projection: &Projection) -> HashMap<String, Expr
 fn build_recovery_projection(
     original_schema: &DFSchema,
     input: LogicalPlan,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
     let new_schema = input.schema();
     let orig_len = original_schema.fields().len();
@@ -483,13 +488,13 @@ fn build_recovery_projection(
                 );
             }
         }
-        let projection = Projection::try_new(proj_exprs, Arc::new(input), &datafusion_common::funding::Funding::default())?;
+        let projection = Projection::try_new(proj_exprs, funding.arc(input)?, funding)?;
         Ok(LogicalPlan::Projection(projection))
     } else {
         // Schema-preserving nodes: new schema has extra extraction columns.
         // Original columns still exist by name; select them to hide extras.
         let col_exprs: Vec<Expr> = original_schema.iter().map(Expr::from).collect();
-        let projection = Projection::try_new(col_exprs, Arc::new(input), &datafusion_common::funding::Funding::default())?;
+        let projection = Projection::try_new(col_exprs, funding.arc(input)?, funding)?;
         Ok(LogicalPlan::Projection(projection))
     }
 }
@@ -553,6 +558,7 @@ impl<'a> LeafExpressionExtractor<'a> {
     fn build_extraction_projection(
         &self,
         input: &Arc<LogicalPlan>,
+        funding: &Funding,
     ) -> Result<Option<LogicalPlan>> {
         if self.extracted.is_empty() {
             return Ok(None);
@@ -567,6 +573,7 @@ impl<'a> LeafExpressionExtractor<'a> {
             &self.columns_needed,
             input,
             self.input_schema,
+            funding,
         )?;
         Ok(Some(LogicalPlan::Projection(proj)))
     }
@@ -588,6 +595,7 @@ fn build_extraction_projection_impl(
     columns_needed: &IndexSet<Column>,
     target: &Arc<LogicalPlan>,
     target_schema: &DFSchema,
+    funding: &Funding,
 ) -> Result<Projection> {
     if let LogicalPlan::Projection(existing) = target.as_ref() {
         // Merge into existing projection
@@ -662,7 +670,7 @@ fn build_extraction_projection_impl(
             // If resolved to non-column expr, it's already computed by existing projection
         }
 
-        Projection::try_new(proj_exprs, Arc::clone(&existing.input), &datafusion_common::funding::Funding::default())
+        Projection::try_new(proj_exprs, Arc::clone(&existing.input), funding)
     } else {
         // Build new projection with extracted expressions + all input columns
         let mut proj_exprs = Vec::new();
@@ -672,7 +680,7 @@ fn build_extraction_projection_impl(
         for (qualifier, field) in target_schema.iter() {
             proj_exprs.push(Expr::from((qualifier, field)));
         }
-        Projection::try_new(proj_exprs, Arc::clone(target), &datafusion_common::funding::Funding::default())
+        Projection::try_new(proj_exprs, Arc::clone(target), funding)
     }
 }
 
@@ -736,7 +744,7 @@ impl OptimizerRule for PushDownLeafProjections {
             return Ok(Transformed::no(plan));
         }
         let alias_generator = config.alias_generator();
-        match try_push_input(&plan, alias_generator)? {
+        match try_push_input(&plan, alias_generator, &config.funding())? {
             Some(new_plan) => Ok(Transformed::yes(new_plan)),
             None => Ok(Transformed::no(plan)),
         }
@@ -750,11 +758,12 @@ impl OptimizerRule for PushDownLeafProjections {
 fn try_push_input(
     input: &LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
+    funding: &Funding,
 ) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Projection(proj) = input else {
         return Ok(None);
     };
-    split_and_push_projection(proj, alias_generator)
+    split_and_push_projection(proj, alias_generator, funding)
 }
 
 /// Splits a projection into extractable pieces, pushes them towards leaf
@@ -791,6 +800,7 @@ fn try_push_input(
 fn split_and_push_projection(
     proj: &Projection,
     alias_generator: &Arc<AliasGenerator>,
+    funding: &Funding,
 ) -> Result<Option<LogicalPlan>> {
     // Fast pre-check: skip if there are no pre-existing extracted aliases
     // and no new extractable expressions.
@@ -908,6 +918,7 @@ fn split_and_push_projection(
         &proj_input,
         alias_generator,
         proj_exprs_captured,
+        funding,
     )?;
 
     // ── Phase 3: Recovery ───────────────────────────────────────────────
@@ -929,6 +940,7 @@ fn split_and_push_projection(
                 columns_needed,
                 &input_arc,
                 input_schema.as_ref(),
+                funding,
             )?;
             LogicalPlan::Projection(extraction)
         }
@@ -969,7 +981,8 @@ fn split_and_push_projection(
     if needs_recovery {
         let recovery = LogicalPlan::Projection(Projection::try_new(
             recovery_exprs,
-            Arc::new(base_plan), &datafusion_common::funding::Funding::default(),
+            funding.arc(base_plan)?,
+            funding,
         )?);
         Ok(Some(recovery))
     } else {
@@ -1006,6 +1019,7 @@ fn push_extraction_pairs(
     proj_input: &Arc<LogicalPlan>,
     alias_generator: &Arc<AliasGenerator>,
     proj_exprs_captured: usize,
+    funding: &Funding,
 ) -> Result<Option<LogicalPlan>> {
     match proj_input.as_ref() {
         // Merge into existing projection, then try to push the result further down.
@@ -1021,6 +1035,7 @@ fn push_extraction_pairs(
                 columns_needed,
                 proj_input,
                 target_schema.as_ref(),
+                funding,
             )?;
             let merged_plan = LogicalPlan::Projection(merged);
 
@@ -1033,7 +1048,8 @@ fn push_extraction_pairs(
             // This handles: Extraction → Recovery(cols) → Filter → ... → TableScan
             // by pushing through the recovery projection AND the filter in one pass.
             if is_pure_extraction_projection(&merged_plan)
-                && let Some(pushed) = try_push_input(&merged_plan, alias_generator)?
+                && let Some(pushed) =
+                    try_push_input(&merged_plan, alias_generator, funding)?
             {
                 return Ok(Some(pushed));
             }
@@ -1049,6 +1065,7 @@ fn push_extraction_pairs(
             columns_needed,
             proj_input.as_ref(),
             alias_generator,
+            funding,
         ),
     }
 }
@@ -1143,6 +1160,7 @@ fn try_push_into_inputs(
     columns_needed: &IndexSet<Column>,
     node: &LogicalPlan,
     alias_generator: &Arc<AliasGenerator>,
+    funding: &Funding,
 ) -> Result<Option<LogicalPlan>> {
     let inputs = node.inputs();
     if inputs.is_empty() {
@@ -1204,6 +1222,7 @@ fn try_push_into_inputs(
                 &per_input[idx].columns,
                 &input_arc,
                 target_schema.as_ref(),
+                funding,
             )?;
             // Verify all requested aliases appear in the projection's output.
             // A merge may deduplicate if the same expression already exists
@@ -1219,7 +1238,7 @@ fn try_push_into_inputs(
             // this input (e.g., through Filter → existing extraction projection).
             // This ensures the input's output schema is stable and won't change
             // when the TopDown pass later visits children.
-            match try_push_input(&proj_plan, alias_generator)? {
+            match try_push_input(&proj_plan, alias_generator, funding)? {
                 Some(pushed) => new_inputs.push(pushed),
                 None => new_inputs.push(proj_plan),
             }

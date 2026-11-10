@@ -423,16 +423,16 @@ impl LogicalPlanBuilder {
     /// # let table_source = Arc::new(LogicalTableSource::new(employee_schema));
     /// // Scan table_source with the name "mytable" (after normalization)
     /// # let table = table_source.clone();
-    /// let scan = LogicalPlanBuilder::scan("MyTable", table, None, &Funding::default(), &Funding::default());
+    /// let scan = LogicalPlanBuilder::scan("MyTable", table, None, &Funding::default());
     ///
     /// // Scan table_source with the name "MyTable" by enclosing in quotes
     /// # let table = table_source.clone();
-    /// let scan = LogicalPlanBuilder::scan(r#""MyTable""#, table, None, &Funding::default(), &Funding::default());
+    /// let scan = LogicalPlanBuilder::scan(r#""MyTable""#, table, None, &Funding::default());
     ///
     /// // Scan table_source with the name "MyTable" by forming the table reference
     /// # let table = table_source.clone();
     /// let table_reference = TableReference::bare("MyTable");
-    /// let scan = LogicalPlanBuilder::scan(table_reference, table, None, &Funding::default(), &Funding::default());
+    /// let scan = LogicalPlanBuilder::scan(table_reference, table, None, &Funding::default());
     /// ```
     ///
     /// The builder plans within `funding`: the scan, and every node built on it, is charged
@@ -2198,7 +2198,6 @@ pub fn table_scan_with_filters(
         table_source,
         projection,
         filters,
-        &Funding::default(),
         &Funding::default(),
     )
 }

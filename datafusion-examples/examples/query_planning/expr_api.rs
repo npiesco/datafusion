@@ -578,7 +578,10 @@ fn type_coercion_demo() -> Result<()> {
     // 3. Type coercion with `TypeCoercionRewriter`.
     let coerced_expr = expr
         .clone()
-        .rewrite(&mut TypeCoercionRewriter::new(&df_schema))?
+        .rewrite(&mut TypeCoercionRewriter::new(
+            &df_schema,
+            &datafusion::common::funding::Funding::default(),
+        ))?
         .data;
     let physical_expr = datafusion::physical_expr::create_physical_expr(
         &coerced_expr,

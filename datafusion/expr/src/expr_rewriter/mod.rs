@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::fmt::Debug;
+use std::fmt::{self, Debug, Display, Write};
 use std::sync::Arc;
 
 use crate::expr::{Alias, Sort, Unnest};
@@ -28,6 +28,7 @@ use crate::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder};
 
 use datafusion_common::TableReference;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Column, DFSchema, Result};
 
@@ -229,7 +230,7 @@ pub fn coerce_plan_expr_for_schema(
         // special case Projection to avoid adding multiple projections
         LogicalPlan::Projection(Projection { expr, input, .. }) => {
             let new_exprs = coerce_exprs_for_schema(expr, input.schema(), schema)?;
-            let projection = Projection::try_new(new_exprs, input, &datafusion_common::funding::Funding::default())?;
+            let projection = Projection::try_new(new_exprs, input, &Funding::default())?;
             Ok(LogicalPlan::Projection(projection))
         }
         _ => {
@@ -237,7 +238,8 @@ pub fn coerce_plan_expr_for_schema(
             let new_exprs = coerce_exprs_for_schema(exprs, plan.schema(), schema)?;
             let add_project = new_exprs.iter().any(|expr| expr.try_as_col().is_none());
             if add_project {
-                let projection = Projection::try_new(new_exprs, Arc::new(plan), &datafusion_common::funding::Funding::default())?;
+                let projection =
+                    Projection::try_new(new_exprs, Arc::new(plan), &Funding::default())?;
                 Ok(LogicalPlan::Projection(projection))
             } else {
                 Ok(plan)
@@ -341,39 +343,75 @@ impl NamePreserver {
         Self { use_alias: true }
     }
 
-    pub fn save(&self, expr: &Expr) -> SavedName {
-        if self.use_alias {
-            match expr {
-                Expr::Alias(alias) => SavedName::Saved {
-                    relation: alias.relation.clone(),
-                    name: alias.name.clone(),
-                },
-                _ => {
-                    let (relation, name) = expr.qualified_name();
-                    SavedName::Saved { relation, name }
-                }
-            }
-        } else {
-            SavedName::None
+    /// The qualified name of `expr`, if it is to be preserved, its text charged to
+    /// `funding` before it is made.
+    pub fn save(&self, expr: &Expr, funding: &Funding) -> Result<SavedName> {
+        if !self.use_alias {
+            return Ok(SavedName::None);
         }
+        Ok(match expr {
+            Expr::Column(Column { relation, name, .. })
+            | Expr::Alias(Alias { relation, name, .. }) => SavedName::Saved {
+                relation: relation.clone(),
+                name: funding.string(name)?,
+            },
+            _ => SavedName::Saved {
+                relation: None,
+                name: funding.format(format_args!("{}", expr.schema_name()))?,
+            },
+        })
     }
 }
 
 impl SavedName {
-    /// Ensures the qualified name of the rewritten expression is preserved
-    pub fn restore(self, expr: Expr) -> Expr {
+    /// Ensures the qualified name of the rewritten expression is preserved: an alias
+    /// added only if its name changed, its box charged to `funding` before it is made;
+    /// the saved name, not needed, freed and given back.
+    pub fn restore(self, expr: Expr, funding: &Funding) -> Result<Expr> {
         match self {
             SavedName::Saved { relation, name } => {
-                let (new_relation, new_name) = expr.qualified_name();
-                if new_relation != relation || new_name != name {
-                    expr.alias_qualified(relation, name)
+                let unchanged = match &expr {
+                    Expr::Column(Column {
+                        relation: new_relation,
+                        name: new_name,
+                        ..
+                    })
+                    | Expr::Alias(Alias {
+                        relation: new_relation,
+                        name: new_name,
+                        ..
+                    }) => *new_relation == relation && *new_name == name,
+                    _ => relation.is_none() && displays_as(expr.schema_name(), &name),
+                };
+                if unchanged {
+                    funding.released(name);
+                    Ok(expr)
                 } else {
-                    expr
+                    funding.charge(size_of::<Expr>())?;
+                    Ok(expr.alias_qualified(relation, name))
                 }
             }
-            SavedName::None => expr,
+            SavedName::None => Ok(expr),
         }
     }
+}
+
+/// Whether `value` displays as exactly `text`, compared as it is written, nothing allocated.
+fn displays_as(value: impl Display, text: &str) -> bool {
+    struct Rest<'a>(&'a str);
+    impl Write for Rest<'_> {
+        fn write_str(&mut self, part: &str) -> fmt::Result {
+            match self.0.strip_prefix(part) {
+                Some(rest) => {
+                    self.0 = rest;
+                    Ok(())
+                }
+                None => Err(fmt::Error),
+            }
+        }
+    }
+    let mut rest = Rest(text);
+    write!(rest, "{value}").is_ok() && rest.0.is_empty()
 }
 
 #[cfg(test)]
@@ -572,9 +610,12 @@ mod test {
         let mut rewriter = TestRewriter {
             rewrite_to: rewrite_to.clone(),
         };
-        let saved_name = NamePreserver { use_alias: true }.save(&expr_from);
+        let funding = Funding::default();
+        let saved_name = NamePreserver { use_alias: true }
+            .save(&expr_from, &funding)
+            .unwrap();
         let new_expr = expr_from.clone().rewrite(&mut rewriter).unwrap().data;
-        let new_expr = saved_name.restore(new_expr);
+        let new_expr = saved_name.restore(new_expr, &funding).unwrap();
 
         let original_name = expr_from.qualified_name();
         let new_name = new_expr.qualified_name();
@@ -582,5 +623,35 @@ mod test {
             original_name, new_name,
             "mismatch rewriting expr_from: {expr_from} to {rewrite_to}"
         )
+    }
+
+    struct Unlimited;
+
+    impl datafusion_common::funding::PlanningFunding for Unlimited {
+        fn charge(&self, _: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _: usize) {}
+    }
+
+    /// The saved name is charged as it is made; restored onto an expression of the same
+    /// name, it is freed and given back; onto a renamed one, it is kept with the alias box.
+    #[test]
+    fn saved_name_charged_and_given_back_unless_kept() {
+        let funding = Funding::new(Arc::new(Unlimited));
+        let preserver = NamePreserver { use_alias: true };
+        let expr = col("a") + col("b");
+
+        let saved = preserver.save(&expr, &funding).unwrap();
+        assert_eq!(funding.outstanding(), "a + b".len());
+        let restored = saved.restore(expr.clone(), &funding).unwrap();
+        assert_eq!(restored, expr);
+        assert_eq!(funding.outstanding(), 0);
+
+        let saved = preserver.save(&expr, &funding).unwrap();
+        let restored = saved.restore(col("c"), &funding).unwrap();
+        assert_eq!(restored, col("c").alias("a + b"));
+        assert_eq!(funding.outstanding(), "a + b".len() + size_of::<Expr>());
     }
 }

@@ -19,16 +19,22 @@
 
 use std::sync::Arc;
 
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{Column, DFSchema, DFSchemaRef, DataFusionError, Result};
+use datafusion_common::funding::{Funding, arc_bytes};
+use datafusion_common::tree_node::{Transformed, TreeNodeRecursion};
+use datafusion_common::{Column, DFSchema, DataFusionError, Result, internal_err};
+use datafusion_expr::expr::Alias;
 use datafusion_expr::logical_plan::{Aggregate, LogicalPlan, Projection};
 use datafusion_expr::simplify::SimplifyContext;
 use datafusion_expr::utils::{
-    columnize_expr, find_aggregate_exprs, grouping_set_to_exprlist, merge_schema,
+    columnize_expr, find_aggregate_exprs, grouping_set_to_exprlist,
 };
 use datafusion_expr::{DmlStatement, Expr, WriteOp};
 
 use super::ExprSimplifier;
+use crate::funded::{
+    Released, apply_inputs, for_each_child_expr_mut, freed, map_plan_exprs_mut,
+    merged_input_schema, merged_with,
+};
 use crate::optimizer::ApplyOrder;
 use crate::simplify_expressions::linear_aggregates::rewrite_multiple_linear_aggregates;
 use crate::utils::NamePreserver;
@@ -77,30 +83,25 @@ impl SimplifyExpressions {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let schema = if let LogicalPlan::Dml(DmlStatement {
+        let funding = config.funding();
+        let f = &funding;
+        let (schema, bytes) = if let LogicalPlan::Dml(DmlStatement {
             op: WriteOp::MergeInto(_),
             table_name,
             target,
             ..
         }) = &plan
         {
-            let schema = merge_schema(
-                &plan.inputs(),
-                &datafusion_common::funding::Funding::default(),
+            let target_schema = DFSchema::try_from_qualified_schema(
+                table_name.clone(),
+                &target.schema(),
+                &Funding::default(),
             )?;
-            let schema = schema.merge(
-                &DFSchema::try_from_qualified_schema(
-                    table_name.clone(),
-                    &target.schema(), &datafusion_common::funding::Funding::default(),
-                )?,
-                &datafusion_common::funding::Funding::default(),
-            )?;
-            DFSchemaRef::new(schema)
-        } else if !plan.inputs().is_empty() {
-            DFSchemaRef::new(merge_schema(
-                &plan.inputs(),
-                &datafusion_common::funding::Funding::default(),
-            )?)
+            merged_with(f, merged_input_schema(f, &plan)?, &target_schema)?
+        } else if apply_inputs(&plan, &mut |_| Ok(TreeNodeRecursion::Stop))?
+            == TreeNodeRecursion::Stop
+        {
+            merged_input_schema(f, &plan)?
         } else if let LogicalPlan::TableScan(scan) = &plan {
             // When predicates are pushed into a table scan, there is no input
             // schema to resolve predicates against, so it must be handled specially
@@ -112,16 +113,26 @@ impl SimplifyExpressions {
             //
             // Thus, use the full schema of the inner provider without any
             // projection applied for simplification
-            Arc::new(DFSchema::try_from_qualified_schema(
-                scan.table_name.clone(),
-                &scan.source.schema(), &datafusion_common::funding::Funding::default(),
-            )?)
+            (
+                DFSchema::try_from_qualified_schema(
+                    scan.table_name.clone(),
+                    &scan.source.schema(),
+                    &Funding::default(),
+                )?,
+                0,
+            )
         } else {
-            Arc::new(DFSchema::empty())
+            (f.cloned(DFSchema::empty_ref().as_ref())?, 0)
         };
+        // Freed with the simplifier holding it, before the plan is returned.
+        let schema = Released::new(
+            f,
+            f.arc(schema)?,
+            bytes.saturating_add(arc_bytes::<DFSchema>()),
+        );
 
         let info = SimplifyContext::builder()
-            .with_schema(schema)
+            .with_schema(Arc::clone(&schema))
             .with_config_options(config.options())
             .with_query_execution_start_time(config.query_execution_start_time())
             .build();
@@ -146,24 +157,32 @@ impl SimplifyExpressions {
 
         // Preserve expression names to avoid changing the schema of the plan.
         let name_preserver = NamePreserver::new(&plan);
-        let mut rewrite_expr = |expr: Expr| {
-            let name = name_preserver.save(&expr);
-            let expr = simplifier.simplify_with_cycle_count_transformed(expr)?.0;
-            Ok(Transformed::new_transformed(
-                name.restore(expr.data),
-                expr.transformed,
-            ))
+        let rewrite_expr = |expr: &mut Expr| -> Result<bool> {
+            let name = name_preserver.save(expr, f)?;
+            let (rewritten, _) =
+                simplifier.simplify_with_cycle_count_transformed(std::mem::take(expr))?;
+            *expr = name.restore(rewritten.data, f)?;
+            Ok(rewritten.transformed)
         };
 
-        plan.map_expressions(|expr| {
+        let mut plan = plan;
+        let changed = map_plan_exprs_mut(&mut plan, &mut |expr| {
             // Preserve the aliasing of grouping sets.
-            if let Expr::GroupingSet(_) = &expr {
-                expr.map_children(&mut rewrite_expr)
+            if let Expr::GroupingSet(_) = expr {
+                let mut changed = false;
+                for_each_child_expr_mut(expr, &mut |child| {
+                    changed |= rewrite_expr(child)?;
+                    Ok(())
+                })?;
+                Ok(changed)
             } else {
                 rewrite_expr(expr)
             }
-        })?
-        .transform_data(rewrite_aggregate_non_aggregate_aggr_expr)
+        })?;
+        drop(simplifier);
+        drop(schema);
+        Transformed::new_transformed(plan, changed)
+            .transform_data(|plan| rewrite_aggregate_non_aggregate_aggr_expr(f, plan))
     }
 }
 
@@ -194,32 +213,30 @@ impl SimplifyExpressions {
 /// * `Projection(exp1 + _X)`
 /// * `  Aggregate(group_expr, aggr_expr=[agg(exp2) AS _X])`
 fn rewrite_aggregate_non_aggregate_aggr_expr(
-    plan: LogicalPlan,
+    f: &Funding,
+    mut plan: LogicalPlan,
 ) -> Result<Transformed<LogicalPlan>> {
-    let LogicalPlan::Aggregate(Aggregate {
-        input,
-        group_expr,
-        mut aggr_expr,
-        schema,
-        ..
-    }) = plan
-    else {
+    let LogicalPlan::Aggregate(aggregate) = &mut plan else {
         return Ok(Transformed::no(plan));
     };
 
-    let rewrote_aggs = rewrite_multiple_linear_aggregates(&mut aggr_expr)?;
+    let rewrote_aggs = rewrite_multiple_linear_aggregates(f, &mut aggregate.aggr_expr)?;
 
-    // Ensure that all Aggregate arguments are AggregateExpr
-    if aggr_expr.iter().all(is_top_level_aggregate_expr) {
-        let new_plan = LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
-            input, group_expr, aggr_expr, schema,
-        )?);
-        return if !rewrote_aggs {
-            Ok(Transformed::no(new_plan))
-        } else {
-            Ok(Transformed::yes(new_plan))
-        };
+    // Ensure that all Aggregate arguments are AggregateExpr: the aggregate, its group
+    // and output unchanged, keeps its schema.
+    if aggregate.aggr_expr.iter().all(is_top_level_aggregate_expr) {
+        return Ok(Transformed::new_transformed(plan, rewrote_aggs));
     }
+
+    let LogicalPlan::Aggregate(Aggregate {
+        input,
+        group_expr,
+        aggr_expr,
+        ..
+    }) = plan
+    else {
+        return internal_err!("Expected an aggregate");
+    };
 
     // Otherwise we need to add a Projection above Aggregate to calculate
     // the final output expressions.
@@ -227,39 +244,50 @@ fn rewrite_aggregate_non_aggregate_aggr_expr(
     let inner_aggr_expr = find_aggregate_exprs(aggr_expr.iter());
     let inner_aggregate = LogicalPlan::Aggregate(Aggregate::try_new(
         Arc::clone(&input),
-        group_expr.clone(),
+        f.cloned(&group_expr)?,
         inner_aggr_expr,
     )?);
-    let inner_aggregate = Arc::new(inner_aggregate);
+    let inner_aggregate = f.arc(inner_aggregate)?;
 
-    let mut projection_exprs = aggregate_output_exprs(&group_expr)?;
+    let mut projection_exprs = aggregate_output_exprs(f, &group_expr, aggr_expr.len())?;
     projection_exprs.extend(aggr_expr);
-    let projection_exprs = projection_exprs
-        .into_iter()
-        .map(|expr| columnize_expr(expr, inner_aggregate.as_ref()))
-        .collect::<Result<Vec<_>>>()?;
+    for expr in projection_exprs.iter_mut() {
+        *expr = columnize_expr(std::mem::take(expr), inner_aggregate.as_ref())?;
+    }
+    freed(f, group_expr);
+    freed(f, input);
 
     Ok(Transformed::yes(LogicalPlan::Projection(
-        Projection::try_new(projection_exprs, inner_aggregate, &datafusion_common::funding::Funding::default())?,
+        Projection::try_new(projection_exprs, inner_aggregate, f)?,
     )))
 }
 
 fn is_top_level_aggregate_expr(expr: &Expr) -> bool {
-    matches!(
-        expr.clone().unalias_nested().data,
-        Expr::AggregateFunction(_)
-    )
+    let mut expr = expr;
+    while let Expr::Alias(Alias { expr: inner, .. }) = expr {
+        expr = inner;
+    }
+    matches!(expr, Expr::AggregateFunction(_))
 }
 
-fn aggregate_output_exprs(group_expr: &[Expr]) -> Result<Vec<Expr>> {
-    let mut output_exprs = grouping_set_to_exprlist(group_expr)?
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
+/// The group's output columns, with room for `more` after them, each charged before it
+/// is made.
+fn aggregate_output_exprs(
+    f: &Funding,
+    group_expr: &[Expr],
+    more: usize,
+) -> Result<Vec<Expr>> {
+    let is_grouping_set = matches!(group_expr, [Expr::GroupingSet(_)]);
+    let grouping_exprs = grouping_set_to_exprlist(group_expr)?;
+    let mut output_exprs =
+        f.vec_with_capacity(grouping_exprs.len() + usize::from(is_grouping_set) + more)?;
+    for expr in grouping_exprs {
+        output_exprs.push(f.cloned(expr)?);
+    }
 
-    if matches!(group_expr, [Expr::GroupingSet(_)]) {
+    if is_grouping_set {
         output_exprs.push(Expr::Column(Column::from_name(
-            Aggregate::INTERNAL_GROUPING_ID,
+            f.string(Aggregate::INTERNAL_GROUPING_ID)?,
         )));
     }
 
