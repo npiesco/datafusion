@@ -36,8 +36,9 @@ use datafusion_common::{HashMap, Result, ScalarValue, TableReference, internal_e
 #[derive(Clone, Debug, Default)]
 pub struct PhysicalPlanningContext {
     /// Behind an `Arc` because the context is cloned for each lambda body that
-    /// is planned, and the indexes are the same for the whole subtree.
-    indexes: Arc<HashMap<crate::logical_plan::Subquery, SubqueryIndex>>,
+    /// is planned, and the indexes are the same for the whole subtree. None when
+    /// there are none, so the default context allocates nothing.
+    indexes: Option<Arc<HashMap<crate::logical_plan::Subquery, SubqueryIndex>>>,
     results: ScalarSubqueryResults,
     /// Maps each lambda variable name in scope to the qualifier generated for
     /// its lambda during physical planning.
@@ -53,7 +54,7 @@ impl PhysicalPlanningContext {
         results: ScalarSubqueryResults,
     ) -> Self {
         Self {
-            indexes: Arc::new(indexes),
+            indexes: Some(Arc::new(indexes)),
             results,
             lambda_variable_qualifier: HashMap::new(),
         }
@@ -64,7 +65,7 @@ impl PhysicalPlanningContext {
         &self,
         subquery: &crate::logical_plan::Subquery,
     ) -> Option<SubqueryIndex> {
-        self.indexes.get(subquery).copied()
+        self.indexes.as_ref()?.get(subquery).copied()
     }
 
     /// Returns the shared results container.
@@ -118,26 +119,28 @@ impl SubqueryIndex {
 /// the plan is reset for re-execution.
 #[derive(Clone, Default)]
 pub struct ScalarSubqueryResults {
-    slots: Arc<Vec<Mutex<Option<ScalarValue>>>>,
+    /// None when there are no slots, so the default container allocates nothing.
+    slots: Option<Arc<Vec<Mutex<Option<ScalarValue>>>>>,
 }
 
 impl ScalarSubqueryResults {
     /// Creates a new shared results container with `n` empty slots.
     pub fn new(n: usize) -> Self {
         Self {
-            slots: Arc::new((0..n).map(|_| Mutex::new(None)).collect()),
+            slots: Some(Arc::new((0..n).map(|_| Mutex::new(None)).collect())),
         }
     }
 
     /// Returns the scalar value stored at `index`, if it has been populated.
     pub fn get(&self, index: SubqueryIndex) -> Option<ScalarValue> {
-        let slot = self.slots.get(index.as_usize())?;
+        let slot = self.slots()?.get(index.as_usize())?;
         slot.lock().unwrap().clone()
     }
 
     /// Stores `value` in the slot at `index`.
     pub fn set(&self, index: SubqueryIndex, value: ScalarValue) -> Result<()> {
-        let Some(slot) = self.slots.get(index.as_usize()) else {
+        let Some(slot) = self.slots().and_then(|slots| slots.get(index.as_usize()))
+        else {
             return internal_err!(
                 "ScalarSubqueryResults: result index {} is out of bounds",
                 index.as_usize()
@@ -158,21 +161,35 @@ impl ScalarSubqueryResults {
 
     /// Clears all populated results so the container can be reused.
     pub fn clear(&self) {
-        for slot in self.slots.iter() {
+        for slot in self.slots().into_iter().flatten() {
             *slot.lock().unwrap() = None;
         }
     }
 
     /// Returns true if `this` and `other` point to the same shared container.
+    /// Containers without slots are all the same empty one.
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        Arc::ptr_eq(&this.slots, &other.slots)
+        match (&this.slots, &other.slots) {
+            (Some(this), Some(other)) => Arc::ptr_eq(this, other),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn slots(&self) -> Option<&[Mutex<Option<ScalarValue>>]> {
+        self.slots.as_deref().map(Vec::as_slice)
     }
 }
 
 impl fmt::Debug for ScalarSubqueryResults {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
-            .entries(self.slots.iter().map(|slot| slot.lock().unwrap().clone()))
+            .entries(
+                self.slots()
+                    .into_iter()
+                    .flatten()
+                    .map(|slot| slot.lock().unwrap().clone()),
+            )
             .finish()
     }
 }
@@ -187,7 +204,7 @@ impl Eq for ScalarSubqueryResults {}
 
 impl Hash for ScalarSubqueryResults {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.slots).hash(state);
+        self.slots.as_ref().map(Arc::as_ptr).hash(state);
     }
 }
 
