@@ -661,13 +661,6 @@ pub(crate) fn schema_columns(funding: &Funding, schema: &DFSchema) -> Result<Vec
     Ok(exprs)
 }
 
-/// Whether `schema` has a field `name` under exactly `qualifier`.
-fn has_column(schema: &DFSchema, qualifier: Option<&TableReference>, name: &str) -> bool {
-    schema.iter().any(|(field_qualifier, field)| {
-        field_qualifier == qualifier && field.name() == name
-    })
-}
-
 /// The columns of a USING join's keys.
 fn using_keys(on: &[(Expr, Expr)]) -> impl Iterator<Item = &Column> + Clone {
     on.iter()
@@ -703,36 +696,6 @@ fn any_using_join(
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(found)
-}
-
-/// The columns `expand_wildcard(plan.schema(), plan, None)` expands to: each of `plan`'s
-/// output columns but the USING join keys it skips as duplicates (another output key of
-/// the same join and name sorting before it), in a list of the output's width, the list
-/// and each name charged before they are made.
-pub(crate) fn wildcard_columns(
-    funding: &Funding,
-    plan: &LogicalPlan,
-) -> Result<Vec<Expr>> {
-    let schema = plan.schema();
-    let has_using = any_using_join(funding, plan, &mut |_| true)?;
-    let mut exprs = funding.vec_with_capacity(schema.fields().len())?;
-    for (qualifier, field) in schema.iter() {
-        let name = field.name();
-        let skipped = has_using
-            && any_using_join(funding, plan, &mut |on| {
-                let mut keys = using_keys(on).filter(|key| key.name == *name);
-                keys.clone().any(|key| key.relation.as_ref() == qualifier)
-                    && keys.any(|key| {
-                        key.relation.as_ref() < qualifier
-                            && has_column(schema, key.relation.as_ref(), name)
-                    })
-            })?;
-        if !skipped {
-            // Room for each is charged: pushing allocates nothing.
-            exprs.push(column_expr(funding, qualifier, name)?);
-        }
-    }
-    Ok(exprs)
 }
 
 /// `expr` with its unqualified columns qualified as [`normalize_col`] qualifies them over

@@ -17,9 +17,7 @@
 
 //! [`ReplaceDistinctWithAggregate`] replaces `DISTINCT ...` with `GROUP BY ...`
 
-use crate::funded::{
-    aliased, column_expr, freed, normalize_in_place, unwrapped, wildcard_columns,
-};
+use crate::funded::{aliased, column_expr, freed, normalize_in_place, unwrapped};
 use crate::optimizer::{ApplyOrder, ApplyOrder::BottomUp};
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -29,6 +27,7 @@ use datafusion_common::tree_node::Transformed;
 use datafusion_common::{Dependency, Result, ScalarValue};
 use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::logical_plan::builder::project;
+use datafusion_expr::utils::expand_wildcard;
 use datafusion_expr::{Aggregate, Distinct, DistinctOn, Expr, LogicalPlan};
 use datafusion_expr::{Limit, LogicalPlanBuilder, lit};
 
@@ -92,11 +91,12 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
         match plan {
             LogicalPlan::Distinct(Distinct::All(input)) => {
                 let funding = config.funding();
-                let group_expr = wildcard_columns(&funding, &input)?;
+                let group_expr = expand_wildcard(input.schema(), &input, None, &funding)?;
 
                 if group_expr.is_empty() {
                     // Special case: there are no columns to group by, so we can't replace it by a group by
                     // however, we can replace it by LIMIT 1 because there is either no output or a single empty row
+                    freed(&funding, group_expr);
                     return Ok(Transformed::yes(LogicalPlan::Limit(Limit {
                         skip: None,
                         fetch: Some(funding.boxed(lit(1i64))?),

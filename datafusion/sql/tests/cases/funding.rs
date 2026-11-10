@@ -144,3 +144,12 @@ fn set_operations_are_funded() {
     assert_funded("SELECT j1_id FROM j1 UNION ALL SELECT j2_id FROM j2");
     assert_funded("SELECT j1_id FROM j1 UNION SELECT j2_id FROM j2");
 }
+
+#[test]
+fn wildcards_are_funded() {
+    assert_funded("SELECT * FROM person");
+    assert_funded("SELECT p.* FROM person AS p");
+    assert_funded("SELECT * EXCLUDE (age, state) FROM person");
+    assert_funded("SELECT * REPLACE (age + 1 AS age) FROM person");
+    assert_funded("SELECT * FROM person AS a JOIN person AS b USING (id)");
+}

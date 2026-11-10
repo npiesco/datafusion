@@ -31,7 +31,7 @@ use crate::utils::{
 
 use arrow::datatypes::DataType;
 use datafusion_common::error::DataFusionErrorBuilder;
-use datafusion_common::funding::Held;
+use datafusion_common::funding::{Buffer, Held};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, Result, internal_err, not_impl_err, plan_err,
@@ -1214,28 +1214,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             rename: options.opt_rename,
         };
         if let Some(replace) = options.opt_replace {
-            let replace_expr = replace
-                .items
-                .iter()
-                .map(|item| {
-                    self.sql_select_to_rex(
-                        SelectItem::UnnamedExpr(item.expr.clone()),
-                        plan,
-                        empty_from,
-                        planner_context,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .filter_map(|expr| match expr {
-                    SelectExpr::Expression(expr) => Some(expr),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let funding = self.funding();
+            let mut planned_expressions =
+                funding.vec_with_capacity(replace.items.len())?;
+            for item in &replace.items {
+                let expr = self.sql_select_to_rex(
+                    SelectItem::UnnamedExpr(item.expr.clone()),
+                    plan,
+                    empty_from,
+                    planner_context,
+                )?;
+                if let SelectExpr::Expression(expr) = expr {
+                    planned_expressions.push(expr);
+                }
+            }
+            let mut items = funding.vec_with_capacity(replace.items.len())?;
+            items.extend(replace.items.into_iter().map(|i| *i));
 
             let planned_replace = PlannedReplaceSelectItem {
-                items: replace.items.into_iter().map(|i| *i).collect(),
-                planned_expressions: replace_expr,
+                items,
+                planned_expressions,
             };
             Ok(planned_option.with_replace(planned_replace))
         } else {
@@ -1243,29 +1241,48 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
     }
 
-    /// Wrap a plan in a projection
+    /// Wrap a plan in a projection. `expr` is a list [`Self::prepare_select_exprs`] made:
+    /// the projection takes its expressions, and the list and its wildcards' REPLACE lists
+    /// are freed, planned or not.
     pub(crate) fn project(
         &self,
         input: LogicalPlan,
         expr: Vec<SelectExpr>,
         set_expr_left_schema: Option<DFSchemaRef>,
     ) -> Result<LogicalPlan> {
-        self.validate_schema_satisfies_exprs(
+        let freed = expr.block_bytes()
+            + expr
+                .iter()
+                .map(|e| match e {
+                    SelectExpr::Wildcard(options)
+                    | SelectExpr::QualifiedWildcard(_, options) => {
+                        options.replace.as_ref().map_or(0, |replace| {
+                            replace.items.block_bytes()
+                                + replace.planned_expressions.block_bytes()
+                        })
+                    }
+                    SelectExpr::Expression(_) => 0,
+                })
+                .sum::<usize>();
+        let projected = self.validate_schema_satisfies_exprs(
             input.schema(),
             expr.iter().filter_map(|e| match e {
                 SelectExpr::Expression(expr) => Some(expr),
                 _ => None,
             }),
-        )?;
-
-        // When inside a set expression, pass the left-most schema so
-        // that expressions get aliased to match, avoiding duplicate
-        // name errors from expressions like `count(*), count(*)`.
-        if let Some(left_schema) = set_expr_left_schema {
-            project_with_schema(input, expr, &left_schema, self.funding())
-        } else {
-            project(input, expr, self.funding())
-        }
+        );
+        let projected = projected.and_then(|()| {
+            // When inside a set expression, pass the left-most schema so
+            // that expressions get aliased to match, avoiding duplicate
+            // name errors from expressions like `count(*), count(*)`.
+            if let Some(left_schema) = set_expr_left_schema {
+                project_with_schema(input, expr, &left_schema, self.funding())
+            } else {
+                project(input, expr, self.funding())
+            }
+        });
+        self.funding().discharge(freed);
+        projected
     }
 
     /// Create an aggregate plan.

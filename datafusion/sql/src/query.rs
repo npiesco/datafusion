@@ -150,12 +150,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
             PipeOperator::Extend { exprs } => {
                 let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
-                let extend_exprs =
+                let mut extend_exprs =
                     self.prepare_select_exprs(&plan, exprs, empty_from, planner_context)?;
-                let all_exprs =
-                    std::iter::once(SelectExpr::Wildcard(WildcardOptions::default()))
-                        .chain(extend_exprs)
-                        .collect();
+                let funding = self.funding();
+                let mut all_exprs = funding.vec_with_capacity(1 + extend_exprs.len())?;
+                all_exprs.push(SelectExpr::Wildcard(WildcardOptions::default()));
+                all_exprs.extend(extend_exprs.drain(..));
+                funding.released(extend_exprs);
                 self.project(plan, all_exprs, None)
             }
             PipeOperator::As { alias } => self.apply_table_alias(
