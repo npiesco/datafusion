@@ -22,6 +22,7 @@ use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::vec::IntoIter;
 
+use crate::cloned::CloneBytes;
 use crate::utils::{merge_and_order_indices, set_difference};
 use crate::{DFSchema, HashSet, JoinType};
 
@@ -657,6 +658,36 @@ fn add_offset_to_vec<T: Copy + std::ops::Add<Output = T>>(
     offset: T,
 ) -> Vec<T> {
     in_data.iter().map(|&item| item + offset).collect()
+}
+
+impl CloneBytes for FunctionalDependence {
+    fn clone_bytes(&self) -> usize {
+        self.source_indices
+            .clone_bytes()
+            .saturating_add(self.target_indices.clone_bytes())
+    }
+}
+
+impl CloneBytes for FunctionalDependencies {
+    fn clone_bytes(&self) -> usize {
+        self.deps.clone_bytes()
+    }
+}
+
+impl CloneBytes for Constraint {
+    fn clone_bytes(&self) -> usize {
+        match self {
+            Constraint::PrimaryKey(indices) | Constraint::Unique(indices) => {
+                indices.clone_bytes()
+            }
+        }
+    }
+}
+
+impl CloneBytes for Constraints {
+    fn clone_bytes(&self) -> usize {
+        self.inner.clone_bytes()
+    }
 }
 
 #[cfg(test)]
