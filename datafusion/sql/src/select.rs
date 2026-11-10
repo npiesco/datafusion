@@ -31,6 +31,7 @@ use crate::utils::{
 
 use arrow::datatypes::DataType;
 use datafusion_common::error::DataFusionErrorBuilder;
+use datafusion_common::funding::Held;
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
 use datafusion_common::{NullHandling, RecursionUnnestOption, UnnestOptions};
@@ -46,8 +47,9 @@ use datafusion_expr::utils::{
     expr_as_column_expr, expr_to_columns, find_aggregate_exprs, find_window_exprs,
 };
 use datafusion_expr::{
-    Aggregate, Expr, Filter, GroupingSet, LogicalPlan, LogicalPlanBuilder,
-    LogicalPlanBuilderOptions, Partitioning, SortExpr,
+    Aggregate, EmptyRelation, Expr, Filter, GroupingSet, Join, LogicalPlan,
+    LogicalPlanBuilder, LogicalPlanBuilderOptions, Partitioning, Projection, SortExpr,
+    Unnest, Window,
 };
 
 use indexmap::IndexMap;
@@ -85,6 +87,36 @@ struct DistinctOnUnnestPlanResult {
 struct RewrittenUnnestExprGroups {
     plan: LogicalPlan,
     expr_groups: Vec<Vec<Expr>>,
+}
+
+/// The schemas [`LogicalPlan::fallback_normalize_schemas`] lists, held in place rather than in
+/// a list allocated for them.
+struct FallbackSchemas<'a> {
+    schemas: [&'a DFSchema; 2],
+    len: usize,
+}
+
+impl<'a> FallbackSchemas<'a> {
+    fn of(plan: &'a LogicalPlan) -> Self {
+        let empty = DFSchema::empty_ref().as_ref();
+        let (schemas, len) = match plan {
+            LogicalPlan::Window(Window { input, .. })
+            | LogicalPlan::Projection(Projection { input, .. })
+            | LogicalPlan::Aggregate(Aggregate { input, .. })
+            | LogicalPlan::Unnest(Unnest { input, .. }) => {
+                ([input.schema().as_ref(), empty], 1)
+            }
+            LogicalPlan::Join(Join { left, right, .. }) => {
+                ([left.schema().as_ref(), right.schema().as_ref()], 2)
+            }
+            _ => ([empty, empty], 0),
+        };
+        Self { schemas, len }
+    }
+
+    fn as_slice(&self) -> &[&'a DFSchema] {
+        &self.schemas[..self.len]
+    }
 }
 
 fn flatten_expr_groups(expr_groups: Vec<Vec<Expr>>) -> Vec<Expr> {
@@ -882,7 +914,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<LogicalPlan> {
         match selection {
             Some(predicate_expr) => {
-                let fallback_schemas = plan.fallback_normalize_schemas();
+                let fallback_schemas = FallbackSchemas::of(&plan);
 
                 self.warn_on_null_equality_predicate(&predicate_expr);
                 let filter_expr =
@@ -897,27 +929,33 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     );
                 }
 
+                let funding = self.funding();
                 let mut using_columns = HashSet::new();
                 expr_to_columns(&filter_expr, &mut using_columns)?;
-                let mut schema_stack: Vec<Vec<&DFSchema>> =
-                    vec![vec![plan.schema()], fallback_schemas];
+                let plan_schema = [plan.schema().as_ref()];
+                let outer_count = planner_context.outer_queries_schemas().len();
+                let mut outer_schemas: Held<Vec<&DFSchema>> = funding.held();
+                outer_schemas.reserve_exact(outer_count)?;
                 for sc in planner_context.outer_schemas_iter() {
-                    schema_stack.push(vec![sc.as_ref()]);
+                    outer_schemas.push(sc.as_ref())?;
+                }
+                let mut schema_stack: Held<Vec<&[&DFSchema]>> = funding.held();
+                schema_stack.reserve_exact(2 + outer_count)?;
+                schema_stack.push(&plan_schema)?;
+                schema_stack.push(fallback_schemas.as_slice())?;
+                for sc in outer_schemas.iter() {
+                    schema_stack.push(std::slice::from_ref(sc))?;
                 }
 
                 let filter_expr = normalize_col_with_schemas_and_ambiguity_check(
                     filter_expr,
-                    schema_stack
-                        .iter()
-                        .map(|sc| sc.as_slice())
-                        .collect::<Vec<&[&DFSchema]>>()
-                        .as_slice(),
+                    schema_stack.as_slice(),
                     &[using_columns],
                 )?;
 
                 Ok(LogicalPlan::Filter(Filter::try_new(
                     filter_expr,
-                    Arc::new(plan),
+                    funding.arc(plan)?,
                 )?))
             }
             None => Ok(plan),
@@ -930,7 +968,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
         match from.len() {
-            0 => Ok(LogicalPlanBuilder::empty(true).build()?),
+            // The shared empty schema: a count bumped, nothing allocated.
+            0 => Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: true,
+                schema: Arc::clone(DFSchema::empty_ref()),
+            })),
             1 => {
                 let input = from.remove(0);
                 self.plan_table_with_joins(input, planner_context)
