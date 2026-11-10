@@ -101,3 +101,46 @@ fn assert_funded(sql: &str) {
 fn select_literal_where_false_is_funded() {
     assert_funded("SELECT 1 WHERE false");
 }
+
+#[test]
+fn select_order_by_is_funded() {
+    assert_funded("SELECT id, age FROM person ORDER BY age DESC, id");
+}
+
+#[test]
+fn select_limit_offset_is_funded() {
+    assert_funded("SELECT id FROM person LIMIT 5 OFFSET 2");
+}
+
+#[test]
+fn select_distinct_is_funded() {
+    assert_funded("SELECT DISTINCT state FROM person");
+}
+
+#[test]
+fn select_group_by_having_is_funded() {
+    assert_funded("SELECT age FROM person GROUP BY age HAVING age > 21");
+}
+
+#[test]
+fn select_table_alias_is_funded() {
+    assert_funded("SELECT p.id FROM person AS p WHERE p.age > 21");
+}
+
+#[test]
+fn select_joins_are_funded() {
+    assert_funded("SELECT j1_id, j2_string FROM j1 JOIN j2 ON j1_id = j2_id");
+    assert_funded("SELECT j1_id FROM j1 LEFT JOIN j2 ON j1_id = j2_id AND j2_id > 1");
+    assert_funded("SELECT j1_id, j2_id FROM j1, j2");
+}
+
+#[test]
+fn select_from_cte_is_funded() {
+    assert_funded("WITH t AS (SELECT id FROM person) SELECT id FROM t");
+}
+
+#[test]
+fn set_operations_are_funded() {
+    assert_funded("SELECT j1_id FROM j1 UNION ALL SELECT j2_id FROM j2");
+    assert_funded("SELECT j1_id FROM j1 UNION SELECT j2_id FROM j2");
+}

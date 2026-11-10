@@ -56,7 +56,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             // (e.g. "WITH table(t1, t2) AS SELECT 1, 2"). Recursive CTEs apply those
             // to the static term in recursive_cte(), so only the relation name here.
             let final_plan = if is_recursive {
-                LogicalPlanBuilder::from(cte_plan)
+                self.builder(cte_plan)?
                     .alias(TableReference::bare(
                         self.ident_normalizer.normalize(cte.alias.name),
                     ))?
@@ -200,7 +200,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // ---------- Step 4: Create the final plan ------------------
         // Step 4.1: Compile the final plan
         let distinct = !Self::is_union_all(set_quantifier)?;
-        LogicalPlanBuilder::from(static_plan)
+        self.builder(static_plan)?
             .to_recursive_query(name, recursive_plan, distinct)?
             .build()
     }

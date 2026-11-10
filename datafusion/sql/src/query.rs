@@ -23,9 +23,7 @@ use datafusion_common::{Constraints, DFSchema, Result, not_impl_err};
 use datafusion_expr::expr::{Sort, WildcardOptions};
 
 use datafusion_expr::select_expr::SelectExpr;
-use datafusion_expr::{
-    CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder,
-};
+use datafusion_expr::{CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan};
 use sqlparser::ast::{
     Expr as SQLExpr, ExprWithAliasAndOrderBy, Ident, LimitClause, Offset, OffsetRows,
     OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, SelectInto, SetExpr,
@@ -290,9 +288,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(input);
         }
 
-        LogicalPlanBuilder::from(input)
-            .limit_by_expr(skip, fetch)?
-            .build()
+        self.builder(input)?.limit_by_expr(skip, fetch)?.build()
     }
 
     /// Wrap the logical in a sort
@@ -305,13 +301,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(plan);
         }
 
-        if let LogicalPlan::Distinct(Distinct::On(ref distinct_on)) = plan {
+        match plan {
             // In case of `DISTINCT ON` we must capture the sort expressions since during the plan
             // optimization we're effectively doing a `first_value` aggregation according to them.
-            let distinct_on = distinct_on.clone().with_sort_expr(order_by)?;
-            Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
-        } else {
-            LogicalPlanBuilder::from(plan).sort(order_by)?.build()
+            LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
+                Ok(LogicalPlan::Distinct(Distinct::On(
+                    distinct_on.with_sort_expr(order_by)?,
+                )))
+            }
+            plan => self.builder(plan)?.sort(order_by)?.build(),
         }
     }
 
@@ -349,7 +347,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .map(|e| process_expr(e, planner_context))
             .collect::<Result<Vec<_>>>()?;
 
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .aggregate(group_by_exprs, aggr_exprs)?
             .build()
     }

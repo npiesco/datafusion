@@ -582,9 +582,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 })
                                 .collect::<Vec<_>>();
 
-                            LogicalPlanBuilder::from(plan.clone())
-                                .project(project_exprs)?
-                                .build()?
+                            self.builder(plan)?.project(project_exprs)?.build()?
                         } else {
                             plan
                         };
@@ -2299,7 +2297,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if let Some(limit) = limit {
             let empty_schema = DFSchema::empty();
             let limit = self.sql_to_expr(limit, &empty_schema, &mut planner_context)?;
-            source = LogicalPlanBuilder::from(source)
+            source = self
+                .builder(source)?
                 .limit_by_expr(None, Some(limit))?
                 .build()?
         }
