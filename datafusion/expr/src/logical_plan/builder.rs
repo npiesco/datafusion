@@ -124,10 +124,15 @@ impl LogicalPlanBuilderOptions {
 /// # Ok(())
 /// # }
 /// ```
+///
+/// A builder made by [`LogicalPlanBuilder::new_from_arc`] plans within the funding it is given:
+/// the block of every plan node it builds is charged to it, and so is what its methods
+/// allocate where they are funded. Any other builder plans unfunded ([`Funding::default`]).
 #[derive(Debug, Clone)]
 pub struct LogicalPlanBuilder {
     plan: Arc<LogicalPlan>,
     options: LogicalPlanBuilderOptions,
+    funding: Funding,
 }
 
 impl LogicalPlanBuilder {
@@ -136,15 +141,32 @@ impl LogicalPlanBuilder {
         Self {
             plan: Arc::new(plan),
             options: LogicalPlanBuilderOptions::default(),
+            funding: Funding::default(),
         }
     }
 
-    /// Create a builder from an existing plan
-    pub fn new_from_arc(plan: Arc<LogicalPlan>) -> Self {
+    /// Create a builder from an existing plan, planning within `funding`: the block of
+    /// `plan` is charged to it (or shared), as is every node the builder builds on it.
+    pub fn new_from_arc(plan: Arc<LogicalPlan>, funding: &Funding) -> Self {
         Self {
             plan,
             options: LogicalPlanBuilderOptions::default(),
+            funding: funding.clone(),
         }
+    }
+
+    /// A builder, planning within `funding`, over `plan` held in a block charged to it.
+    fn built(plan: LogicalPlan, funding: Funding) -> Result<Self> {
+        Ok(Self {
+            plan: funding.arc(plan)?,
+            options: LogicalPlanBuilderOptions::default(),
+            funding,
+        })
+    }
+
+    /// The funding the builder plans within.
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     pub fn with_options(mut self, options: LogicalPlanBuilderOptions) -> Self {
@@ -196,10 +218,10 @@ impl LogicalPlanBuilder {
         let recursive_query = RecursiveQuery::try_new(
             name,
             self.plan,
-            Arc::new(coerced_recursive_term),
+            self.funding.arc(coerced_recursive_term)?,
             is_distinct,
         )?;
-        Ok(Self::from(LogicalPlan::RecursiveQuery(recursive_query)))
+        Self::built(LogicalPlan::RecursiveQuery(recursive_query), self.funding)
     }
 
     /// Create a values list based relation, and the schema is inferred from data, consuming
@@ -593,7 +615,8 @@ impl LogicalPlanBuilder {
         self,
         expr: impl IntoIterator<Item = impl Into<SelectExpr>>,
     ) -> Result<Self> {
-        project(Arc::unwrap_or_clone(self.plan), expr, &Funding::default()).map(Self::new)
+        let plan = project(self.funding.unwrapped(self.plan)?, expr, &self.funding)?;
+        Self::built(plan, self.funding)
     }
 
     /// Apply a projection without alias with optional validation
@@ -602,13 +625,13 @@ impl LogicalPlanBuilder {
         self,
         expr: Vec<(impl Into<SelectExpr>, bool)>,
     ) -> Result<Self> {
-        project_with_validation(
-            Arc::unwrap_or_clone(self.plan),
+        let plan = project_with_validation(
+            self.funding.unwrapped(self.plan)?,
             expr,
             None,
-            &Funding::default(),
-        )
-        .map(Self::new)
+            &self.funding,
+        )?;
+        Self::built(plan, self.funding)
     }
 
     /// Apply a projection, aliasing non-Column/non-Alias expressions to
@@ -618,13 +641,13 @@ impl LogicalPlanBuilder {
         expr: impl IntoIterator<Item = impl Into<SelectExpr>>,
         schema: &DFSchemaRef,
     ) -> Result<Self> {
-        project_with_schema(
-            Arc::unwrap_or_clone(self.plan),
+        let plan = project_with_schema(
+            self.funding.unwrapped(self.plan)?,
             expr,
             schema,
-            &Funding::default(),
-        )
-        .map(Self::new)
+            &self.funding,
+        )?;
+        Self::built(plan, self.funding)
     }
 
     /// Select the given column indices
@@ -639,28 +662,27 @@ impl LogicalPlanBuilder {
     /// Apply a filter
     pub fn filter(self, expr: impl Into<Expr>) -> Result<Self> {
         let expr = normalize_col(expr.into(), &self.plan)?;
-        Filter::try_new(expr, self.plan)
-            .map(LogicalPlan::Filter)
-            .map(Self::new)
+        let filter = Filter::try_new(expr, self.plan)?;
+        Self::built(LogicalPlan::Filter(filter), self.funding)
     }
 
     /// Apply a filter which is used for a having clause
     pub fn having(self, expr: impl Into<Expr>) -> Result<Self> {
         let expr = normalize_col(expr.into(), &self.plan)?;
-        Filter::try_new(expr, self.plan)
-            .map(LogicalPlan::Filter)
-            .map(Self::from)
+        let filter = Filter::try_new(expr, self.plan)?;
+        Self::built(LogicalPlan::Filter(filter), self.funding)
     }
 
     /// Make a builder for a prepare logical plan from the builder's plan
     pub fn prepare(self, name: String, fields: Vec<FieldRef>) -> Result<Self> {
-        Ok(Self::new(LogicalPlan::Statement(Statement::Prepare(
-            Prepare {
+        Self::built(
+            LogicalPlan::Statement(Statement::Prepare(Prepare {
                 name,
                 fields,
                 input: self.plan,
-            },
-        ))))
+            })),
+            self.funding,
+        )
     }
 
     /// Limit the number of rows returned
@@ -683,16 +705,18 @@ impl LogicalPlanBuilder {
     ///
     /// Similar to `limit` but uses expressions for `skip` and `fetch`
     pub fn limit_by_expr(self, skip: Option<Expr>, fetch: Option<Expr>) -> Result<Self> {
-        Ok(Self::new(LogicalPlan::Limit(Limit {
-            skip: skip.map(Box::new),
-            fetch: fetch.map(Box::new),
+        let limit = Limit {
+            skip: self.funding.maybe_boxed(skip)?,
+            fetch: self.funding.maybe_boxed(fetch)?,
             input: self.plan,
-        })))
+        };
+        Self::built(LogicalPlan::Limit(limit), self.funding)
     }
 
     /// Apply an alias
     pub fn alias(self, alias: impl Into<TableReference>) -> Result<Self> {
-        subquery_alias(Arc::unwrap_or_clone(self.plan), alias).map(Self::new)
+        let plan = subquery_alias(self.funding.unwrapped(self.plan)?, alias)?;
+        Self::built(plan, self.funding)
     }
 
     /// Add missing sort columns to all downstream projection
@@ -852,11 +876,12 @@ impl LogicalPlanBuilder {
         })?;
 
         if missing_cols.is_empty() {
-            return Ok(Self::new(LogicalPlan::Sort(Sort {
+            let sort = Sort {
                 expr: normalize_sorts(sorts, &self.plan)?,
                 input: self.plan,
                 fetch,
-            })));
+            };
+            return Self::built(LogicalPlan::Sort(sort), self.funding);
         }
 
         // remove pushed down sort columns
@@ -864,55 +889,58 @@ impl LogicalPlanBuilder {
 
         let is_distinct = false;
         let plan = Self::add_missing_columns(
-            Arc::unwrap_or_clone(self.plan),
+            self.funding.unwrapped(self.plan)?,
             &missing_cols,
             is_distinct,
         )?;
 
         let sort_plan = LogicalPlan::Sort(Sort {
             expr: normalize_sorts(sorts, &plan)?,
-            input: Arc::new(plan),
+            input: self.funding.arc(plan)?,
             fetch,
         });
 
-        Projection::try_new(new_expr, Arc::new(sort_plan), &Funding::default())
-            .map(LogicalPlan::Projection)
-            .map(Self::new)
+        let projection =
+            Projection::try_new(new_expr, self.funding.arc(sort_plan)?, &self.funding)?;
+        Self::built(LogicalPlan::Projection(projection), self.funding)
     }
 
     /// Apply a union, preserving duplicate rows
     pub fn union(self, plan: LogicalPlan) -> Result<Self> {
-        union(Arc::unwrap_or_clone(self.plan), plan).map(Self::new)
+        let plan = union(self.funding.unwrapped(self.plan)?, plan)?;
+        Self::built(plan, self.funding)
     }
 
     /// Apply a union by name, preserving duplicate rows
     pub fn union_by_name(self, plan: LogicalPlan) -> Result<Self> {
-        union_by_name(Arc::unwrap_or_clone(self.plan), plan).map(Self::new)
+        let plan = union_by_name(self.funding.unwrapped(self.plan)?, plan)?;
+        Self::built(plan, self.funding)
     }
 
     /// Apply a union by name, removing duplicate rows
     pub fn union_by_name_distinct(self, plan: LogicalPlan) -> Result<Self> {
-        let left_plan: LogicalPlan = Arc::unwrap_or_clone(self.plan);
+        let left_plan: LogicalPlan = self.funding.unwrapped(self.plan)?;
         let right_plan: LogicalPlan = plan;
 
-        Ok(Self::new(LogicalPlan::Distinct(Distinct::All(Arc::new(
-            union_by_name(left_plan, right_plan)?,
-        )))))
+        let union = self.funding.arc(union_by_name(left_plan, right_plan)?)?;
+        Self::built(LogicalPlan::Distinct(Distinct::All(union)), self.funding)
     }
 
     /// Apply a union, removing duplicate rows
     pub fn union_distinct(self, plan: LogicalPlan) -> Result<Self> {
-        let left_plan: LogicalPlan = Arc::unwrap_or_clone(self.plan);
+        let left_plan: LogicalPlan = self.funding.unwrapped(self.plan)?;
         let right_plan: LogicalPlan = plan;
 
-        Ok(Self::new(LogicalPlan::Distinct(Distinct::All(Arc::new(
-            union(left_plan, right_plan)?,
-        )))))
+        let union = self.funding.arc(union(left_plan, right_plan)?)?;
+        Self::built(LogicalPlan::Distinct(Distinct::All(union)), self.funding)
     }
 
     /// Apply deduplication: Only distinct (different) values are returned)
     pub fn distinct(self) -> Result<Self> {
-        Ok(Self::new(LogicalPlan::Distinct(Distinct::All(self.plan))))
+        Self::built(
+            LogicalPlan::Distinct(Distinct::All(self.plan)),
+            self.funding,
+        )
     }
 
     /// Project first values of the specified expression list according to the provided
@@ -923,9 +951,12 @@ impl LogicalPlanBuilder {
         select_expr: Vec<Expr>,
         sort_expr: Option<Vec<SortExpr>>,
     ) -> Result<Self> {
-        Ok(Self::new(LogicalPlan::Distinct(Distinct::On(
-            DistinctOn::try_new(on_expr, select_expr, sort_expr, self.plan)?,
-        ))))
+        let distinct_on =
+            DistinctOn::try_new(on_expr, select_expr, sort_expr, self.plan)?;
+        Self::built(
+            LogicalPlan::Distinct(Distinct::On(distinct_on)),
+            self.funding,
+        )
     }
 
     /// Apply a join to `right` using explicitly specified columns and an
@@ -1169,17 +1200,18 @@ impl LogicalPlanBuilder {
             return plan_err!("join condition should not be empty");
         }
 
-        Ok(Self::new(LogicalPlan::Join(Join {
+        let join = Join {
             left: self.plan,
-            right: Arc::new(right),
+            right: self.funding.arc(right)?,
             on,
             filter,
             join_type,
             join_constraint: JoinConstraint::On,
-            schema: DFSchemaRef::new(join_schema),
+            schema: self.funding.arc(join_schema)?,
             null_equality,
             null_aware,
-        })))
+        };
+        Self::built(LogicalPlan::Join(join), self.funding)
     }
 
     /// Apply a join with using constraint, which duplicates all join columns in output schema.
@@ -1239,14 +1271,14 @@ impl LogicalPlanBuilder {
         }
 
         if join_on.is_empty() {
-            let join = Self::from(self.plan).cross_join(right)?;
+            let join = self.cross_join(right)?;
             join.filter(filters.ok_or_else(|| {
                 internal_datafusion_err!("filters should not be None here")
             })?)
         } else {
             let join = Join::try_new(
                 self.plan,
-                Arc::new(right),
+                self.funding.arc(right)?,
                 join_on,
                 filters,
                 join_type,
@@ -1255,7 +1287,7 @@ impl LogicalPlanBuilder {
                 false, // null_aware
             )?;
 
-            Ok(Self::new(LogicalPlan::Join(join)))
+            Self::built(LogicalPlan::Join(join), self.funding)
         }
     }
 
@@ -1263,7 +1295,7 @@ impl LogicalPlanBuilder {
     pub fn cross_join(self, right: LogicalPlan) -> Result<Self> {
         let join = Join::try_new(
             self.plan,
-            Arc::new(right),
+            self.funding.arc(right)?,
             vec![],
             None,
             JoinType::Inner,
@@ -1272,15 +1304,16 @@ impl LogicalPlanBuilder {
             false, // null_aware
         )?;
 
-        Ok(Self::new(LogicalPlan::Join(join)))
+        Self::built(LogicalPlan::Join(join), self.funding)
     }
 
     /// Repartition
     pub fn repartition(self, partitioning_scheme: Partitioning) -> Result<Self> {
-        Ok(Self::new(LogicalPlan::Repartition(Repartition {
+        let repartition = Repartition {
             input: self.plan,
             partitioning_scheme,
-        })))
+        };
+        Self::built(LogicalPlan::Repartition(repartition), self.funding)
     }
 
     /// Apply a window functions to extend the schema
@@ -1289,11 +1322,9 @@ impl LogicalPlanBuilder {
         window_expr: impl IntoIterator<Item = impl Into<Expr>>,
     ) -> Result<Self> {
         let window_expr = normalize_cols(window_expr, &self.plan)?;
-        validate_unique_names("Windows", &window_expr, &Funding::default())?;
-        Ok(Self::new(LogicalPlan::Window(Window::try_new(
-            window_expr,
-            self.plan,
-        )?)))
+        validate_unique_names("Windows", &window_expr, &self.funding)?;
+        let window = Window::try_new(window_expr, self.plan)?;
+        Self::built(LogicalPlan::Window(window), self.funding)
     }
 
     /// Apply an aggregate: grouping on the `group_expr` expressions
@@ -1313,9 +1344,8 @@ impl LogicalPlanBuilder {
             group_expr
         };
 
-        Aggregate::try_new(self.plan, group_expr, aggr_expr)
-            .map(LogicalPlan::Aggregate)
-            .map(Self::new)
+        let aggregate = Aggregate::try_new(self.plan, group_expr, aggr_expr)?;
+        Self::built(LogicalPlan::Aggregate(aggregate), self.funding)
     }
 
     /// Create an expression to represent the explanation of the plan
@@ -1341,19 +1371,20 @@ impl LogicalPlanBuilder {
         let schema = schema.to_dfschema_ref()?;
 
         if explain_option.analyze {
-            Ok(Self::new(LogicalPlan::Analyze(Analyze {
+            let analyze = Analyze {
                 verbose: explain_option.verbose,
                 format: explain_option.format,
                 input: self.plan,
                 schema,
                 analyze_level: explain_option.analyze_level,
                 analyze_categories: explain_option.analyze_categories,
-            })))
+            };
+            Self::built(LogicalPlan::Analyze(analyze), self.funding)
         } else {
             let stringified_plans =
                 vec![self.plan.to_stringified(PlanType::InitialLogicalPlan)];
 
-            Ok(Self::new(LogicalPlan::Explain(Explain {
+            let explain = Explain {
                 verbose: explain_option.verbose,
                 plan: self.plan,
                 explain_format: explain_option.format,
@@ -1361,7 +1392,8 @@ impl LogicalPlanBuilder {
                 schema,
                 logical_optimization_succeeded: false,
                 show_statistics: explain_option.show_statistics,
-            })))
+            };
+            Self::built(LogicalPlan::Explain(explain), self.funding)
         }
     }
 
@@ -1455,8 +1487,11 @@ impl LogicalPlanBuilder {
     }
 
     /// Build the plan
+    ///
+    /// The plan is taken out of its block, given back to the builder's funding when the
+    /// builder held the last handle to it, and copied, charged, when it did not.
     pub fn build(self) -> Result<LogicalPlan> {
-        Ok(Arc::unwrap_or_clone(self.plan))
+        self.funding.unwrapped(self.plan)
     }
 
     /// Apply a join with both explicit equijoin and non equijoin predicates.
@@ -1522,7 +1557,7 @@ impl LogicalPlanBuilder {
 
         let join = Join::try_new(
             self.plan,
-            Arc::new(right),
+            self.funding.arc(right)?,
             join_key_pairs,
             filter,
             join_type,
@@ -1531,12 +1566,13 @@ impl LogicalPlanBuilder {
             false, // null_aware
         )?;
 
-        Ok(Self::new(LogicalPlan::Join(join)))
+        Self::built(LogicalPlan::Join(join), self.funding)
     }
 
     /// Unnest the given column.
     pub fn unnest_column(self, column: impl Into<Column>) -> Result<Self> {
-        unnest(Arc::unwrap_or_clone(self.plan), vec![column.into()]).map(Self::new)
+        let plan = unnest(self.funding.unwrapped(self.plan)?, vec![column.into()])?;
+        Self::built(plan, self.funding)
     }
 
     /// Unnest the given column given [`UnnestOptions`]
@@ -1545,12 +1581,12 @@ impl LogicalPlanBuilder {
         column: impl Into<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
-        unnest_with_options(
-            Arc::unwrap_or_clone(self.plan),
+        let plan = unnest_with_options(
+            self.funding.unwrapped(self.plan)?,
             vec![column.into()],
             options,
-        )
-        .map(Self::new)
+        )?;
+        Self::built(plan, self.funding)
     }
 
     /// Unnest the given columns with the given [`UnnestOptions`]
@@ -1559,8 +1595,9 @@ impl LogicalPlanBuilder {
         columns: Vec<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
-        unnest_with_options(Arc::unwrap_or_clone(self.plan), columns, options)
-            .map(Self::new)
+        let plan =
+            unnest_with_options(self.funding.unwrapped(self.plan)?, columns, options)?;
+        Self::built(plan, self.funding)
     }
 }
 
@@ -1572,7 +1609,7 @@ impl From<LogicalPlan> for LogicalPlanBuilder {
 
 impl From<Arc<LogicalPlan>> for LogicalPlanBuilder {
     fn from(plan: Arc<LogicalPlan>) -> Self {
-        LogicalPlanBuilder::new_from_arc(plan)
+        LogicalPlanBuilder::new_from_arc(plan, &Funding::default())
     }
 }
 

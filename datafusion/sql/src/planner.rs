@@ -591,6 +591,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         self.context_provider.funding()
     }
 
+    /// A builder over `plan`, planning within [`SqlToRel::funding`]: the plan's block and
+    /// every node it builds are charged to it.
+    pub(crate) fn builder(&self, plan: LogicalPlan) -> Result<LogicalPlanBuilder> {
+        let funding = self.funding();
+        Ok(LogicalPlanBuilder::new_from_arc(
+            funding.arc(plan)?,
+            funding,
+        ))
+    }
+
     /// What `plan` makes, charged to [`SqlToRel::funding`]. Planned, the plan holds what the
     /// funding has outstanding since; failed, all it made has been freed with the attempt,
     /// and is given back.
@@ -691,7 +701,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let idents = alias.columns.into_iter().map(|c| c.name).collect();
         let plan = self.apply_expr_alias(plan, idents)?;
 
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .alias(TableReference::bare(
                 self.ident_normalizer.normalize(alias.name),
             ))?
@@ -714,7 +724,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             )
         } else {
             let columns = plan.schema().columns();
-            LogicalPlanBuilder::from(plan)
+            self.builder(plan)?
                 .project(columns.into_iter().zip(idents).map(|(col, ident)| {
                     Expr::Column(col).alias(self.ident_normalizer.normalize(ident))
                 }))?

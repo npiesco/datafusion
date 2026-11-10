@@ -451,9 +451,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         let plan = if let Some(having_expr_post_aggr) = having_expr_post_aggr {
-            LogicalPlanBuilder::from(plan)
-                .having(having_expr_post_aggr)?
-                .build()?
+            self.builder(plan)?.having(having_expr_post_aggr)?.build()?
         } else {
             plan
         };
@@ -532,7 +530,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 std::slice::from_ref(&qualify_expr_post_window),
             )?;
 
-            LogicalPlanBuilder::from(plan)
+            self.builder(plan)?
                 .filter(qualify_expr_post_window)?
                 .build()?
         } else {
@@ -551,7 +549,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
             Some(Distinct::Distinct) => {
                 let plan = self.try_process_unnest(plan, select_exprs_post_aggr)?;
-                LogicalPlanBuilder::from(plan).distinct()?.build()?
+                self.builder(plan)?.distinct()?.build()?
             }
             Some(Distinct::On(_)) => {
                 if aggr_exprs.is_empty()
@@ -567,13 +565,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     // underlying input expression first.
                     order_by_rex =
                         substitute_top_level_aliases_in_sorts(order_by_rex, &alias_map);
-                    LogicalPlanBuilder::from(Arc::clone(base_plan))
-                        .distinct_on(
-                            on_exprs_post_aggr,
-                            self.funding().cloned(select_exprs)?,
-                            None,
-                        )?
-                        .build()?
+                    LogicalPlanBuilder::new_from_arc(
+                        Arc::clone(base_plan),
+                        self.funding(),
+                    )
+                    .distinct_on(
+                        on_exprs_post_aggr,
+                        self.funding().cloned(select_exprs)?,
+                        None,
+                    )?
+                    .build()?
                 } else {
                     // General path: DistinctOn layered over the post-
                     // aggregate / post-window plan (no extra Projection
@@ -605,7 +606,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     )?;
                     order_by_rex = rewritten_order_by_rex;
 
-                    LogicalPlanBuilder::from(plan)
+                    self.builder(plan)?
                         .distinct_on(on_exprs_post_aggr, select_exprs_post_aggr, None)?
                         .build()?
                 }
@@ -640,7 +641,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .iter()
             .map(|e| self.sql_expr_to_logical_expr(e.clone(), schema, planner_context))
             .collect::<Result<Vec<_>>>()?;
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .repartition(Partitioning::DistributeBy(x))?
             .build()
     }
@@ -656,7 +657,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 select_exprs.into_iter().map(|expr| vec![expr]).collect(),
             )?;
 
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .project(flatten_expr_groups(expr_groups))?
             .build()
     }
@@ -804,7 +805,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 unnest_col_vec.push(col);
             }
 
-            intermediate_plan = LogicalPlanBuilder::from(intermediate_plan)
+            intermediate_plan = self
+                .builder(intermediate_plan)?
                 .project(inner_projection_exprs)?
                 .unnest_columns_with_options(unnest_col_vec, unnest_options)?
                 .build()?;
@@ -855,7 +857,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     self.try_process_group_by_unnest(agg)?;
                 let options = LogicalPlanBuilderOptions::new()
                     .with_add_implicit_group_by_exprs(true);
-                LogicalPlanBuilder::from(new_input)
+                self.builder(new_input)?
                     .with_options(options)
                     .aggregate(new_group_by_exprs, agg_expr)?
                     .build()
@@ -963,7 +965,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     unnest_col_vec.push(col);
                 }
 
-                intermediate_plan = LogicalPlanBuilder::from(intermediate_plan)
+                intermediate_plan = self
+                    .builder(intermediate_plan)?
                     .project(projection_exprs)?
                     .unnest_columns_with_options(unnest_col_vec, unnest_options)?
                     .build()?;
@@ -1051,10 +1054,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             _ => {
                 let mut from = from.into_iter();
 
-                let mut left = LogicalPlanBuilder::from({
+                let mut left = self.builder({
                     let input = from.next().unwrap();
                     self.plan_table_with_joins(input, planner_context)?
-                });
+                })?;
                 let old_outer_from_schema = {
                     let left_schema = Some(Arc::clone(left.schema()));
                     planner_context.set_outer_from_schema(left_schema)
@@ -1298,7 +1301,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     #[expect(clippy::too_many_arguments)]
     fn aggregate(
         &self,
-        input: &LogicalPlan,
+        input: &Arc<LogicalPlan>,
         select_exprs: &[Expr],
         having_expr_opt: Option<&Expr>,
         qualify_expr_opt: Option<&Expr>,
@@ -1310,9 +1313,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // create the aggregate plan
         let options =
             LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(true);
-        let plan = LogicalPlanBuilder::from(input.clone())
+        let funding = self.funding();
+        let plan = LogicalPlanBuilder::new_from_arc(Arc::clone(input), funding)
             .with_options(options)
-            .aggregate(group_by_exprs.to_vec(), aggr_exprs.to_vec())?
+            .aggregate(funding.to_vec(group_by_exprs)?, funding.to_vec(aggr_exprs)?)?
             .build()?;
         let group_by_exprs = if let LogicalPlan::Aggregate(agg) = &plan {
             &agg.group_expr
