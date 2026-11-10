@@ -122,8 +122,8 @@ impl PhysicalOptimizerRule for PushdownSort {
                         // Insert BufferExec to replace SortExec's buffering role.
                         // SortExec buffered all data in memory; BufferExec provides
                         // bounded buffering so SPM doesn't stall on I/O.
-                        let buffered: Arc<dyn ExecutionPlan> =
-                            Arc::new(BufferExec::new(inner, buffer_capacity));
+                        let buffered: Arc<dyn ExecutionPlan> = funding
+                            .arc(BufferExec::new(inner, buffer_capacity, funding)?)?;
                         let new_spm = SortPreservingMergeExec::new(
                             spm.expr().clone(),
                             buffered,

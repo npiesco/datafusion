@@ -34,6 +34,7 @@ use crate::{
 };
 use arrow::array::RecordBatch;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, Statistics, internal_err};
 use datafusion_common_runtime::SpawnedTask;
@@ -100,21 +101,37 @@ pub struct BufferExec {
     properties: Arc<PlanProperties>,
     capacity: usize,
     metrics: ExecutionPlanMetricsSet,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl BufferExec {
-    /// Builds a new [BufferExec] with the provided capacity in bytes.
-    pub fn new(input: Arc<dyn ExecutionPlan>, capacity: usize) -> Self {
-        let properties = PlanProperties::clone(input.properties())
-            .with_scheduling_type(SchedulingType::Cooperative)
-            .with_evaluation_type(EvaluationType::Eager);
+    /// Builds a new [BufferExec] with the provided capacity in bytes, charging what it
+    /// allocates to `funding`.
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        capacity: usize,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let properties = funding.arc(
+            PlanProperties::clone(input.properties())
+                .with_scheduling_type(SchedulingType::Cooperative)
+                .with_evaluation_type(EvaluationType::Eager),
+        )?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
 
-        Self {
+        Ok(Self {
             input,
-            properties: Arc::new(properties),
+            properties,
             capacity,
             metrics: ExecutionPlanMetricsSet::new(),
-        }
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Returns the input [ExecutionPlan] of this [BufferExec].
@@ -176,14 +193,19 @@ impl ExecutionPlan for BufferExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
-            ChildrenPropertiesMode::Recompute => {
-                Ok(Arc::new(Self::new(children.swap_remove(0), self.capacity)))
+            ChildrenPropertiesMode::Keep => {
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ..Self::clone(&*self)
+                })?)
             }
+            ChildrenPropertiesMode::Recompute => Ok(self.funding.arc(Self::new(
+                children.swap_remove(0),
+                self.capacity,
+                &self.funding,
+            )?)?),
         }
     }
 
@@ -322,7 +344,10 @@ impl ExecutionPlan for BufferExec {
         // CoalesceBatchesExec is transparent for sort ordering - it preserves order
         // Delegate to the child and wrap with a new CoalesceBatchesExec
         self.input.try_pushdown_sort(order)?.try_map(|new_input| {
-            Ok(Arc::new(Self::new(new_input, self.capacity)) as Arc<dyn ExecutionPlan>)
+            Ok(self
+                .funding
+                .arc(Self::new(new_input, self.capacity, &self.funding)?)?
+                as Arc<dyn ExecutionPlan>)
         })
     }
 
@@ -365,7 +390,11 @@ impl BufferExec {
         );
         let input =
             ctx.decode_required_child(buffer.input.as_deref(), "BufferExec", "input")?;
-        Ok(Arc::new(BufferExec::new(input, buffer.capacity as usize)))
+        Ok(Arc::new(BufferExec::new(
+            input,
+            buffer.capacity as usize,
+            &Funding::default(),
+        )?))
     }
 }
 

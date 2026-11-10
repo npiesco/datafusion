@@ -71,6 +71,7 @@
 //! that report [`SchedulingType::NonCooperative`] in their [plan properties](ExecutionPlan::properties).
 
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_physical_expr::PhysicalExpr;
 #[cfg(datafusion_coop = "tokio_fallback")]
@@ -220,16 +221,29 @@ where
 pub struct CooperativeExec {
     input: Arc<dyn ExecutionPlan>,
     properties: Arc<PlanProperties>,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl CooperativeExec {
-    /// Creates a new `CooperativeExec` operator that wraps the given input execution plan.
-    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        let properties = PlanProperties::clone(input.properties())
-            .with_scheduling_type(SchedulingType::Cooperative)
-            .into();
+    /// Creates a new `CooperativeExec` operator that wraps the given input execution plan,
+    /// charging what it allocates to `funding`.
+    pub fn new(input: Arc<dyn ExecutionPlan>, funding: &Funding) -> Result<Self> {
+        let properties = funding.arc(
+            PlanProperties::clone(input.properties())
+                .with_scheduling_type(SchedulingType::Cooperative),
+        )?;
 
-        Self { input, properties }
+        Ok(Self {
+            input,
+            properties,
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Returns a reference to the wrapped input execution plan.
@@ -283,13 +297,13 @@ impl ExecutionPlan for CooperativeExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
+            ChildrenPropertiesMode::Keep => Ok(self.funding.arc(Self {
                 input: children.swap_remove(0),
                 ..Self::clone(&*self)
-            })),
-            ChildrenPropertiesMode::Recompute => {
-                Ok(Arc::new(CooperativeExec::new(children.swap_remove(0))))
-            }
+            })?),
+            ChildrenPropertiesMode::Recompute => Ok(self.funding.arc(
+                CooperativeExec::new(children.swap_remove(0), &self.funding)?,
+            )?),
         }
     }
 
@@ -437,7 +451,7 @@ impl CooperativeExec {
             "CooperativeExec",
             "input",
         )?;
-        Ok(Arc::new(CooperativeExec::new(input)))
+        Ok(Arc::new(CooperativeExec::new(input, &Funding::default())?))
     }
 }
 

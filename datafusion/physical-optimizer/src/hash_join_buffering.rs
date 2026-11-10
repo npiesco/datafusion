@@ -59,6 +59,7 @@ impl PhysicalOptimizerRule for HashJoinBuffering {
         plan: Arc<dyn ExecutionPlan>,
         config: &ConfigOptions,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let funding = &config.funding;
         let capacity = config.execution.hash_join_buffering_capacity;
         if capacity == 0 {
             return Ok(plan);
@@ -77,10 +78,14 @@ impl PhysicalOptimizerRule for HashJoinBuffering {
                     }
                     replace_children_if_necessary(
                         plan,
-                        vec![
-                            Arc::new(BufferExec::new(Arc::clone(&node.left), capacity)),
+                        funding.vec_of([
+                            funding.arc(BufferExec::new(
+                                Arc::clone(&node.left),
+                                capacity,
+                                funding,
+                            )?)? as Arc<dyn ExecutionPlan>,
                             Arc::clone(&node.right),
-                        ],
+                        ])?,
                     )?
                 } else {
                     // Do not stack BufferExec nodes together.
@@ -89,10 +94,14 @@ impl PhysicalOptimizerRule for HashJoinBuffering {
                     }
                     replace_children_if_necessary(
                         plan,
-                        vec![
+                        funding.vec_of([
                             Arc::clone(&node.left),
-                            Arc::new(BufferExec::new(Arc::clone(&node.right), capacity)),
-                        ],
+                            funding.arc(BufferExec::new(
+                                Arc::clone(&node.right),
+                                capacity,
+                                funding,
+                            )?)? as Arc<dyn ExecutionPlan>,
+                        ])?,
                     )?
                 },
             ))

@@ -2959,7 +2959,8 @@ mod tests {
     fn buffer_exec_does_not_need_data_exchange() {
         let schema = Arc::new(Schema::empty());
         let input: Arc<dyn ExecutionPlan> = Arc::new(MockExec::new(vec![], schema));
-        let buffer: Arc<dyn ExecutionPlan> = Arc::new(BufferExec::new(input, 1024));
+        let buffer: Arc<dyn ExecutionPlan> =
+            Arc::new(BufferExec::new(input, 1024, &Funding::default()).unwrap());
 
         assert!(!need_data_exchange(buffer));
     }

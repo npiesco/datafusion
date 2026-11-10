@@ -1727,7 +1727,8 @@ fn test_partition_col_projection_pushdown_expr() -> Result<()> {
 #[test]
 fn test_cooperative_exec_after_projection() -> Result<()> {
     let csv = create_simple_csv_exec();
-    let cooperative: Arc<dyn ExecutionPlan> = Arc::new(CooperativeExec::new(csv));
+    let cooperative: Arc<dyn ExecutionPlan> =
+        Arc::new(CooperativeExec::new(csv, &Funding::default()).unwrap());
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
             ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a"),

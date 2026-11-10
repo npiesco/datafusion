@@ -65,11 +65,13 @@ impl PhysicalOptimizerRule for EnsureCooperative {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         use std::cell::RefCell;
 
-        let ancestry_stack = RefCell::new(Vec::<(SchedulingType, EvaluationType)>::new());
+        let funding = &config.funding;
+        let ancestry_stack =
+            RefCell::new(funding.held::<Vec<(SchedulingType, EvaluationType)>>());
 
         plan.transform_down_up(
             // Down phase: Push parent properties <SchedulingType, EvaluationType> into the stack
@@ -77,7 +79,7 @@ impl PhysicalOptimizerRule for EnsureCooperative {
                 let props = plan.properties();
                 ancestry_stack
                     .borrow_mut()
-                    .push((props.scheduling_type, props.evaluation_type));
+                    .push((props.scheduling_type, props.evaluation_type))?;
                 Ok(Transformed::no(plan))
             },
             // Up phase: Wrap nodes with CooperativeExec if needed
@@ -112,7 +114,9 @@ impl PhysicalOptimizerRule for EnsureCooperative {
                     && !is_cooperative
                     && !is_under_cooperative_context
                 {
-                    return Ok(Transformed::yes(Arc::new(CooperativeExec::new(plan))));
+                    return Ok(Transformed::yes(
+                        funding.arc(CooperativeExec::new(plan, funding)?)?,
+                    ));
                 }
 
                 Ok(Transformed::no(plan))
@@ -190,7 +194,9 @@ mod tests {
         }
 
         // Test 2: Start with already-wrapped plan, verify no double wrapping
-        let pre_wrapped = Arc::new(CooperativeExec::new(scan_partitioned(1)));
+        let pre_wrapped = Arc::new(
+            CooperativeExec::new(scan_partitioned(1), &Funding::default()).unwrap(),
+        );
         let result = rule.optimize(pre_wrapped, &config).unwrap();
         let display = displayable(result.as_ref()).indent(true).to_string();
 
@@ -227,7 +233,8 @@ mod tests {
 
         // Case 2: Filter -> CoopExec -> Scan (depth tracking prevents double wrap)
         let scan2 = scan_partitioned(1);
-        let wrapped_scan = Arc::new(CooperativeExec::new(scan2));
+        let wrapped_scan =
+            Arc::new(CooperativeExec::new(scan2, &Funding::default()).unwrap());
         let filter2 = Arc::new(
             FilterExec::try_new(lit(true), wrapped_scan, &Funding::default()).unwrap(),
         );
@@ -381,7 +388,7 @@ mod tests {
             SchedulingType::NonCooperative,
             EvaluationType::Eager,
         ));
-        let coop = Arc::new(CooperativeExec::new(exch1));
+        let coop = Arc::new(CooperativeExec::new(exch1, &Funding::default()).unwrap());
         let filter1 = Arc::new(DummyExec::new(
             "filter1",
             coop,

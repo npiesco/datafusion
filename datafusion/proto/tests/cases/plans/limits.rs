@@ -259,9 +259,13 @@ fn roundtrip_coalesce_partitions_with_fetch() -> Result<()> {
 #[test]
 fn roundtrip_cooperative() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
-    roundtrip_test(Arc::new(CooperativeExec::new(Arc::new(
-        EmptyExec::new(schema, &Funding::default()).unwrap(),
-    ))))
+    roundtrip_test(Arc::new(
+        CooperativeExec::new(
+            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+            &Funding::default(),
+        )
+        .unwrap(),
+    ))
 }
 
 #[test]
@@ -271,10 +275,14 @@ fn roundtrip_buffer() -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
     let proto_converter = DefaultPhysicalProtoConverter {};
     let result = roundtrip_test_and_return(
-        Arc::new(BufferExec::new(
-            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
-            4096,
-        )),
+        Arc::new(
+            BufferExec::new(
+                Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
+                4096,
+                &Funding::default(),
+            )
+            .unwrap(),
+        ),
         &ctx,
         &codec,
         &proto_converter,
