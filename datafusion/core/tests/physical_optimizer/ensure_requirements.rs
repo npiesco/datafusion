@@ -487,7 +487,12 @@ fn test_filter_over_multi_partition_sort_limit() {
 fn test_repartition_sort_limit_idempotent() {
     let source = Arc::new(MockMultiPartitionExec::new(1));
     let repartition = Arc::new(
-        RepartitionExec::try_new(source as _, Partitioning::RoundRobinBatch(8)).unwrap(),
+        RepartitionExec::try_new(
+            source as _,
+            Partitioning::RoundRobinBatch(8),
+            &Funding::default(),
+        )
+        .unwrap(),
     );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
@@ -910,7 +915,12 @@ fn test_issue_14150_fetch_survives_multiple_passes() {
     // with target_partitions > 1 (triggers RepartitionExec)
     let source: Arc<dyn ExecutionPlan> = Arc::new(MockMultiPartitionExec::new(1));
     let repartition = Arc::new(
-        RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(4)).unwrap(),
+        RepartitionExec::try_new(
+            source,
+            Partitioning::RoundRobinBatch(4),
+            &Funding::default(),
+        )
+        .unwrap(),
     );
 
     let sort_expr = sort_expr_on("a", 0, false, true);
@@ -1312,7 +1322,12 @@ fn test_idempotent_repartition_hash_sort_limit() {
 
     let hash_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(Column::new("a", 0))];
     let repartition = Arc::new(
-        RepartitionExec::try_new(source, Partitioning::Hash(hash_exprs, 4)).unwrap(),
+        RepartitionExec::try_new(
+            source,
+            Partitioning::Hash(hash_exprs, 4),
+            &Funding::default(),
+        )
+        .unwrap(),
     );
 
     let sort_expr = sort_expr_on("a", 0, true, true);
@@ -1433,6 +1448,7 @@ fn collect_left_plan_before_parallelize_sorts(
             .unwrap(),
         ),
         Partitioning::RoundRobinBatch(TEST_TARGET_PARTITIONS),
+        &Funding::default(),
     )?);
 
     let on = vec![(

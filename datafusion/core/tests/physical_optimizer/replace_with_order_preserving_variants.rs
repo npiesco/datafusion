@@ -1096,7 +1096,14 @@ fn sort_expr_options(
 }
 
 fn repartition_exec_round_robin(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(8)).unwrap())
+    Arc::new(
+        RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(8),
+            &Funding::default(),
+        )
+        .unwrap(),
+    )
 }
 
 fn repartition_exec_hash(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
@@ -1105,6 +1112,7 @@ fn repartition_exec_hash(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan
         RepartitionExec::try_new(
             input,
             Partitioning::Hash(vec![col("c", &input_schema).unwrap()], 8),
+            &Funding::default(),
         )
         .unwrap(),
     )

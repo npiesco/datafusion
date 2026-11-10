@@ -388,9 +388,14 @@ mod sp_repartition_fuzz_tests {
         input: Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
-            RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(2))
-                .unwrap()
-                .with_preserve_order(),
+            RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(2),
+                &Funding::default(),
+            )
+            .unwrap()
+            .with_preserve_order()
+            .unwrap(),
         )
     }
 
@@ -398,7 +403,12 @@ mod sp_repartition_fuzz_tests {
         input: Arc<dyn ExecutionPlan>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
-            RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(2)).unwrap(),
+            RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(2),
+                &Funding::default(),
+            )
+            .unwrap(),
         )
     }
 
@@ -407,9 +417,14 @@ mod sp_repartition_fuzz_tests {
         hash_expr: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
-            RepartitionExec::try_new(input, Partitioning::Hash(hash_expr, 2))
-                .unwrap()
-                .with_preserve_order(),
+            RepartitionExec::try_new(
+                input,
+                Partitioning::Hash(hash_expr, 2),
+                &Funding::default(),
+            )
+            .unwrap()
+            .with_preserve_order()
+            .unwrap(),
         )
     }
 
@@ -418,7 +433,12 @@ mod sp_repartition_fuzz_tests {
         hash_expr: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
-            RepartitionExec::try_new(input, Partitioning::Hash(hash_expr, 2)).unwrap(),
+            RepartitionExec::try_new(
+                input,
+                Partitioning::Hash(hash_expr, 2),
+                &Funding::default(),
+            )
+            .unwrap(),
         )
     }
 

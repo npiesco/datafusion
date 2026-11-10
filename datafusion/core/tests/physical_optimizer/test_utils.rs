@@ -368,14 +368,26 @@ pub fn global_limit_exec(
 }
 
 pub fn repartition_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(10)).unwrap())
+    Arc::new(
+        RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )
+        .unwrap(),
+    )
 }
 
 pub fn spr_repartition_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     Arc::new(
-        RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(10))
-            .unwrap()
-            .with_preserve_order(),
+        RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )
+        .unwrap()
+        .with_preserve_order()
+        .unwrap(),
     )
 }
 

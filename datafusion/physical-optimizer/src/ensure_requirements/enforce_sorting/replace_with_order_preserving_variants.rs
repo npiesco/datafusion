@@ -139,10 +139,14 @@ pub fn plan_with_order_preserving_variants(
         // When a `RepartitionExec` doesn't preserve ordering, replace it with
         // a sort-preserving variant if appropriate:
         let child = Arc::clone(&sort_input.children[0].plan);
-        let partitioning = sort_input.plan.output_partitioning().clone();
-        sort_input.plan = Arc::new(
-            RepartitionExec::try_new(child, partitioning)?.with_preserve_order(),
-        ) as _;
+        let partitioning = sort_input
+            .plan
+            .output_partitioning()
+            .funded_clone(funding)?;
+        sort_input.plan = funding.arc(
+            RepartitionExec::try_new(child, partitioning, funding)?
+                .with_preserve_order()?,
+        )? as _;
         sort_input.children[0].data = true;
         return Ok(sort_input);
     } else if is_coalesce_partitions(&sort_input.plan) && is_spm_better {
@@ -200,8 +204,9 @@ pub fn plan_with_order_breaking_variants(
         // When a `RepartitionExec` preserves ordering, replace it with a
         // non-sort-preserving variant:
         let child = Arc::clone(&sort_input.children[0].plan);
-        let partitioning = plan.output_partitioning().clone();
-        sort_input.plan = Arc::new(RepartitionExec::try_new(child, partitioning)?) as _;
+        let partitioning = plan.output_partitioning().funded_clone(funding)?;
+        sort_input.plan =
+            funding.arc(RepartitionExec::try_new(child, partitioning, funding)?)? as _;
     } else if is_sort_preserving_merge(plan) {
         // Replace `SortPreservingMergeExec` with a `CoalescePartitionsExec`
         // SPM may have `fetch`, so pass it to the `CoalescePartitionsExec`

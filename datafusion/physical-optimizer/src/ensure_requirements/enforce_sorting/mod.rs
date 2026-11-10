@@ -806,10 +806,14 @@ fn remove_corresponding_sort_from_sub_plan(
             node.children = node.children.swap_remove(0).children;
             node.plan = Arc::clone(node.plan.children().swap_remove(0));
         } else if let Some(repartition) = node.plan.downcast_ref::<RepartitionExec>() {
-            node.plan = Arc::new(RepartitionExec::try_new(
+            node.plan = funding.arc(RepartitionExec::try_new(
                 Arc::clone(&node.children[0].plan),
-                repartition.properties().output_partitioning().clone(),
-            )?) as _;
+                repartition
+                    .properties()
+                    .output_partitioning()
+                    .funded_clone(funding)?,
+                funding,
+            )?)? as _;
         }
     };
     // Deleting a merging sort may invalidate distribution requirements.

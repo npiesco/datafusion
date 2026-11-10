@@ -687,6 +687,7 @@ fn new_join_conditions(
 fn add_roundrobin_on_top(
     input: DistributionContext,
     n_target: usize,
+    funding: &Funding,
 ) -> Result<DistributionContext> {
     // Adding repartition is helpful:
     if input.plan.output_partitioning().partition_count() < n_target {
@@ -698,10 +699,10 @@ fn add_roundrobin_on_top(
         // (determined by flag `config.optimizer.prefer_existing_sort`)
         let partitioning = Partitioning::RoundRobinBatch(n_target);
         let repartition =
-            RepartitionExec::try_new(Arc::clone(&input.plan), partitioning)?
-                .with_preserve_order();
+            RepartitionExec::try_new(Arc::clone(&input.plan), partitioning, funding)?
+                .with_preserve_order()?;
 
-        let new_plan = Arc::new(repartition) as _;
+        let new_plan = funding.arc(repartition)? as _;
 
         Ok(DistributionContext::new(new_plan, true, vec![input]))
     } else {
@@ -916,10 +917,11 @@ pub fn replace_order_preserving_variants(
     } else if let Some(repartition) = context.plan.downcast_ref::<RepartitionExec>()
         && repartition.preserve_order()
     {
-        context.plan = Arc::new(RepartitionExec::try_new(
+        context.plan = funding.arc(RepartitionExec::try_new(
             Arc::clone(&context.children[0].plan),
-            repartition.partitioning().clone(),
-        )?);
+            repartition.partitioning().funded_clone(funding)?,
+            funding,
+        )?)?;
         return Ok(context);
     }
 
@@ -1060,6 +1062,7 @@ fn enforce_distribution_relationships(
     input_distributions: &InputDistributionRequirements,
     children: &mut [DistributionChildState],
     target_partitions: usize,
+    funding: &Funding,
 ) -> Result<()> {
     let mut repartitioned_for_relationship = vec![false; children.len()];
 
@@ -1102,14 +1105,16 @@ fn enforce_distribution_relationships(
                 continue;
             }
 
-            let partitioning = Distribution::KeyPartitioned(exprs.to_vec())
-                .create_partitioning(target_partitions);
+            let partitioning =
+                Distribution::KeyPartitioned(funding.vec_from_slice(exprs)?)
+                    .create_partitioning(target_partitions);
             let repartition = RepartitionExec::try_new(
                 Arc::clone(&children[child_idx].context.plan),
                 partitioning,
+                funding,
             )?
-            .with_preserve_order();
-            let plan = Arc::new(repartition) as _;
+            .with_preserve_order()?;
+            let plan = funding.arc(repartition)? as _;
             let original_child = std::mem::replace(
                 &mut children[child_idx].context,
                 DistributionContext::new(plan, true, vec![]),
@@ -1149,6 +1154,7 @@ pub fn ensure_distribution(
         return Ok(Transformed::no(dist_context));
     }
 
+    let funding = &config.funding;
     let target_partitions = config.execution.target_partitions;
     // When `false`, round robin repartition will not be added to increase parallelism
     let enable_round_robin = config.optimizer.enable_round_robin_repartition;
@@ -1331,7 +1337,7 @@ pub fn ensure_distribution(
             // Satisfy the distribution requirement if it is unmet.
             match &requirement {
                 Distribution::SinglePartition => {
-                    child = add_merge_on_top(child, &config.funding)?;
+                    child = add_merge_on_top(child, funding)?;
                 }
                 Distribution::HashPartitioned(exprs)
                 | Distribution::KeyPartitioned(exprs) => {
@@ -1374,14 +1380,16 @@ pub fn ensure_distribution(
                         //   requirements.
                         // - Usage of order preserving variants is not desirable (per the flag
                         //   `config.optimizer.prefer_existing_sort`).
-                        let partitioning = Distribution::KeyPartitioned(exprs.to_vec())
-                            .create_partitioning(target_partitions);
+                        let partitioning =
+                            Distribution::KeyPartitioned(funding.vec_from_slice(exprs)?)
+                                .create_partitioning(target_partitions);
                         let repartition = RepartitionExec::try_new(
                             Arc::clone(&child.plan),
                             partitioning,
+                            funding,
                         )?
-                        .with_preserve_order();
-                        let plan = Arc::new(repartition) as _;
+                        .with_preserve_order()?;
+                        let plan = funding.arc(repartition)? as _;
                         child = DistributionContext::new(plan, true, vec![child]);
                     }
                 }
@@ -1389,7 +1397,7 @@ pub fn ensure_distribution(
                     if add_roundrobin {
                         // Add round-robin repartitioning on top of the operator
                         // to increase parallelism.
-                        child = add_roundrobin_on_top(child, target_partitions)?;
+                        child = add_roundrobin_on_top(child, target_partitions, funding)?;
                     }
                 }
             };
@@ -1412,6 +1420,7 @@ pub fn ensure_distribution(
         &input_distributions,
         &mut children,
         target_partitions,
+        funding,
     )?;
 
     let children = children
@@ -1424,11 +1433,7 @@ pub fn ensure_distribution(
                  requirement,
              }| {
                 let streaming_benefit = if context.data {
-                    preserving_order_enables_streaming(
-                        &plan,
-                        &context.plan,
-                        &config.funding,
-                    )?
+                    preserving_order_enables_streaming(&plan, &context.plan, funding)?
                 } else {
                     false
                 };
@@ -1448,8 +1453,7 @@ pub fn ensure_distribution(
                         && !streaming_benefit
                         && context.data
                     {
-                        context =
-                            replace_order_preserving_variants(context, &config.funding)?;
+                        context = replace_order_preserving_variants(context, funding)?;
                         // If ordering requirements were satisfied before repartitioning,
                         // make sure ordering requirements are still satisfied after.
                         if ordering_satisfied {
@@ -1461,7 +1465,7 @@ pub fn ensure_distribution(
                                 context,
                                 sort_req,
                                 output_fetch,
-                                &config.funding,
+                                funding,
                             )?;
                         }
                     }
@@ -1479,10 +1483,8 @@ pub fn ensure_distribution(
                             // input order, we keep order-preserving variants so
                             // ordering can flow through to ancestors that need it.
                             if !maintains_input_order && !streaming_benefit {
-                                context = replace_order_preserving_variants(
-                                    context,
-                                    &config.funding,
-                                )?;
+                                context =
+                                    replace_order_preserving_variants(context, funding)?;
                             }
                         }
                         Distribution::UnspecifiedDistribution => {
@@ -1490,10 +1492,8 @@ pub fn ensure_distribution(
                             if !maintains_input_order
                                 || plan.is::<OutputRequirementExec>()
                             {
-                                context = replace_order_preserving_variants(
-                                    context,
-                                    &config.funding,
-                                )?;
+                                context =
+                                    replace_order_preserving_variants(context, funding)?;
                             }
                         }
                     }

@@ -109,7 +109,14 @@ fn final_aggregate_exec(
 }
 
 fn repartition_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(10)).unwrap())
+    Arc::new(
+        RepartitionExec::try_new(
+            input,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )
+        .unwrap(),
+    )
 }
 
 // Return appropriate expr depending if COUNT is for col or table (*)

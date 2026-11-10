@@ -2878,6 +2878,7 @@ mod tests {
             PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
                 left,
                 Partitioning::Hash(left_expr, partition_count),
+                &Funding::default(),
             )?),
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests");
@@ -2894,11 +2895,13 @@ mod tests {
                 Arc::new(RepartitionExec::try_new(
                     right,
                     Partitioning::Hash(partition_expr, partition_count),
+                    &Funding::default(),
                 )?) as _
             }
             PartitionMode::Partitioned => Arc::new(RepartitionExec::try_new(
                 right,
                 Partitioning::Hash(right_expr, partition_count),
+                &Funding::default(),
             )?),
             PartitionMode::Auto => {
                 return internal_err!("Unexpected PartitionMode::Auto in join tests");

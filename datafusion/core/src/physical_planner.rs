@@ -1394,10 +1394,11 @@ impl DefaultPhysicalPlanner {
                     planning_ctx,
                     funding,
                 )?;
-                Arc::new(RepartitionExec::try_new(
+                funding.arc(RepartitionExec::try_new(
                     physical_input,
                     physical_partitioning,
-                )?)
+                    funding,
+                )?)?
             }
             LogicalPlan::Sort(Sort {
                 expr, input, fetch, ..

@@ -19,6 +19,7 @@
 //! partitions to M output partitions based on a partitioning scheme, optionally
 //! maintaining the order of the input rows in the output.
 
+use datafusion_common::funding::Funding;
 use std::cmp::Ordering;
 use std::fmt::{Debug, Display, Formatter};
 use std::pin::Pin;
@@ -1419,6 +1420,8 @@ pub struct RepartitionExec {
     preserve_order: bool,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 #[derive(Debug, Clone)]
@@ -1571,21 +1574,26 @@ impl ExecutionPlan for RepartitionExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                state: Default::default(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                let state = self.funding.arc(Mutex::default())?;
+                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(self.funding.arc(Self {
+                    input: children.swap_remove(0),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    state,
+                    ..Self::clone(&*self)
+                })?)
+            }
             ChildrenPropertiesMode::Recompute => {
                 let mut repartition = RepartitionExec::try_new(
                     children.swap_remove(0),
-                    self.partitioning().clone(),
+                    self.partitioning().funded_clone(&self.funding)?,
+                    &self.funding,
                 )?;
                 if self.preserve_order {
-                    repartition = repartition.with_preserve_order();
+                    repartition = repartition.with_preserve_order()?;
                 }
-                Ok(Arc::new(repartition))
+                Ok(self.funding.arc(repartition)?)
             }
         }
     }
@@ -1877,13 +1885,14 @@ impl ExecutionPlan for RepartitionExec {
                     range_partitioning.split_points().to_vec(),
                 )?)
             }
-            others => others.clone(),
+            others => others.funded_clone(&self.funding)?,
         };
 
-        Ok(Some(Arc::new(RepartitionExec::try_new(
+        Ok(Some(self.funding.arc(RepartitionExec::try_new(
             new_projection,
             new_partitioning,
-        )?)))
+            &self.funding,
+        )?)?))
     }
 
     fn gather_filters_for_pushdown(
@@ -1916,12 +1925,15 @@ impl ExecutionPlan for RepartitionExec {
 
         // Delegate to the child and wrap with a new RepartitionExec
         self.input.try_pushdown_sort(order)?.try_map(|new_input| {
-            let mut new_repartition =
-                RepartitionExec::try_new(new_input, self.partitioning().clone())?;
+            let mut new_repartition = RepartitionExec::try_new(
+                new_input,
+                self.partitioning().funded_clone(&self.funding)?,
+                &self.funding,
+            )?;
             if self.preserve_order {
-                new_repartition = new_repartition.with_preserve_order();
+                new_repartition = new_repartition.with_preserve_order()?;
             }
-            Ok(Arc::new(new_repartition) as Arc<dyn ExecutionPlan>)
+            Ok(self.funding.arc(new_repartition)? as Arc<dyn ExecutionPlan>)
         })
     }
 
@@ -1941,13 +1953,14 @@ impl ExecutionPlan for RepartitionExec {
             }
             UnknownPartitioning(_) => UnknownPartitioning(target_partitions),
         };
-        Ok(Some(Arc::new(Self {
+        Ok(Some(self.funding.arc(Self {
             input: Arc::clone(&self.input),
             state: Arc::clone(&self.state),
             metrics: self.metrics.clone(),
             preserve_order: self.preserve_order,
-            cache: new_properties.into(),
-        })))
+            cache: self.funding.arc(new_properties)?,
+            funding: self.funding.clone(),
+        })?))
     }
 
     #[cfg(feature = "proto")]
@@ -2009,9 +2022,10 @@ impl RepartitionExec {
                 )
             })?;
 
-        let mut repart_exec = RepartitionExec::try_new(input, partitioning)?;
+        let mut repart_exec =
+            RepartitionExec::try_new(input, partitioning, &Funding::default())?;
         if repart.preserve_order {
-            repart_exec = repart_exec.with_preserve_order();
+            repart_exec = repart_exec.with_preserve_order()?;
         }
         Ok(Arc::new(repart_exec))
     }
@@ -2021,19 +2035,34 @@ impl RepartitionExec {
     /// Create a new RepartitionExec, that produces output `partitioning`, and
     /// does not preserve the order of the input (see [`Self::with_preserve_order`]
     /// for more details)
+    ///
+    /// What it allocates is charged to `funding`.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         partitioning: Partitioning,
+        funding: &Funding,
     ) -> Result<Self> {
         let preserve_order = false;
-        let cache = Self::compute_properties(&input, partitioning, preserve_order);
+        let cache = funding.arc(Self::compute_properties(
+            &input,
+            partitioning,
+            preserve_order,
+        ))?;
+        let state = funding.arc(Mutex::default())?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(RepartitionExec {
             input,
-            state: Default::default(),
+            state,
             metrics: ExecutionPlanMetricsSet::new(),
             preserve_order,
-            cache: Arc::new(cache),
+            cache,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     fn maintains_input_order_helper(
@@ -2085,7 +2114,7 @@ impl RepartitionExec {
     ///
     /// If the input is not ordered, or has only one partition, this is a no op,
     /// and the node remains a `RepartitionExec`.
-    pub fn with_preserve_order(mut self) -> Self {
+    pub fn with_preserve_order(mut self) -> Result<Self> {
         self.preserve_order =
                 // If the input isn't ordered, there is no ordering to preserve
                 self.input.output_ordering().is_some() &&
@@ -2093,8 +2122,15 @@ impl RepartitionExec {
                 // to maintain order
                 self.input.output_partitioning().partition_count() > 1;
         let eq_properties = Self::eq_properties_helper(&self.input, self.preserve_order);
-        Arc::make_mut(&mut self.cache).set_eq_properties(eq_properties);
-        self
+        match Arc::get_mut(&mut self.cache) {
+            Some(cache) => cache.set_eq_properties(eq_properties),
+            None => {
+                let mut cache = PlanProperties::clone(&self.cache);
+                cache.set_eq_properties(eq_properties);
+                self.cache = self.funding.arc(cache)?;
+            }
+        }
+        Ok(self)
     }
 
     /// Return the sort expressions that are used to merge
@@ -2461,7 +2497,6 @@ impl RecordBatchStream for PerPartitionStream {
 
 #[cfg(test)]
 mod tests {
-    use datafusion_common::funding::Funding;
     use std::collections::HashSet;
 
     use super::*;
@@ -2964,7 +2999,8 @@ mod tests {
                 "foo".to_string(),
             ))])],
         )?);
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning)?;
+        let exec =
+            RepartitionExec::try_new(Arc::new(input), partitioning, &Funding::default())?;
 
         let mut partition_0 = Vec::new();
         let mut stream = exec.execute(0, Arc::clone(&task_ctx))?;
@@ -3002,6 +3038,7 @@ mod tests {
         let repartition = Arc::new(RepartitionExec::try_new(
             Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
             range_partitioning_on_columns(&schema, &["id"], vec![vec![10]])?,
+            &Funding::default(),
         )?);
 
         let projection =
@@ -3035,6 +3072,7 @@ mod tests {
         let repartition = Arc::new(RepartitionExec::try_new(
             Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
             range_partitioning_on_columns(&schema, &["id"], vec![vec![10]])?,
+            &Funding::default(),
         )?);
         let projection =
             projection_on_columns(&(Arc::clone(&repartition) as _), &["payload"])?;
@@ -3053,6 +3091,7 @@ mod tests {
         let repartition = Arc::new(RepartitionExec::try_new(
             Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
             range_partitioning_on_columns(&schema, &["a", "b"], vec![vec![10, 1]])?,
+            &Funding::default(),
         )?);
         let projection =
             projection_on_columns(&(Arc::clone(&repartition) as _), &["a", "c"])?;
@@ -3085,8 +3124,10 @@ mod tests {
             RepartitionExec::try_new(
                 source,
                 range_partitioning_on_columns(&schema, &["id"], vec![vec![10]])?,
+                &Funding::default(),
             )?
-            .with_preserve_order(),
+            .with_preserve_order()
+            .unwrap(),
         );
         assert!(repartition.maintains_input_order()[0]);
 
@@ -3133,6 +3174,7 @@ mod tests {
         let repartition = Arc::new(RepartitionExec::try_new(
             source,
             range_partitioning_on_columns(&schema, &["id"], vec![vec![10]])?,
+            &Funding::default(),
         )?);
         assert!(!repartition.maintains_input_order()[0]);
 
@@ -3297,7 +3339,7 @@ mod tests {
 
         // create physical plan
         let exec = TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         for i in 0..exec.partitioning().partition_count() {
             let mut stream = exec.execute(i, Arc::clone(&task_ctx))?;
@@ -3324,7 +3366,11 @@ mod tests {
             true,
             None,
         )?);
-        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(1))?;
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::RoundRobinBatch(1),
+            &Funding::default(),
+        )?;
         let session_config = SessionConfig::new().with_batch_size(batch.num_rows() * 2);
         let task_ctx =
             Arc::new(TaskContext::default().with_session_config(session_config));
@@ -3421,7 +3467,7 @@ mod tests {
         // create physical plan
         let exec =
             TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         // execute and collect results
         let mut output_partitions = vec![];
@@ -3479,7 +3525,9 @@ mod tests {
         // but only after the plan is executed. The error should be
         // returned and no results produced
         let partitioning = Partitioning::UnknownPartitioning(1);
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
+        let exec =
+            RepartitionExec::try_new(Arc::new(input), partitioning, &Funding::default())
+                .unwrap();
         let output_stream = exec.execute(0, task_ctx).unwrap();
 
         // Expect that an error is returned
@@ -3502,7 +3550,9 @@ mod tests {
         let task_ctx = Arc::new(TaskContext::default());
         let input = ErrorExec::new();
         let partitioning = Partitioning::RoundRobinBatch(1);
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
+        let exec =
+            RepartitionExec::try_new(Arc::new(input), partitioning, &Funding::default())
+                .unwrap();
 
         // Expect that an error is returned
         let result_string = exec.execute(0, task_ctx).err().unwrap().to_string();
@@ -3529,7 +3579,9 @@ mod tests {
         let schema = batch.schema();
         let input = MockExec::new(vec![Ok(batch), err], schema);
         let partitioning = Partitioning::RoundRobinBatch(1);
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
+        let exec =
+            RepartitionExec::try_new(Arc::new(input), partitioning, &Funding::default())
+                .unwrap();
 
         // Note: this should pass (the stream can be created) but the
         // error when the input is executed should get passed back
@@ -3568,7 +3620,9 @@ mod tests {
         let input = MockExec::new(vec![Ok(batch1), Ok(batch2)], schema);
         let partitioning = Partitioning::RoundRobinBatch(1);
 
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
+        let exec =
+            RepartitionExec::try_new(Arc::new(input), partitioning, &Funding::default())
+                .unwrap();
 
         assert_snapshot!(batches_to_sort_string(&expected_batches), @r"
         +------------------+
@@ -3608,6 +3662,7 @@ mod tests {
         let exec = RepartitionExec::try_new(
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             partitioning,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -3658,6 +3713,7 @@ mod tests {
         let exec = RepartitionExec::try_new(
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             partitioning.clone(),
+            &Funding::default(),
         )
         .unwrap();
         let output_stream1 = exec.execute(1, Arc::clone(&task_ctx)).unwrap();
@@ -3683,6 +3739,7 @@ mod tests {
         let exec = RepartitionExec::try_new(
             Arc::clone(&input) as Arc<dyn ExecutionPlan>,
             partitioning,
+            &Funding::default(),
         )
         .unwrap();
         let output_stream0 = exec.execute(0, Arc::clone(&task_ctx)).unwrap();
@@ -3764,6 +3821,7 @@ mod tests {
         let repartition_exec = Arc::new(RepartitionExec::try_new(
             blocking_exec,
             Partitioning::UnknownPartitioning(1),
+            &Funding::default(),
         )?);
 
         let fut = collect(repartition_exec, task_ctx);
@@ -3790,7 +3848,9 @@ mod tests {
         );
         let schema = batch.schema();
         let input = MockExec::new(vec![Ok(batch)], schema);
-        let exec = RepartitionExec::try_new(Arc::new(input), partitioning).unwrap();
+        let exec =
+            RepartitionExec::try_new(Arc::new(input), partitioning, &Funding::default())
+                .unwrap();
         let output_stream0 = exec.execute(0, Arc::clone(&task_ctx)).unwrap();
         let batch0 = crate::common::collect(output_stream0).await.unwrap();
         let output_stream1 = exec.execute(1, Arc::clone(&task_ctx)).unwrap();
@@ -3818,7 +3878,7 @@ mod tests {
         // create physical plan
         let exec =
             TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         // Collect all partitions - should succeed by spilling to disk
         let mut total_rows = 0;
@@ -3885,7 +3945,7 @@ mod tests {
         // create physical plan
         let exec =
             TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         // Collect all partitions - should succeed with partial spilling
         let mut total_rows = 0;
@@ -3950,7 +4010,7 @@ mod tests {
         // create physical plan
         let exec =
             TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         // Collect all partitions - should succeed without spilling
         let mut total_rows = 0;
@@ -4015,7 +4075,7 @@ mod tests {
         // create physical plan
         let exec =
             TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         // Attempt to execute - should fail with ResourcesExhausted error
         for i in 0..exec.partitioning().partition_count() {
@@ -4090,7 +4150,7 @@ mod tests {
         // create physical plan
         let exec =
             TestMemoryExec::try_new_exec(&input_partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
+        let exec = RepartitionExec::try_new(exec, partitioning, &Funding::default())?;
 
         // Collect all output partitions
         let mut all_batches = Vec::new();
@@ -4175,8 +4235,13 @@ mod test {
         let source2 = sorted_memory_exec(&schema, sort_exprs);
         // output has multiple partitions, and is sorted
         let union = UnionExec::try_new(vec![source1, source2])?;
-        let exec = RepartitionExec::try_new(union, Partitioning::RoundRobinBatch(10))?
-            .with_preserve_order();
+        let exec = RepartitionExec::try_new(
+            union,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )?
+        .with_preserve_order()
+        .unwrap();
 
         // Repartition should preserve order
         assert_plan!(&exec, @r"
@@ -4194,8 +4259,13 @@ mod test {
         let sort_exprs = sort_exprs(&schema);
         let source = sorted_memory_exec(&schema, sort_exprs);
         // output is sorted, but has only a single partition, so no need to sort
-        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(10))?
-            .with_preserve_order();
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )?
+        .with_preserve_order()
+        .unwrap();
 
         // Repartition should not preserve order
         assert_plan!(&exec, @r"
@@ -4213,8 +4283,13 @@ mod test {
         let source2 = memory_exec(&schema);
         // output has multiple partitions, but is not sorted
         let union = UnionExec::try_new(vec![source1, source2])?;
-        let exec = RepartitionExec::try_new(union, Partitioning::RoundRobinBatch(10))?
-            .with_preserve_order();
+        let exec = RepartitionExec::try_new(
+            union,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )?
+        .with_preserve_order()
+        .unwrap();
 
         // Repartition should not preserve order, as there is no order to preserve
         assert_plan!(&exec, @r"
@@ -4265,8 +4340,13 @@ mod test {
         let exec = Arc::new(TestMemoryExec::update_cache(&exec));
         // Repartition into 3 partitions with order preservation
         // We expect 1 batch per output partition after repartitioning
-        let exec = RepartitionExec::try_new(exec, Partitioning::RoundRobinBatch(3))?
-            .with_preserve_order();
+        let exec = RepartitionExec::try_new(
+            exec,
+            Partitioning::RoundRobinBatch(3),
+            &Funding::default(),
+        )?
+        .with_preserve_order()
+        .unwrap();
 
         let mut batches = vec![];
 
@@ -4380,8 +4460,13 @@ mod test {
         let exec = TestMemoryExec::try_new(&input_partitions, Arc::clone(&schema), None)?
             .try_with_sort_information(vec![sort_exprs.clone(), sort_exprs])?;
         let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
-        let exec = RepartitionExec::try_new(exec, Partitioning::RoundRobinBatch(3))?
-            .with_preserve_order();
+        let exec = RepartitionExec::try_new(
+            exec,
+            Partitioning::RoundRobinBatch(3),
+            &Funding::default(),
+        )?
+        .with_preserve_order()
+        .unwrap();
 
         // Each output partition merges sorted substreams, so its rows must be non-decreasing.
         for i in 0..exec.partitioning().partition_count() {
@@ -4445,8 +4530,11 @@ mod test {
         let exec = Arc::new(TestMemoryExec::update_cache(&exec));
         // Hash partition into 2 partitions by column c0
         let hash_expr = col("c0", &schema)?;
-        let exec =
-            RepartitionExec::try_new(exec, Partitioning::Hash(vec![hash_expr], 2))?;
+        let exec = RepartitionExec::try_new(
+            exec,
+            Partitioning::Hash(vec![hash_expr], 2),
+            &Funding::default(),
+        )?;
 
         // Collect all partitions concurrently using JoinSet - this prevents deadlock
         // where the distribution channel gate closes when all output channels are full
@@ -4494,9 +4582,13 @@ mod test {
         let sort_exprs = sort_exprs(&schema);
         let source = sorted_memory_exec(&schema, sort_exprs);
         // output is sorted, but has only a single partition, so no need to sort
-        let exec = RepartitionExec::try_new(source, Partitioning::RoundRobinBatch(10))?
-            .repartitioned(20, &Default::default())?
-            .unwrap();
+        let exec = RepartitionExec::try_new(
+            source,
+            Partitioning::RoundRobinBatch(10),
+            &Funding::default(),
+        )?
+        .repartitioned(20, &Default::default())?
+        .unwrap();
 
         // Repartition should not preserve order
         assert_plan!(exec.as_ref(), @r"
@@ -4521,7 +4613,7 @@ mod test {
                 SplitPoint::new(vec![ScalarValue::UInt32(Some(20))]),
             ],
         )?);
-        let exec = RepartitionExec::try_new(source, partitioning)?;
+        let exec = RepartitionExec::try_new(source, partitioning, &Funding::default())?;
 
         let mut expressions = vec![];
         exec.apply_expressions(&mut |expr| {
@@ -4586,8 +4678,13 @@ mod test {
         let exec = Arc::new(exec);
         let exec = Arc::new(TestMemoryExec::update_cache(&exec));
 
-        let exec = RepartitionExec::try_new(exec, Partitioning::RoundRobinBatch(3))?
-            .with_preserve_order();
+        let exec = RepartitionExec::try_new(
+            exec,
+            Partitioning::RoundRobinBatch(3),
+            &Funding::default(),
+        )?
+        .with_preserve_order()
+        .unwrap();
 
         let task_ctx = Arc::new(TaskContext::default());
         let mut total_rows = 0;

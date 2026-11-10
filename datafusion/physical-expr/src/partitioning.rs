@@ -23,6 +23,7 @@ use crate::{
 };
 pub use datafusion_common::SplitPoint;
 use datafusion_common::cloned::{CloneBytes, slice_clone_bytes};
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, validate_range_split_points};
 use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -358,6 +359,17 @@ impl PartitioningSatisfaction {
 }
 
 impl Partitioning {
+    /// A clone of this partitioning, its hash key list charged to `funding`
+    /// before it is made
+    pub fn funded_clone(&self, funding: &Funding) -> Result<Self> {
+        Ok(match self {
+            Partitioning::Hash(exprs, n) => {
+                Partitioning::Hash(funding.vec_from_slice(exprs)?, *n)
+            }
+            others => others.clone(),
+        })
+    }
+
     /// Returns the number of partitions in this partitioning scheme
     pub fn partition_count(&self) -> usize {
         use Partitioning::*;
@@ -760,9 +772,6 @@ impl Display for Distribution {
 
 #[cfg(test)]
 mod tests {
-
-    use datafusion_common::funding::Funding;
-
     use super::*;
     use crate::expressions::Column;
     use crate::projection::ProjectionTargets;

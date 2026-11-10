@@ -682,6 +682,7 @@ mod tests {
         let repartition_exec = RepartitionExec::try_new(
             TestMemoryExec::try_new_exec(&[rbs], schema, None)?,
             Partitioning::RoundRobinBatch(2),
+            &Funding::default(),
         )?;
         let spm = SortPreservingMergeExec::new(
             sort,

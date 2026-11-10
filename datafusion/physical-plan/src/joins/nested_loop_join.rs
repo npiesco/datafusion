@@ -3191,7 +3191,6 @@ pub(crate) mod tests {
     use crate::{
         common, expressions::Column, repartition::RepartitionExec, test::build_table_i32,
     };
-    use datafusion_common::funding::Funding;
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field};
@@ -3333,6 +3332,7 @@ pub(crate) mod tests {
         let right = Arc::new(RepartitionExec::try_new(
             right,
             Partitioning::RoundRobinBatch(partition_count),
+            &Funding::default(),
         )?) as Arc<dyn ExecutionPlan>;
 
         // Use the required distribution for nested loop join to test partition data

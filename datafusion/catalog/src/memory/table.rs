@@ -161,6 +161,7 @@ impl MemTable {
             let exec = RepartitionExec::try_new(
                 Arc::new(source),
                 Partitioning::RoundRobinBatch(num_partitions),
+                &Funding::default(),
             )?;
             collect_partitioned(Arc::new(exec), state.task_ctx()).await?
         } else {

@@ -1721,6 +1721,7 @@ fn create_lost_ordering_plan(source_unbounded: bool) -> Result<Arc<dyn Execution
     let repartition_hash = Arc::new(RepartitionExec::try_new(
         repartition_rr,
         Partitioning::Hash(vec![col("c", &schema)?], 10),
+        &Funding::default(),
     )?) as _;
     let coalesce_partitions = coalesce_partitions_exec(repartition_hash);
     let physical_plan = sort_exec(sort_exprs.into(), coalesce_partitions);

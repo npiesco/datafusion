@@ -6296,6 +6296,7 @@ mod tests {
                 (*schema).clone(),
             )),
             Partitioning::RoundRobinBatch(4),
+            &Funding::default(),
         )?) as Arc<dyn ExecutionPlan>;
 
         let agg = AggregateExec::try_new(

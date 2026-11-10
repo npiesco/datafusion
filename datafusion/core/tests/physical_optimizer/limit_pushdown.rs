@@ -85,6 +85,7 @@ fn repartition_exec(
     Ok(Arc::new(RepartitionExec::try_new(
         streaming_table,
         Partitioning::RoundRobinBatch(8),
+        &Funding::default(),
     )?))
 }
 

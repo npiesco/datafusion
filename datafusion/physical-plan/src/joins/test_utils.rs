@@ -94,10 +94,12 @@ pub async fn partitioned_sym_join_with_filter(
         Arc::new(RepartitionExec::try_new(
             Arc::clone(&left),
             Partitioning::Hash(left_expr, partition_count),
+            &Funding::default(),
         )?),
         Arc::new(RepartitionExec::try_new(
             Arc::clone(&right),
             Partitioning::Hash(right_expr, partition_count),
+            &Funding::default(),
         )?),
         on,
         filter,
@@ -142,10 +144,12 @@ pub async fn partitioned_hash_join_with_filter(
         Arc::new(RepartitionExec::try_new(
             left,
             Partitioning::Hash(left_expr, partition_count),
+            &Funding::default(),
         )?),
         Arc::new(RepartitionExec::try_new(
             right,
             Partitioning::Hash(right_expr, partition_count),
+            &Funding::default(),
         )?),
         on,
         filter,

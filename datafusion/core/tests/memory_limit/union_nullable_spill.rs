@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch};
@@ -132,7 +133,12 @@ async fn test_sort_union_repartition_spill_mixed_nullability() {
     assert!(union_exec.schema().field(1).is_nullable());
 
     let repartition = Arc::new(
-        RepartitionExec::try_new(union_exec, Partitioning::RoundRobinBatch(1)).unwrap(),
+        RepartitionExec::try_new(
+            union_exec,
+            Partitioning::RoundRobinBatch(1),
+            &Funding::default(),
+        )
+        .unwrap(),
     );
 
     let task_ctx = build_task_ctx(200);

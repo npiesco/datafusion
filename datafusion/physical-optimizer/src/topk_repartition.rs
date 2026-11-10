@@ -147,9 +147,10 @@ impl PhysicalOptimizerRule for TopKRepartition {
             )?;
 
             let new_partitioning =
-                Partitioning::Hash(hash_exprs.clone(), *num_partitions);
-            let new_repartition: Arc<dyn ExecutionPlan> =
-                Arc::new(RepartitionExec::try_new(new_sort, new_partitioning)?);
+                Partitioning::Hash(funding.vec_from_slice(hash_exprs)?, *num_partitions);
+            let new_repartition: Arc<dyn ExecutionPlan> = funding.arc(
+                RepartitionExec::try_new(new_sort, new_partitioning, funding)?,
+            )?;
 
             // Rebuild the tree above the repartition
             let new_sort_input = if let Some(parent) = repart_parent {
@@ -216,6 +217,7 @@ mod tests {
             RepartitionExec::try_new(
                 input,
                 Partitioning::Hash(vec![col("a", &s).unwrap()], 4),
+                &Funding::default(),
             )
             .unwrap(),
         );
@@ -252,6 +254,7 @@ mod tests {
             RepartitionExec::try_new(
                 input,
                 Partitioning::Hash(vec![col("a", &s).unwrap()], 4),
+                &Funding::default(),
             )
             .unwrap(),
         );
@@ -286,6 +289,7 @@ mod tests {
             RepartitionExec::try_new(
                 input,
                 Partitioning::Hash(vec![col("b", &s).unwrap()], 4),
+                &Funding::default(),
             )
             .unwrap(),
         );
@@ -323,6 +327,7 @@ mod tests {
             RepartitionExec::try_new(
                 input,
                 Partitioning::Hash(vec![col("a", &s).unwrap()], 4),
+                &Funding::default(),
             )
             .unwrap(),
         );
@@ -360,7 +365,12 @@ mod tests {
         let ordering = sort_exprs(&s);
 
         let repartition = Arc::new(
-            RepartitionExec::try_new(input, Partitioning::RoundRobinBatch(4)).unwrap(),
+            RepartitionExec::try_new(
+                input,
+                Partitioning::RoundRobinBatch(4),
+                &Funding::default(),
+            )
+            .unwrap(),
         );
 
         let sort: Arc<dyn ExecutionPlan> = Arc::new(

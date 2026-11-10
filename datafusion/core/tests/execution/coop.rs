@@ -635,10 +635,12 @@ async fn join_yields(
     let hashed_left = Arc::new(RepartitionExec::try_new(
         Arc::new(infinite_left),
         part_left,
+        &Funding::default(),
     )?);
     let hashed_right = Arc::new(RepartitionExec::try_new(
         Arc::new(infinite_right),
         part_right,
+        &Funding::default(),
     )?);
 
     // Build an Inner HashJoinExec → left.value = right.value
@@ -685,10 +687,12 @@ async fn join_agg_yields(
     let hashed_left = Arc::new(RepartitionExec::try_new(
         Arc::new(infinite_left),
         part_left,
+        &Funding::default(),
     )?);
     let hashed_right = Arc::new(RepartitionExec::try_new(
         Arc::new(infinite_right),
         part_right,
+        &Funding::default(),
     )?);
 
     // Build an Inner HashJoinExec → left.value = right.value

@@ -1138,10 +1138,12 @@ mod tests {
         let left: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             TestMemoryExec::try_new_exec(&[vec![batch_not_null]], schema_not_null, None)?,
             Partitioning::Hash(hash_expr.clone(), 1),
+            &Funding::default(),
         )?);
         let right: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             TestMemoryExec::try_new_exec(&[vec![batch_nullable]], schema_nullable, None)?,
             Partitioning::Hash(hash_expr, 1),
+            &Funding::default(),
         )?);
 
         let interleave: Arc<dyn ExecutionPlan> =
@@ -1421,10 +1423,12 @@ mod tests {
         let left: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             Arc::new(StatisticsExec::new(left, schema.as_ref().clone())),
             Partitioning::Hash(hash_expr.clone(), 2),
+            &Funding::default(),
         )?);
         let right: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             Arc::new(StatisticsExec::new(right, schema.as_ref().clone())),
             Partitioning::Hash(hash_expr, 2),
+            &Funding::default(),
         )?);
 
         let interleave = InterleaveExec::try_new(vec![left, right])?;
@@ -1444,10 +1448,12 @@ mod tests {
         let left: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             Arc::new(StatisticsExec::new(left, schema.as_ref().clone())),
             Partitioning::Hash(hash_expr.clone(), 2),
+            &Funding::default(),
         )?);
         let right: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
             Arc::new(StatisticsExec::new(right, schema.as_ref().clone())),
             Partitioning::Hash(hash_expr, 2),
+            &Funding::default(),
         )?);
 
         let interleave = InterleaveExec::try_new(vec![left, right])?;
@@ -1660,6 +1666,7 @@ mod tests {
         Ok(Arc::new(RepartitionExec::try_new(
             base,
             Partitioning::Hash(exprs, buckets),
+            &Funding::default(),
         )?))
     }
 
@@ -1679,6 +1686,7 @@ mod tests {
         Ok(Arc::new(RepartitionExec::try_new(
             base,
             Partitioning::Range(RangePartitioning::try_new(ordering, split_points)?),
+            &Funding::default(),
         )?))
     }
 

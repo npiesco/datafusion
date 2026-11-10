@@ -1398,6 +1398,7 @@ fn test_repartition_after_projection() -> Result<()> {
             ],
             6,
         ),
+        &Funding::default(),
     )?);
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![

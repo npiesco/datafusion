@@ -531,11 +531,13 @@ mod test {
         let repartition1 = Arc::new(RepartitionExec::try_new(
             scan1,
             Partitioning::Hash(hash_expr1, 2),
+            &Funding::default(),
         )?);
         let hash_expr2 = vec![col("id", &scan2.schema())?];
         let repartition2 = Arc::new(RepartitionExec::try_new(
             scan2,
             Partitioning::Hash(hash_expr2, 2),
+            &Funding::default(),
         )?);
 
         let interleave: Arc<dyn ExecutionPlan> =
@@ -1231,6 +1233,7 @@ mod test {
         let repartition = Arc::new(RepartitionExec::try_new(
             scan.clone(),
             Partitioning::RoundRobinBatch(3),
+            &Funding::default(),
         )?);
 
         let statistics = (0..repartition.partitioning().partition_count())
@@ -1288,6 +1291,7 @@ mod test {
         let repartition = Arc::new(RepartitionExec::try_new(
             scan.clone(),
             Partitioning::RoundRobinBatch(2),
+            &Funding::default(),
         )?);
 
         let result = StatisticsContext::new().compute(
@@ -1320,6 +1324,7 @@ mod test {
         let repartition = Arc::new(RepartitionExec::try_new(
             Arc::new(EmptyExec::new(scan_schema.clone(), &Funding::default()).unwrap()),
             Partitioning::RoundRobinBatch(0),
+            &Funding::default(),
         )?);
 
         // Requesting a specific partition of a zero-partition plan is out of
@@ -1356,6 +1361,7 @@ mod test {
         let repartition = Arc::new(RepartitionExec::try_new(
             scan,
             Partitioning::Hash(hash_expr, 2),
+            &Funding::default(),
         )?);
 
         // Verify the result of partition statistics of repartition

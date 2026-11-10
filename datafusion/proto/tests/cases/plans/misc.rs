@@ -262,8 +262,13 @@ fn roundtrip_repartition_preserve_order() -> Result<()> {
         Arc::new(source2) as Arc<dyn ExecutionPlan>,
     ])?;
 
-    let repartition = RepartitionExec::try_new(union, Partitioning::RoundRobinBatch(10))?
-        .with_preserve_order();
+    let repartition = RepartitionExec::try_new(
+        union,
+        Partitioning::RoundRobinBatch(10),
+        &Funding::default(),
+    )?
+    .with_preserve_order()
+    .unwrap();
     assert!(repartition.preserve_order());
 
     roundtrip_test(Arc::new(repartition))
@@ -280,7 +285,8 @@ fn roundtrip_range_partitioning() -> Result<()> {
     ));
     // RepartitionExec is used only to carry the partitioning through proto.
     // Executing range repartitioning is intentionally unsupported.
-    let repartition = RepartitionExec::try_new(input, range_partitioning)?;
+    let repartition =
+        RepartitionExec::try_new(input, range_partitioning, &Funding::default())?;
 
     roundtrip_test(Arc::new(repartition))
 }
@@ -377,10 +383,12 @@ fn roundtrip_interleave() -> Result<()> {
     let left = RepartitionExec::try_new(
         Arc::new(EmptyExec::new(Arc::new(schema_left), &Funding::default()).unwrap()),
         partition.clone(),
+        &Funding::default(),
     )?;
     let right = RepartitionExec::try_new(
         Arc::new(EmptyExec::new(Arc::new(schema_right), &Funding::default()).unwrap()),
         partition,
+        &Funding::default(),
     )?;
     let inputs: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::new(left), Arc::new(right)];
     let interleave = InterleaveExec::try_new(inputs)?;
@@ -407,6 +415,7 @@ async fn roundtrip_interleave_with_mismatched_nullability_executes() -> Result<(
         Ok(Arc::new(RepartitionExec::try_new(
             Arc::new(projection),
             partition.clone(),
+            &Funding::default(),
         )?))
     };
     let non_nullable_leg = literal_leg(ScalarValue::Int64(Some(1)))?;

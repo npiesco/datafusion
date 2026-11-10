@@ -416,7 +416,7 @@ fn range_partitioned_exec(
         [sort_expr(key, schema)].into(),
         split_points,
     )?);
-    RepartitionExec::try_new(memory_exec(schema), partitioning)
+    RepartitionExec::try_new(memory_exec(schema), partitioning, &Funding::default())
         .map(|exec| Arc::new(exec) as Arc<dyn ExecutionPlan>)
 }
 
@@ -752,11 +752,13 @@ async fn test_sort_merge_join_satisfied() -> Result<()> {
     let left = Arc::new(RepartitionExec::try_new(
         left,
         Partitioning::Hash(vec![left_jcol.clone()], 10),
+        &Funding::default(),
     )?);
 
     let right = Arc::new(RepartitionExec::try_new(
         right,
         Partitioning::Hash(vec![right_jcol.clone()], 10),
+        &Funding::default(),
     )?);
 
     let join_on = vec![(left_jcol as _, right_jcol as _)];
@@ -802,11 +804,13 @@ async fn test_sort_merge_join_order_missing() -> Result<()> {
     let left = Arc::new(RepartitionExec::try_new(
         left,
         Partitioning::Hash(vec![left_jcol.clone()], 10),
+        &Funding::default(),
     )?);
 
     let right = Arc::new(RepartitionExec::try_new(
         right,
         Partitioning::Hash(vec![right_jcol.clone()], 10),
+        &Funding::default(),
     )?);
 
     let join_on = vec![(left_jcol as _, right_jcol as _)];
@@ -847,12 +851,14 @@ async fn test_sort_merge_join_dist_missing() -> Result<()> {
     let right = Arc::new(RepartitionExec::try_new(
         right,
         Partitioning::RoundRobinBatch(10),
+        &Funding::default(),
     )?);
     let left_jcol = col("c9", &left.schema())?;
     let right_jcol = col("a", &right.schema())?;
     let left = Arc::new(RepartitionExec::try_new(
         left,
         Partitioning::Hash(vec![left_jcol.clone()], 10),
+        &Funding::default(),
     )?);
 
     // Missing hash partitioning on right child.

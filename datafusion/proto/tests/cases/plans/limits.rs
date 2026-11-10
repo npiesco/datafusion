@@ -86,7 +86,8 @@ fn roundtrip_global_skip_no_limit() -> Result<()> {
                 EmptyExec::new(Arc::new(Schema::empty()), &Funding::default()).unwrap(),
             ),
             10,
-            None, // no limit, &Funding::default()
+            None, // no limit
+            &Funding::default(),
         )
         .unwrap(),
     ))

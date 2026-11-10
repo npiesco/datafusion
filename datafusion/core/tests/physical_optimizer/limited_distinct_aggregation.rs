@@ -75,7 +75,8 @@ async fn test_partial_final() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(final_agg),
-        4, // fetch, &Funding::default()
+        4, // fetch
+        &Funding::default(),
     )
     .unwrap();
     let plan: Arc<dyn ExecutionPlan> = Arc::new(limit_exec);
@@ -240,7 +241,8 @@ async fn test_single_local() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
-        4, // fetch, &Funding::default()
+        4, // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected to push the limit to the AggregateExec
@@ -290,7 +292,8 @@ async fn test_single_global() -> Result<()> {
     let limit_exec = GlobalLimitExec::new(
         Arc::new(single_agg),
         1,       // skip
-        Some(3), // fetch, &Funding::default()
+        Some(3), // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected to push the skip+fetch limit to the AggregateExec
@@ -347,7 +350,8 @@ async fn test_distinct_cols_different_than_group_by_cols() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(distinct_agg),
-        4, // fetch, &Funding::default()
+        4, // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected to push the limit to the outer AggregateExec only
@@ -403,7 +407,8 @@ fn test_has_order_by() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
-        10, // fetch, &Funding::default()
+        10, // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected not to push the limit to the AggregateExec
@@ -438,7 +443,8 @@ fn test_no_group_by() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
-        10, // fetch, &Funding::default()
+        10, // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected not to push the limit to the AggregateExec
@@ -474,7 +480,8 @@ fn test_has_aggregate_expression() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
-        10, // fetch, &Funding::default()
+        10, // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected not to push the limit to the AggregateExec
@@ -518,7 +525,8 @@ fn test_has_filter() -> Result<()> {
     )?;
     let limit_exec = LocalLimitExec::new(
         Arc::new(single_agg),
-        10, // fetch, &Funding::default()
+        10, // fetch
+        &Funding::default(),
     )
     .unwrap();
     // expected not to push the limit to the AggregateExec

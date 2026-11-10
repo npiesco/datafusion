@@ -678,7 +678,12 @@ fn test_push_down_through_transparent_nodes() {
     let filter =
         Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap());
     let repartition = Arc::new(
-        RepartitionExec::try_new(filter, Partitioning::RoundRobinBatch(1)).unwrap(),
+        RepartitionExec::try_new(
+            filter,
+            Partitioning::RoundRobinBatch(1),
+            &Funding::default(),
+        )
+        .unwrap(),
     );
     let predicate = col_lit_predicate("b", "bar", &schema());
     let plan = Arc::new(
@@ -1097,6 +1102,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
         RepartitionExec::try_new(
             build_scan,
             Partitioning::Hash(build_hash_exprs, partition_count),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1110,6 +1116,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
         RepartitionExec::try_new(
             Arc::clone(&probe_scan),
             Partitioning::Hash(probe_hash_exprs, partition_count),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1310,6 +1317,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_range_partitioned() {
                 RangePartitioning::try_new(build_range_ordering, split_points.clone())
                     .unwrap(),
             ),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1332,6 +1340,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_range_partitioned() {
             Partitioning::Range(
                 RangePartitioning::try_new(probe_range_ordering, split_points).unwrap(),
             ),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1471,6 +1480,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
         RepartitionExec::try_new(
             Arc::clone(&probe_scan),
             Partitioning::Hash(probe_hash_exprs, partition_count), // create multi partitions on probSide
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2774,6 +2784,7 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
         RepartitionExec::try_new(
             build_scan,
             Partitioning::Hash(build_hash_exprs, partition_count),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2786,6 +2797,7 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
         RepartitionExec::try_new(
             Arc::clone(&probe_scan),
             Partitioning::Hash(probe_hash_exprs, partition_count),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2879,6 +2891,7 @@ async fn test_hashjoin_hash_table_pushdown_partitioned() {
         RepartitionExec::try_new(
             build_scan,
             Partitioning::Hash(build_hash_exprs, partition_count),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2892,6 +2905,7 @@ async fn test_hashjoin_hash_table_pushdown_partitioned() {
         RepartitionExec::try_new(
             Arc::clone(&probe_scan),
             Partitioning::Hash(probe_hash_exprs, partition_count),
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -3000,6 +3014,7 @@ async fn test_hashjoin_hash_table_pushdown_collect_left() {
         RepartitionExec::try_new(
             Arc::clone(&probe_scan),
             Partitioning::Hash(probe_hash_exprs, partition_count), // create multi partitions on probSide
+            &Funding::default(),
         )
         .unwrap(),
     );
