@@ -141,6 +141,7 @@ impl TableProvider for StreamingTable {
                 &df_schema,
                 eqp,
                 &PhysicalPlanningContext::default(),
+                &Funding::default(),
             )?;
 
             if let Some(p) = projection {

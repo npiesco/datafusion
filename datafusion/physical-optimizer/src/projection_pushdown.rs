@@ -503,6 +503,7 @@ mod test {
                     Operator::And,
                     a_plus_one_greater_than_x_plus_one(schema)?,
                     schema,
+                    &Funding::default(),
                 )
             },
             JoinType::Inner,
@@ -737,14 +738,22 @@ mod test {
             Operator::Plus,
             lit(1),
             join_schema,
+            &Funding::default(),
         )?;
         let right_expr = binary(
             Arc::new(Column::new("x", 1)),
             Operator::Plus,
             lit(1),
             join_schema,
+            &Funding::default(),
         )?;
-        binary(left_expr, Operator::Gt, right_expr, join_schema)
+        binary(
+            left_expr,
+            Operator::Gt,
+            right_expr,
+            join_schema,
+            &Funding::default(),
+        )
     }
 
     fn a_plus_rand_greater_than_x(join_schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
@@ -759,9 +768,16 @@ mod test {
                 Arc::new(ConfigOptions::default()),
             )),
             join_schema,
+            &Funding::default(),
         )?;
         let right_expr = Arc::new(Column::new("x", 1));
-        binary(left_expr, Operator::Gt, right_expr, join_schema)
+        binary(
+            left_expr,
+            Operator::Gt,
+            right_expr,
+            join_schema,
+            &Funding::default(),
+        )
     }
 
     fn a_greater_than_x(join_schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
@@ -770,6 +786,7 @@ mod test {
             Operator::Gt,
             Arc::new(Column::new("x", 1)),
             join_schema,
+            &Funding::default(),
         )
     }
 
@@ -781,13 +798,15 @@ mod test {
             Operator::Plus,
             Arc::new(Column::new("b", 1)),
             join_schema,
+            &Funding::default(),
         )?;
         let rhs = binary(
             Arc::new(Column::new("x", 2)),
             Operator::Plus,
             Arc::new(Column::new("z", 3)),
             join_schema,
+            &Funding::default(),
         )?;
-        binary(lhs, Operator::Gt, rhs, join_schema)
+        binary(lhs, Operator::Gt, rhs, join_schema, &Funding::default())
     }
 }

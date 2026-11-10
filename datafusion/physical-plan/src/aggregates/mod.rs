@@ -5081,7 +5081,9 @@ mod tests {
 
         let col_a = col("a", &schema)?;
         let col_b = col("b", &schema)?;
-        let const_expr = Arc::new(Literal::new(ScalarValue::Int32(Some(1))));
+        let const_expr = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+        );
 
         let groups = PhysicalGroupBy::new(
             vec![
@@ -5091,15 +5093,24 @@ mod tests {
             ],
             vec![
                 (
-                    Arc::new(Literal::new(ScalarValue::Float32(None))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Float32(None), &Funding::default())
+                            .unwrap(),
+                    ),
                     "a".to_string(),
                 ),
                 (
-                    Arc::new(Literal::new(ScalarValue::Float32(None))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Float32(None), &Funding::default())
+                            .unwrap(),
+                    ),
                     "b".to_string(),
                 ),
                 (
-                    Arc::new(Literal::new(ScalarValue::Int32(None))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Int32(None), &Funding::default())
+                            .unwrap(),
+                    ),
                     "const".to_string(),
                 ),
             ],

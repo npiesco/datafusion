@@ -25,6 +25,7 @@
 //! [`file_row_index()`]: datafusion_functions::core::file_row_index::FileRowIndexFunc
 //! [`input_file_name()`]: datafusion_functions::core::input_file_name::InputFileNameFunc
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
@@ -167,9 +168,10 @@ pub fn rewrite_input_file_name_in_projection(
         return Ok(projection);
     }
 
-    let file_name_lit =
-        Arc::new(Literal::new(ScalarValue::Utf8(Some(file_name.to_string()))))
-            as Arc<dyn PhysicalExpr>;
+    let file_name_lit = Arc::new(Literal::new(
+        ScalarValue::Utf8(Some(file_name.to_string())),
+        &Funding::default(),
+    )?) as Arc<dyn PhysicalExpr>;
 
     projection.try_map_exprs(|expr| {
         rewrite_scalar_udf::<InputFileNameFunc, _>(expr, |_| {

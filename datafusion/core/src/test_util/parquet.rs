@@ -179,6 +179,7 @@ impl TestParquetFile {
                 &df_schema,
                 &ExecutionProps::default(),
                 &PhysicalPlanningContext::default(),
+                &Funding::default(),
             )?;
 
             let source = Arc::new(

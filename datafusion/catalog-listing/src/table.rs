@@ -23,6 +23,7 @@ use crate::{ListingOptions, ListingTableConfig};
 use arrow::datatypes::{Field, Schema, SchemaBuilder, SchemaRef};
 use async_trait::async_trait;
 use datafusion_catalog::{ScanArgs, ScanResult, Session, TableProvider};
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     Constraints, DFSchema, SchemaExt, Statistics, internal_datafusion_err, plan_err,
@@ -619,6 +620,7 @@ impl TableProvider for ListingTable {
                         &df_schema,
                         state.execution_props(),
                         &PhysicalPlanningContext::default(),
+                        &Funding::default(),
                     )?
                 }
             };

@@ -347,6 +347,7 @@ mod tests {
 
 #[cfg(test)]
 pub(crate) mod test_utils {
+    use datafusion_common::funding::Funding;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::{
@@ -405,6 +406,7 @@ pub(crate) mod test_utils {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?
         .evaluate(&RecordBatch::try_new(
             Arc::clone(schema.inner()),
@@ -438,6 +440,7 @@ pub(crate) mod test_utils {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?
         .evaluate(&RecordBatch::try_new(
             Arc::clone(schema.inner()),

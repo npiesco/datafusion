@@ -322,6 +322,7 @@ impl From<OrderingEquivalenceClass> for Vec<LexOrdering> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use crate::equivalence::tests::create_test_schema;
@@ -431,18 +432,21 @@ mod tests {
             vec![Arc::clone(col_a)],
             &test_schema,
             Arc::new(ConfigOptions::default()),
+            &Funding::default(),
         )?) as PhysicalExprRef;
         let floor_f = Arc::new(ScalarFunctionExpr::try_new(
             Arc::clone(&test_fun),
             vec![Arc::clone(col_f)],
             &test_schema,
             Arc::new(ConfigOptions::default()),
+            &Funding::default(),
         )?) as PhysicalExprRef;
         let exp_a = Arc::new(ScalarFunctionExpr::try_new(
             Arc::clone(&test_fun),
             vec![Arc::clone(col_a)],
             &test_schema,
             Arc::new(ConfigOptions::default()),
+            &Funding::default(),
         )?) as PhysicalExprRef;
 
         let a_plus_b = Arc::new(BinaryExpr::new(

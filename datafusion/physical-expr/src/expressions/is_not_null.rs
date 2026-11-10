@@ -22,6 +22,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 use std::hash::Hash;
@@ -147,8 +148,11 @@ impl IsNotNullExpr {
 }
 
 /// Create an IS NOT NULL expression
-pub fn is_not_null(arg: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(IsNotNullExpr::new(arg)))
+pub fn is_not_null(
+    arg: Arc<dyn PhysicalExpr>,
+    funding: &Funding,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    Ok(funding.arc(IsNotNullExpr::new(arg))?)
 }
 
 #[cfg(test)]
@@ -161,13 +165,14 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use arrow::datatypes::*;
     use datafusion_common::cast::as_boolean_array;
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     #[test]
     fn is_not_null_op() -> Result<()> {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
         let a = StringArray::from(vec![Some("foo"), None]);
-        let expr = is_not_null(col("a", &schema)?).unwrap();
+        let expr = is_not_null(col("a", &schema)?, &Funding::default()).unwrap();
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)])?;
 
         // expression: "a is not null"
@@ -212,7 +217,8 @@ mod tests {
         );
 
         let schema = Schema::new(vec![field]);
-        let expr = is_not_null(col("my_union", &schema).unwrap()).unwrap();
+        let expr =
+            is_not_null(col("my_union", &schema).unwrap(), &Funding::default()).unwrap();
         let batch =
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)]).unwrap();
 
@@ -245,7 +251,8 @@ mod tests {
         );
 
         let schema = Schema::new(vec![field]);
-        let expr = is_not_null(col("my_union", &schema).unwrap()).unwrap();
+        let expr =
+            is_not_null(col("my_union", &schema).unwrap(), &Funding::default()).unwrap();
         let display_string = expr.to_string();
         assert_eq!(display_string, "my_union@0 IS NOT NULL");
         let sql_string = fmt_sql(expr.as_ref()).to_string();

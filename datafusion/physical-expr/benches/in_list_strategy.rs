@@ -52,6 +52,7 @@ use arrow::datatypes::{Field, Int32Type, IntervalMonthDayNanoType, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use datafusion_common::funding::Funding;
 use datafusion_physical_expr::expressions::{col, in_list, lit};
 use half::f16;
 use rand::distr::Alphanumeric;
@@ -143,7 +144,14 @@ fn bench_numeric<T, A>(
         .iter()
         .map(|v: &T| lit((cfg.to_scalar)(v.clone())))
         .collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &cfg.negated, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &cfg.negated,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values) as ArrayRef])
             .unwrap();
@@ -247,7 +255,14 @@ where
         .iter()
         .map(|v| lit((cfg.to_scalar)(v.clone())))
         .collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &cfg.negated, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &cfg.negated,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values) as ArrayRef])
             .unwrap();
@@ -295,7 +310,14 @@ fn bench_string_shared_prefix<A>(
 
     let schema = Schema::new(vec![Field::new("a", values.data_type().clone(), true)]);
     let exprs: Vec<_> = haystack.iter().map(|v| lit(to_scalar(v.clone()))).collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &false, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &false,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values) as ArrayRef])
             .unwrap();
@@ -345,7 +367,14 @@ fn bench_string_mixed_lengths<A>(
 
     let schema = Schema::new(vec![Field::new("a", values.data_type().clone(), true)]);
     let exprs: Vec<_> = haystack.iter().map(|v| lit(to_scalar(v.clone()))).collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &false, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &false,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(values) as ArrayRef])
             .unwrap();
@@ -751,7 +780,14 @@ fn bench_dict_int32(
         .iter()
         .map(|v| lit(ScalarValue::Int32(Some(*v))))
         .collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &negated, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &negated,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict_array) as ArrayRef])
             .unwrap();
@@ -793,7 +829,14 @@ fn bench_dict_string(
         .iter()
         .map(|v| lit(ScalarValue::Utf8(Some(v.clone()))))
         .collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &false, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &false,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch =
         RecordBatch::try_new(Arc::new(schema), vec![Arc::new(dict_array) as ArrayRef])
             .unwrap();
@@ -1042,7 +1085,14 @@ fn bench_fixed_size_binary_inner(
         .iter()
         .map(|v| lit(ScalarValue::FixedSizeBinary(16, Some(v.clone()))))
         .collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &false, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &false,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array) as ArrayRef])
         .unwrap();
 

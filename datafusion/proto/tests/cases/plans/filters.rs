@@ -49,8 +49,9 @@ fn roundtrip_filter_with_not_and_in_list() -> Result<()> {
         ],
         &false,
         schema.as_ref(),
+        &Funding::default(),
     )?;
-    let and = binary(not, Operator::And, in_list, &schema)?;
+    let and = binary(not, Operator::And, in_list, &schema, &Funding::default())?;
     roundtrip_test(Arc::new(FilterExec::try_new(
         and,
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),

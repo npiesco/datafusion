@@ -838,6 +838,8 @@ pub fn prepare_sorted_exprs(
 #[cfg(test)]
 pub mod tests {
 
+    use datafusion_common::funding::Funding;
+
     use super::*;
     use crate::{joins::test_utils::complicated_filter, joins::utils::ColumnIndex};
 
@@ -867,6 +869,7 @@ pub mod tests {
                 Operator::Plus,
                 col("right_2", &right_child_schema)?,
                 &right_child_schema,
+                &Funding::default(),
             )?,
             options: SortOptions::default(),
         };
@@ -883,12 +886,14 @@ pub mod tests {
             Operator::Plus,
             col("filter_3", &intermediate_schema)?,
             &intermediate_schema,
+            &Funding::default(),
         )?;
         let filter_expr = binary(
             Arc::clone(&filter_left),
             Operator::Gt,
             Arc::clone(&filter_right),
             &intermediate_schema,
+            &Funding::default(),
         )?;
         let column_indices = vec![
             ColumnIndex {
@@ -973,6 +978,7 @@ pub mod tests {
                 Operator::Plus,
                 col("1", &schema)?,
                 &schema,
+                &Funding::default(),
             )?,
             &schema,
             DataType::Int64,
@@ -1102,6 +1108,7 @@ pub mod tests {
             Operator::Minus,
             col("1", &intermediate_schema)?,
             &intermediate_schema,
+            &Funding::default(),
         )?;
         let column_indices = vec![
             ColumnIndex {
@@ -1127,6 +1134,7 @@ pub mod tests {
                 Operator::Plus,
                 col("b", &schema)?,
                 &schema,
+                &Funding::default(),
             )?,
             options: SortOptions::default(),
         };

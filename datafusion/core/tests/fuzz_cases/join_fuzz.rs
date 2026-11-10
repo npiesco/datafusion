@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -736,15 +737,21 @@ impl JoinFuzzTestCase {
     /// Helper function for building NLJoin filter, returns the union
     /// of original filter expression and on-condition expression
     fn composite_filter_expression(&self) -> PhysicalExprRef {
-        let (filter_expression, column_idx_offset) =
-            if let Some(filter) = self.join_filter() {
-                (
-                    filter.expression().to_owned(),
-                    filter.schema().fields().len(),
-                )
-            } else {
-                (Arc::new(Literal::new(ScalarValue::from(true))) as _, 0)
-            };
+        let (filter_expression, column_idx_offset) = if let Some(filter) =
+            self.join_filter()
+        {
+            (
+                filter.expression().to_owned(),
+                filter.schema().fields().len(),
+            )
+        } else {
+            (
+                Arc::new(
+                    Literal::new(ScalarValue::from(true), &Funding::default()).unwrap(),
+                ) as _,
+                0,
+            )
+        };
 
         let equal_a = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", column_idx_offset)),

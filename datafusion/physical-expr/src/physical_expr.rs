@@ -18,10 +18,11 @@
 use std::sync::Arc;
 
 use crate::expressions::{self, Column};
-use crate::{LexOrdering, PhysicalSortExpr, create_physical_expr};
+use crate::{LexOrdering, PhysicalSortExpr, create_physical_expr, create_physical_exprs};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{DFSchema, HashMap, ScalarValue, SplitPoint};
 use datafusion_common::{Result, plan_err};
@@ -192,12 +193,14 @@ pub fn create_lex_ordering(
             &df_schema,
             execution_props,
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?));
     }
     Ok(all_sort_orders)
 }
 
-/// Create a physical sort expression from a logical expression
+/// Create a physical sort expression from a logical expression, what it allocates
+/// charged to `funding` first
 ///
 /// See [`create_physical_expr`] for details on the `planning_ctx` argument.
 pub fn create_physical_sort_expr(
@@ -205,16 +208,23 @@ pub fn create_physical_sort_expr(
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<PhysicalSortExpr> {
-    create_physical_expr(&e.expr, input_dfschema, execution_props, planning_ctx).map(
-        |expr| {
-            let options = SortOptions::new(!e.asc, e.nulls_first);
-            PhysicalSortExpr::new(expr, options)
-        },
+    create_physical_expr(
+        &e.expr,
+        input_dfschema,
+        execution_props,
+        planning_ctx,
+        funding,
     )
+    .map(|expr| {
+        let options = SortOptions::new(!e.asc, e.nulls_first);
+        PhysicalSortExpr::new(expr, options)
+    })
 }
 
-/// Create vector of physical sort expression from a vector of logical expression
+/// Create vector of physical sort expression from a vector of logical expression, the
+/// list and what each expression allocates charged to `funding` first
 ///
 /// See [`create_physical_expr`] for details on the `planning_ctx` argument.
 pub fn create_physical_sort_exprs(
@@ -222,16 +232,24 @@ pub fn create_physical_sort_exprs(
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<Vec<PhysicalSortExpr>> {
-    exprs
-        .iter()
-        .map(|e| {
-            create_physical_sort_expr(e, input_dfschema, execution_props, planning_ctx)
-        })
-        .collect()
+    let mut sort_exprs = funding.held::<Vec<_>>();
+    sort_exprs.reserve_exact(exprs.len())?;
+    for e in exprs {
+        sort_exprs.push(create_physical_sort_expr(
+            e,
+            input_dfschema,
+            execution_props,
+            planning_ctx,
+            funding,
+        )?)?;
+    }
+    Ok(sort_exprs.keep())
 }
 
-/// Create physical partitioning from logical partitioning.
+/// Create physical partitioning from logical partitioning, its hash expressions and
+/// range ordering charged to `funding` first.
 ///
 /// See [`create_physical_expr`] for details on the `planning_ctx` argument.
 pub fn create_physical_partitioning(
@@ -239,21 +257,18 @@ pub fn create_physical_partitioning(
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<Partitioning> {
     match partitioning {
         LogicalPartitioning::RoundRobinBatch(n) => Ok(Partitioning::RoundRobinBatch(*n)),
         LogicalPartitioning::Hash(exprs, partition_count) => {
-            let exprs = exprs
-                .iter()
-                .map(|expr| {
-                    create_physical_expr(
-                        expr,
-                        input_dfschema,
-                        execution_props,
-                        planning_ctx,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let exprs = create_physical_exprs(
+                exprs,
+                input_dfschema,
+                execution_props,
+                planning_ctx,
+                funding,
+            )?;
             Ok(Partitioning::Hash(exprs, *partition_count))
         }
         LogicalPartitioning::Range(range) => {
@@ -262,6 +277,7 @@ pub fn create_physical_partitioning(
                 input_dfschema,
                 execution_props,
                 planning_ctx,
+                funding,
             )?;
             let Some(ordering) = LexOrdering::new(ordering) else {
                 return plan_err!("Range partitioning requires non-empty ordering");
@@ -351,6 +367,7 @@ pub fn add_offset_to_physical_sort_exprs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     use crate::expressions::{BinaryExpr, Literal, UnKnownColumn};
     use crate::physical_expr::{
@@ -367,16 +384,21 @@ mod tests {
 
     #[test]
     fn test_physical_exprs_contains() {
-        let lit_true = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
-            as Arc<dyn PhysicalExpr>;
-        let lit_false = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))
-            as Arc<dyn PhysicalExpr>;
-        let lit4 =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(4)))) as Arc<dyn PhysicalExpr>;
-        let lit2 =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>;
-        let lit1 =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let lit_true = Arc::new(
+            Literal::new(ScalarValue::Boolean(Some(true)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit_false = Arc::new(
+            Literal::new(ScalarValue::Boolean(Some(false)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit4 = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(4)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit2 = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(2)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit1 = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
         let col_a_expr = Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
         let col_b_expr = Arc::new(Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
         let col_c_expr = Arc::new(Column::new("c", 2)) as Arc<dyn PhysicalExpr>;
@@ -408,14 +430,18 @@ mod tests {
 
     #[test]
     fn test_physical_exprs_equal() {
-        let lit_true = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))))
-            as Arc<dyn PhysicalExpr>;
-        let lit_false = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))))
-            as Arc<dyn PhysicalExpr>;
-        let lit1 =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>;
-        let lit2 =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let lit_true = Arc::new(
+            Literal::new(ScalarValue::Boolean(Some(true)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit_false = Arc::new(
+            Literal::new(ScalarValue::Boolean(Some(false)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit1 = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let lit2 = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(2)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
         let col_b_expr = Arc::new(Column::new("b", 1)) as Arc<dyn PhysicalExpr>;
 
         let vec1 = vec![Arc::clone(&lit_true), Arc::clone(&lit_false)];
@@ -492,8 +518,9 @@ mod tests {
     #[test]
     fn test_is_volatile_default_behavior() {
         // Test that default PhysicalExpr implementations are not volatile
-        let literal =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let literal = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(42)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
         let column = Arc::new(Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
 
         // Test is_volatile_node() - should return false by default
@@ -574,8 +601,9 @@ mod tests {
         assert!(!is_volatile(&stable_expr));
 
         // Create a literal (non-volatile)
-        let literal =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(42)))) as Arc<dyn PhysicalExpr>;
+        let literal = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(42)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
         assert!(!literal.is_volatile_node());
         assert!(!is_volatile(&literal));
 

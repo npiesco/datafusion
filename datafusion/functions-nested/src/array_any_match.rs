@@ -188,6 +188,7 @@ impl HigherOrderUDFImpl for ArrayAnyMatch {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::{collections::HashMap, sync::Arc};
 
     use arrow::{
@@ -242,6 +243,7 @@ mod tests {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?
         .evaluate(&RecordBatch::try_new(
             Arc::clone(schema.inner()),
@@ -276,6 +278,7 @@ mod tests {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?
         .evaluate(&RecordBatch::try_new(
             Arc::clone(schema.inner()),

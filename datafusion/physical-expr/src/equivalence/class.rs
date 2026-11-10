@@ -925,6 +925,7 @@ mod tests {
     use crate::equivalence::tests::create_test_params;
     use crate::expressions::{BinaryExpr, Column, binary, col, lit};
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
 
     use datafusion_expr::Operator;
 
@@ -1027,8 +1028,12 @@ mod tests {
 
     #[test]
     fn test_contains_any() {
-        let lit_true = Arc::new(Literal::new(ScalarValue::from(true))) as _;
-        let lit_false = Arc::new(Literal::new(ScalarValue::from(false))) as _;
+        let lit_true =
+            Arc::new(Literal::new(ScalarValue::from(true), &Funding::default()).unwrap())
+                as _;
+        let lit_false = Arc::new(
+            Literal::new(ScalarValue::from(false), &Funding::default()).unwrap(),
+        ) as _;
         let col_a_expr = Arc::new(Column::new("a", 0)) as _;
         let col_b_expr = Arc::new(Column::new("b", 1)) as _;
         let col_c_expr = Arc::new(Column::new("c", 2)) as _;
@@ -1060,8 +1065,12 @@ mod tests {
         let col_y = Arc::new(Column::new("y", 3)) as _;
 
         // Create test literals
-        let lit_1 = Arc::new(Literal::new(ScalarValue::from(1))) as _;
-        let lit_2 = Arc::new(Literal::new(ScalarValue::from(2))) as _;
+        let lit_1 =
+            Arc::new(Literal::new(ScalarValue::from(1), &Funding::default()).unwrap())
+                as _;
+        let lit_2 =
+            Arc::new(Literal::new(ScalarValue::from(2), &Funding::default()).unwrap())
+                as _;
 
         // Create equivalence group with classes (a = x) and (b = y)
         let eq_group = EquivalenceGroup::new([
@@ -1219,6 +1228,7 @@ mod tests {
                     Operator::Plus,
                     col("c", &schema)?,
                     &schema,
+                    &Funding::default(),
                 )?,
                 vec![(col("a+c", &projected_schema)?, 0)].into(),
             ),
@@ -1228,6 +1238,7 @@ mod tests {
                     Operator::Plus,
                     col("c", &schema)?,
                     &schema,
+                    &Funding::default(),
                 )?,
                 vec![(col("b+c", &projected_schema)?, 1)].into(),
             ),

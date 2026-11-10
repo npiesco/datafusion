@@ -29,6 +29,8 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::cloned::CloneBytes;
+use datafusion_common::funding::Funding;
 use datafusion_common::{
     HashMap, plan_err,
     tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor},
@@ -44,6 +46,15 @@ pub struct LambdaExpr {
     projected_body: Arc<dyn PhysicalExpr>,
     projection: Vec<usize>,
     used_param_indices: Vec<usize>,
+}
+
+impl CloneBytes for LambdaExpr {
+    fn clone_bytes(&self) -> usize {
+        self.params
+            .clone_bytes()
+            .saturating_add(self.projection.clone_bytes())
+            .saturating_add(self.used_param_indices.clone_bytes())
+    }
 }
 
 // Manually derive PartialEq and Hash to work around https://github.com/rust-lang/rust/issues/78808 [https://github.com/apache/datafusion/issues/13196]
@@ -315,15 +326,17 @@ impl PhysicalExpr for LambdaExpr {
     }
 }
 
-/// Create a lambda expression.
+/// Create a lambda expression, its parameter names and node charged to `funding` first.
 pub fn lambda(
-    params: impl IntoIterator<Item = impl Into<String>>,
+    params: impl IntoIterator<Item = impl AsRef<str>>,
     body: Arc<dyn PhysicalExpr>,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(LambdaExpr::try_new(
-        params.into_iter().map(Into::into).collect(),
-        body,
-    )?))
+    let mut names = funding.held::<Vec<String>>();
+    for param in params {
+        names.push(funding.string(param.as_ref())?)?;
+    }
+    Ok(funding.arc(LambdaExpr::try_new(names.keep(), body)?)?)
 }
 
 fn all_unique(params: &[String]) -> bool {
@@ -359,20 +372,21 @@ mod tests {
         array::RecordBatch,
         datatypes::{DataType, Field, Schema},
     };
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use super::LambdaExpr;
 
     #[test]
     fn test_lambda_evaluate() {
-        let lambda = lambda(["a"], Arc::new(NoOp::new())).unwrap();
+        let lambda = lambda(["a"], Arc::new(NoOp::new()), &Funding::default()).unwrap();
         let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
         assert!(lambda.evaluate(&batch).is_err());
     }
 
     #[test]
     fn test_lambda_duplicate_name() {
-        assert!(lambda(["a", "a"], Arc::new(NoOp::new())).is_err());
+        assert!(lambda(["a", "a"], Arc::new(NoOp::new()), &Funding::default()).is_err());
     }
 
     /// A two-parameter lambda whose body only references the second

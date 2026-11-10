@@ -17,6 +17,7 @@
 
 //! Utility functions leveraged by the query optimizer rules
 
+use datafusion_common::funding::Funding;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::analyzer::type_coercion::TypeCoercionRewriter;
@@ -239,6 +240,7 @@ fn evaluate_expr_with_null_column<'a>(
         &input_schema,
         &execution_props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )?
     .evaluate(&input_batch)
 }

@@ -120,7 +120,7 @@ impl ProjectionExec {
     /// // Create PhysicalExprs
     /// let a = col("a", &schema).unwrap();
     /// let b = col("b", &schema).unwrap();
-    /// let a_plus_b = binary(Arc::clone(&a), Operator::Plus, b, &schema).unwrap();
+    /// let a_plus_b = binary(Arc::clone(&a), Operator::Plus, b, &schema, &datafusion_common::funding::Funding::default()).unwrap();
     /// // create ProjectionExec
     /// let proj = ProjectionExec::try_new(
     ///     [
@@ -1748,9 +1748,13 @@ mod tests {
             Arc::new(ScalarUDF::new_from_impl(ArrowMetadataFunc::new())),
             vec![
                 Arc::new(Column::new("i", 0)),
-                Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                    "event_field".to_string(),
-                )))),
+                Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("event_field".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
             ],
             Arc::new(Field::new("arrow_metadata", DataType::Utf8, true)),
             Arc::new(ConfigOptions::default()),
@@ -1802,15 +1806,19 @@ mod tests {
             Arc::new(ScalarUDF::new_from_impl(ArrowMetadataFunc::new())),
             vec![
                 Arc::new(Column::new("i", 0)),
-                Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                    "event_field".to_string(),
-                )))),
+                Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("event_field".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
             ],
             Arc::new(Field::new("arrow_metadata", DataType::Utf8, true)),
             Arc::new(ConfigOptions::default()),
         ));
         let filter: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
-            is_null(arrow_metadata)?,
+            is_null(arrow_metadata, &Funding::default())?,
             widened,
             &Funding::default(),
         )?);
@@ -1843,6 +1851,7 @@ mod tests {
             Operator::Gt,
             lit(ScalarValue::Int32(Some(-1))),
             &scan.schema(),
+            &Funding::default(),
         )?;
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, scan, &Funding::default())?);
@@ -1881,7 +1890,10 @@ mod tests {
             Arc::new(Column::new("b", 7)),
             Operator::Minus,
             Arc::new(BinaryExpr::new(
-                Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int32(Some(1)), &Funding::default())
+                        .unwrap(),
+                ),
                 Operator::Plus,
                 Arc::new(Column::new("a", 1)),
             )),
@@ -2206,7 +2218,9 @@ mod tests {
         let filter = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("b", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
@@ -2220,7 +2234,9 @@ mod tests {
         let expected_filter = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         assert_eq!(description.self_filters(), vec![vec![]]);
@@ -2269,14 +2285,18 @@ mod tests {
         let filter1 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         // filter "y < 10"
         let filter2 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("y", 1)),
             Operator::Lt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
@@ -2289,13 +2309,17 @@ mod tests {
         let expected_filter1 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let expected_filter2 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("b", 1)),
             Operator::Lt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let pushed_filters = &description.parent_filters()[0];
@@ -2350,14 +2374,18 @@ mod tests {
         let filter1 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("b", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         // filter "a < 10" (output column 1, which is "b" in input)
         let filter2 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 1)),
             Operator::Lt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
@@ -2417,14 +2445,18 @@ mod tests {
         let filter1 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         // filter "b < 10" (using output index 1 which corresponds to 'b')
         let filter2 = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("b", 1)),
             Operator::Lt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
@@ -2466,7 +2498,10 @@ mod tests {
                 expr: Arc::new(BinaryExpr::new(
                     Arc::new(Column::new("a", 0)),
                     Operator::Plus,
-                    Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Int32(Some(1)), &Funding::default())
+                            .unwrap(),
+                    ),
                 )),
                 alias: "z".to_string(),
             }],
@@ -2478,7 +2513,9 @@ mod tests {
         let filter = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("z", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
@@ -2521,7 +2558,9 @@ mod tests {
         let filter = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("unknown_col", 1)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let description = projection.gather_filters_for_pushdown(
@@ -2565,6 +2604,7 @@ mod tests {
                     Operator::Minus,
                     lit(1),
                     &input_schema,
+                    &Funding::default(),
                 )
                 .unwrap(),
                 alias: "a".to_string(),

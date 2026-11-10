@@ -61,8 +61,13 @@ fn roundtrip_date_time_interval() -> Result<()> {
         Arc::new(EmptyExec::new(Arc::new(schema.clone()), &Funding::default()).unwrap());
     let date_expr = col("some_date", &schema)?;
     let literal_expr = col("some_interval", &schema)?;
-    let date_time_interval_expr =
-        binary(date_expr, Operator::Plus, literal_expr, &schema)?;
+    let date_time_interval_expr = binary(
+        date_expr,
+        Operator::Plus,
+        literal_expr,
+        &schema,
+        &Funding::default(),
+    )?;
     let plan = Arc::new(ProjectionExec::try_new(
         vec![ProjectionExpr {
             expr: date_time_interval_expr,
@@ -88,6 +93,7 @@ fn roundtrip_like() -> Result<()> {
         col("a", &schema)?,
         col("b", &schema)?,
         &schema,
+        &Funding::default(),
     )?;
     let plan = Arc::new(ProjectionExec::try_new(
         vec![ProjectionExpr {
@@ -173,7 +179,13 @@ fn roundtrip_hash_expr() -> Result<()> {
 
     // Wrap in a filter by comparing hash value to a literal
     // hash_expr > 0 is always boolean
-    let filter_expr = binary(hash_expr, Operator::Gt, lit(0u64), &schema)?;
+    let filter_expr = binary(
+        hash_expr,
+        Operator::Gt,
+        lit(0u64),
+        &schema,
+        &Funding::default(),
+    )?;
     let filter = Arc::new(FilterExec::try_new(
         filter_expr,
         Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
@@ -212,7 +224,13 @@ fn roundtrip_range_expr() -> Result<()> {
         vec![col("a", &schema)?, col("a", &schema)?],
         &range_partitioning,
     )?);
-    let filter_expr = binary(range_expr, Operator::Eq, lit(0u64), &schema)?;
+    let filter_expr = binary(
+        range_expr,
+        Operator::Eq,
+        lit(0u64),
+        &schema,
+        &Funding::default(),
+    )?;
     let plan = Arc::new(FilterExec::try_new(
         filter_expr,
         Arc::new(EmptyExec::new(Arc::clone(&schema), &Funding::default()).unwrap()),
@@ -275,8 +293,15 @@ fn roundtrip_binary_expr_chain_same_op() -> Result<()> {
         Operator::And,
         col("b", &schema)?,
         &schema,
+        &Funding::default(),
     )?;
-    let abc = binary(ab, Operator::And, col("c", &schema)?, &schema)?;
+    let abc = binary(
+        ab,
+        Operator::And,
+        col("c", &schema)?,
+        &schema,
+        &Funding::default(),
+    )?;
     roundtrip_test(Arc::new(FilterExec::try_new(
         abc,
         Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
@@ -298,8 +323,15 @@ fn roundtrip_binary_expr_mixed_ops() -> Result<()> {
         Operator::And,
         col("b", &schema)?,
         &schema,
+        &Funding::default(),
     )?;
-    let expr = binary(a_and_b, Operator::Or, col("c", &schema)?, &schema)?;
+    let expr = binary(
+        a_and_b,
+        Operator::Or,
+        col("c", &schema)?,
+        &schema,
+        &Funding::default(),
+    )?;
     roundtrip_test(Arc::new(FilterExec::try_new(
         expr,
         Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap()),
@@ -318,7 +350,13 @@ fn roundtrip_binary_expr_deeply_nested_and_chain() -> Result<()> {
     let col_a = col("a", &schema)?;
     let mut expr = Arc::clone(&col_a);
     for _ in 0..99 {
-        expr = binary(expr, Operator::And, Arc::clone(&col_a), &schema)?;
+        expr = binary(
+            expr,
+            Operator::And,
+            Arc::clone(&col_a),
+            &schema,
+            &Funding::default(),
+        )?;
     }
 
     roundtrip_test(Arc::new(FilterExec::try_new(
@@ -337,7 +375,13 @@ fn roundtrip_binary_expr_deeply_nested_or_chain() -> Result<()> {
     let col_a = col("a", &schema)?;
     let mut expr = Arc::clone(&col_a);
     for _ in 0..99 {
-        expr = binary(expr, Operator::Or, Arc::clone(&col_a), &schema)?;
+        expr = binary(
+            expr,
+            Operator::Or,
+            Arc::clone(&col_a),
+            &schema,
+            &Funding::default(),
+        )?;
     }
 
     roundtrip_test(Arc::new(FilterExec::try_new(
@@ -363,14 +407,16 @@ fn roundtrip_binary_expr_alternating_and_or() -> Result<()> {
         Operator::And,
         col("b", &schema)?,
         &schema,
+        &Funding::default(),
     )?;
     let c_and_d = binary(
         col("c", &schema)?,
         Operator::And,
         col("d", &schema)?,
         &schema,
+        &Funding::default(),
     )?;
-    let expr = binary(a_and_b, Operator::Or, c_and_d, &schema)?;
+    let expr = binary(a_and_b, Operator::Or, c_and_d, &schema, &Funding::default())?;
 
     roundtrip_test(Arc::new(FilterExec::try_new(
         expr,

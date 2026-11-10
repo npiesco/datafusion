@@ -17,6 +17,7 @@
 
 //! Integration tests for [`LimitedDistinctAggregation`] physical optimizer rule
 
+use datafusion_common::funding::Funding;
 use insta::assert_snapshot;
 use std::sync::Arc;
 
@@ -487,6 +488,7 @@ fn test_has_filter() -> Result<()> {
         Operator::Gt,
         cast(expressions::lit(1u32), &schema, DataType::Int32)?,
         &schema,
+        &Funding::default(),
     )?);
     let agg = TestAggregate::new_count_star();
     let single_agg = AggregateExec::try_new(

@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use insta::assert_snapshot;
 use std::sync::Arc;
 
@@ -888,22 +889,46 @@ async fn test_union_with_sorts_and_constants() -> Result<()> {
 
     let proj_exprs_1 = vec![
         (
-            Arc::new(Literal::new(ScalarValue::Utf8(Some("foo".to_owned())))) as _,
+            Arc::new(
+                Literal::new(
+                    ScalarValue::Utf8(Some("foo".to_owned())),
+                    &Funding::default(),
+                )
+                .unwrap(),
+            ) as _,
             "const_1".to_owned(),
         ),
         (
-            Arc::new(Literal::new(ScalarValue::Utf8(Some("foo".to_owned())))) as _,
+            Arc::new(
+                Literal::new(
+                    ScalarValue::Utf8(Some("foo".to_owned())),
+                    &Funding::default(),
+                )
+                .unwrap(),
+            ) as _,
             "const_2".to_owned(),
         ),
         (col("a", &schema_in).unwrap(), "a".to_owned()),
     ];
     let proj_exprs_2 = vec![
         (
-            Arc::new(Literal::new(ScalarValue::Utf8(Some("foo".to_owned())))) as _,
+            Arc::new(
+                Literal::new(
+                    ScalarValue::Utf8(Some("foo".to_owned())),
+                    &Funding::default(),
+                )
+                .unwrap(),
+            ) as _,
             "const_1".to_owned(),
         ),
         (
-            Arc::new(Literal::new(ScalarValue::Utf8(Some("bar".to_owned())))) as _,
+            Arc::new(
+                Literal::new(
+                    ScalarValue::Utf8(Some("bar".to_owned())),
+                    &Funding::default(),
+                )
+                .unwrap(),
+            ) as _,
             "const_2".to_owned(),
         ),
         (col("a", &schema_in).unwrap(), "a".to_owned()),

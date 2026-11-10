@@ -22,6 +22,7 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::funding::Funding;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::ops::Not;
@@ -713,6 +714,7 @@ impl ConstEvaluator {
             &DUMMY_DF_SCHEMA,
             &self.execution_props,
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         ) {
             Ok(e) => e,
             Err(err) => return ConstSimplifyResult::SimplifyRuntimeError(err, expr),

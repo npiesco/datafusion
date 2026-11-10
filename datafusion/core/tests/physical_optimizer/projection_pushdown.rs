@@ -947,7 +947,13 @@ fn test_join_after_projection() -> Result<()> {
                     Arc::new(Column::new("b_left_inter", 0)),
                     Operator::Minus,
                     Arc::new(BinaryExpr::new(
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                        Arc::new(
+                            Literal::new(
+                                ScalarValue::Int32(Some(1)),
+                                &Funding::default(),
+                            )
+                            .unwrap(),
+                        ),
                         Operator::Plus,
                         Arc::new(Column::new("a_right_inter", 1)),
                     )),
@@ -1070,7 +1076,13 @@ fn test_join_after_required_projection() -> Result<()> {
                     Arc::new(Column::new("b_left_inter", 0)),
                     Operator::Minus,
                     Arc::new(BinaryExpr::new(
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                        Arc::new(
+                            Literal::new(
+                                ScalarValue::Int32(Some(1)),
+                                &Funding::default(),
+                            )
+                            .unwrap(),
+                        ),
                         Operator::Plus,
                         Arc::new(Column::new("a_right_inter", 1)),
                     )),
@@ -1166,7 +1178,13 @@ fn test_nested_loop_join_after_projection() -> Result<()> {
     let col_right_b = col("b", &right_csv.schema())?;
     let col_left_c = col("c", &left_csv.schema())?;
     // left_a < right_b
-    let filter_expr = binary(col_left_a, Operator::Lt, col_right_b, &Schema::empty())?;
+    let filter_expr = binary(
+        col_left_a,
+        Operator::Lt,
+        col_right_b,
+        &Schema::empty(),
+        &Funding::default(),
+    )?;
     let filter_column_indices = vec![
         ColumnIndex {
             index: 0,
@@ -1252,7 +1270,13 @@ fn test_hash_join_after_projection() -> Result<()> {
                     Arc::new(Column::new("b_left_inter", 0)),
                     Operator::Minus,
                     Arc::new(BinaryExpr::new(
-                        Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                        Arc::new(
+                            Literal::new(
+                                ScalarValue::Int32(Some(1)),
+                                &Funding::default(),
+                            )
+                            .unwrap(),
+                        ),
                         Operator::Plus,
                         Arc::new(Column::new("a_right_inter", 1)),
                     )),
@@ -1801,7 +1825,7 @@ fn test_filter_with_embedded_projection_after_projection() -> Result<()> {
     let predicate = Arc::new(BinaryExpr::new(
         Arc::new(Column::new("a", 0)),
         Operator::Gt,
-        Arc::new(Literal::new(ScalarValue::Int32(Some(0)))),
+        Arc::new(Literal::new(ScalarValue::Int32(Some(0)), &Funding::default()).unwrap()),
     ));
     let filter: Arc<dyn ExecutionPlan> = Arc::new(
         FilterExecBuilder::new(predicate, csv, &Funding::default())
@@ -1858,7 +1882,9 @@ fn test_filter_with_embedded_projection_after_renaming_projection() -> Result<()
     let predicate = Arc::new(BinaryExpr::new(
         Arc::new(Column::new("b", 1)),
         Operator::Gt,
-        Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+        Arc::new(
+            Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+        ),
     ));
     let filter: Arc<dyn ExecutionPlan> = Arc::new(
         FilterExecBuilder::new(predicate, csv, &Funding::default())

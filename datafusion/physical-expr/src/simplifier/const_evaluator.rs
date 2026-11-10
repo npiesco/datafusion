@@ -17,6 +17,7 @@
 
 //! Constant expression evaluation for the physical expression simplifier
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::new_null_array;
@@ -54,13 +55,16 @@ pub fn simplify_const_expr(
 
     // Evaluate the expression
     match expr.evaluate(batch) {
-        Ok(ColumnarValue::Scalar(scalar)) => {
-            Ok(Transformed::yes(Arc::new(Literal::new(scalar))))
-        }
+        Ok(ColumnarValue::Scalar(scalar)) => Ok(Transformed::yes(Arc::new(
+            Literal::new(scalar, &Funding::default())?,
+        ))),
         Ok(ColumnarValue::Array(arr)) if arr.len() == 1 => {
             // Some operations return an array even for scalar inputs
             let scalar = ScalarValue::try_from_array(&arr, 0)?;
-            Ok(Transformed::yes(Arc::new(Literal::new(scalar))))
+            Ok(Transformed::yes(Arc::new(Literal::new(
+                scalar,
+                &Funding::default(),
+            )?)))
         }
         Ok(_) => {
             // Unexpected result - keep original expression
@@ -124,13 +128,16 @@ pub(crate) fn simplify_const_expr_immediate(
 
     // Evaluate the expression
     match expr.evaluate(batch) {
-        Ok(ColumnarValue::Scalar(scalar)) => {
-            Ok(Transformed::yes(Arc::new(Literal::new(scalar))))
-        }
+        Ok(ColumnarValue::Scalar(scalar)) => Ok(Transformed::yes(Arc::new(
+            Literal::new(scalar, &Funding::default())?,
+        ))),
         Ok(ColumnarValue::Array(arr)) if arr.len() == 1 => {
             // Some operations return an array even for scalar inputs
             let scalar = ScalarValue::try_from_array(&arr, 0)?;
-            Ok(Transformed::yes(Arc::new(Literal::new(scalar))))
+            Ok(Transformed::yes(Arc::new(Literal::new(
+                scalar,
+                &Funding::default(),
+            )?)))
         }
         Ok(_) => {
             // Unexpected result - keep original expression

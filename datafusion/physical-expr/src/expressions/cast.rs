@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
@@ -483,6 +484,7 @@ pub fn cast_with_target_field(
     input_schema: &Schema,
     target_field: &FieldRef,
     cast_options: Option<CastOptions<'static>>,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = expr.data_type(input_schema)?;
     let cast_type = target_field.data_type();
@@ -527,17 +529,17 @@ pub fn cast_with_target_field(
     // For explicit target fields, use new_with_target_field which applies the target's
     // extension metadata and nullability.
     if is_type_only {
-        Ok(Arc::new(CastExpr::new(
+        Ok(funding.arc(CastExpr::new(
             expr,
-            cast_type.clone(),
+            funding.cloned(cast_type)?,
             cast_options,
-        )))
+        ))?)
     } else {
-        Ok(Arc::new(CastExpr::new_with_target_field(
+        Ok(funding.arc(CastExpr::new_with_target_field(
             expr,
             Arc::clone(target_field),
             cast_options,
-        )))
+        ))?)
     }
 }
 
@@ -556,6 +558,7 @@ pub fn cast(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     use crate::expressions::column::col;
 
@@ -1324,9 +1327,13 @@ mod tests {
             vec![Arc::new(source_field)].into(),
             vec![Arc::new(Int32Array::from(vec![Some(9)])) as ArrayRef],
         );
-        let literal = Arc::new(crate::expressions::Literal::new(ScalarValue::Struct(
-            Arc::new(scalar_struct),
-        )));
+        let literal = Arc::new(
+            crate::expressions::Literal::new(
+                ScalarValue::Struct(Arc::new(scalar_struct)),
+                &Funding::default(),
+            )
+            .unwrap(),
+        );
         let target_field = Arc::new(target_field);
         let expr = CastExpr::new_with_target_field(literal, target_field, None);
 

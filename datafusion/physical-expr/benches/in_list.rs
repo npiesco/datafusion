@@ -23,6 +23,7 @@ use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use datafusion_common::funding::Funding;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{col, in_list, lit};
 use rand::distr::Alphanumeric;
@@ -36,7 +37,14 @@ use std::time::Duration;
 fn do_bench(c: &mut Criterion, name: &str, values: ArrayRef, exprs: &[ScalarValue]) {
     let schema = Schema::new(vec![Field::new("a", values.data_type().clone(), true)]);
     let exprs = exprs.iter().map(|s| lit(s.clone())).collect();
-    let expr = in_list(col("a", &schema).unwrap(), exprs, &false, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        exprs,
+        &false,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch = RecordBatch::try_new(Arc::new(schema), vec![values]).unwrap();
 
     c.bench_function(name, |b| {
@@ -260,7 +268,14 @@ fn do_bench_with_columns(
         .map(|f| col(f.name(), &schema).unwrap())
         .collect();
 
-    let expr = in_list(col("a", &schema).unwrap(), list_exprs, &false, &schema).unwrap();
+    let expr = in_list(
+        col("a", &schema).unwrap(),
+        list_exprs,
+        &false,
+        &schema,
+        &Funding::default(),
+    )
+    .unwrap();
     let batch = RecordBatch::try_new(Arc::new(schema), columns).unwrap();
 
     c.bench_function(name, |b| {

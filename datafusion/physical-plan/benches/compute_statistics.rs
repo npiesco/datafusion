@@ -167,8 +167,9 @@ fn build_cross_join_tree(depth: usize, next_col: &mut usize) -> Arc<dyn Executio
 /// Build: Filter^depth -> BenchLeaf (always-true predicate).
 fn build_filter_chain(depth: usize) -> Arc<dyn ExecutionPlan> {
     let mut plan: Arc<dyn ExecutionPlan> = Arc::new(BenchLeaf::new("a"));
-    let predicate: Arc<dyn PhysicalExpr> =
-        Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+    let predicate: Arc<dyn PhysicalExpr> = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(true)), &Funding::default()).unwrap(),
+    );
     for _ in 0..depth {
         plan = Arc::new(
             FilterExec::try_new(Arc::clone(&predicate), plan, &Funding::default())
@@ -183,8 +184,9 @@ fn build_filter_chain(depth: usize) -> Arc<dyn ExecutionPlan> {
 /// Exercises the cache with both None and Some(p) lookups in the same walk.
 fn build_mixed_chain(groups: usize) -> Arc<dyn ExecutionPlan> {
     let mut plan: Arc<dyn ExecutionPlan> = Arc::new(BenchLeaf::new("a"));
-    let predicate: Arc<dyn PhysicalExpr> =
-        Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+    let predicate: Arc<dyn PhysicalExpr> = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(true)), &Funding::default()).unwrap(),
+    );
     for _ in 0..groups {
         // Two partition-preserving filters
         for _ in 0..2 {

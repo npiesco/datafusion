@@ -25,6 +25,7 @@ use crate::PhysicalExpr;
 
 use arrow::datatypes::{DataType, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, ScalarValue, cast::as_boolean_array, internal_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr::interval_arithmetic::Interval;
@@ -223,12 +224,16 @@ impl NotExpr {
 }
 
 /// Creates a unary expression NOT
-pub fn not(arg: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(NotExpr::new(arg)))
+pub fn not(
+    arg: Arc<dyn PhysicalExpr>,
+    funding: &Funding,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    Ok(funding.arc(NotExpr::new(arg))?)
 }
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::LazyLock;
 
     use super::*;
@@ -241,7 +246,7 @@ mod tests {
     fn neg_op() -> Result<()> {
         let schema = schema();
 
-        let expr = not(col("a", &schema)?)?;
+        let expr = not(col("a", &schema)?, &Funding::default())?;
         assert_eq!(expr.data_type(&schema)?, DataType::Boolean);
         assert!(expr.nullable(&schema)?);
 
@@ -289,7 +294,7 @@ mod tests {
         interval: Interval,
         expected_interval: Interval,
     ) -> Result<()> {
-        let not_expr = not(col("a", &schema())?)?;
+        let not_expr = not(col("a", &schema())?, &Funding::default())?;
         assert_eq!(not_expr.evaluate_bounds(&[&interval])?, expected_interval);
         Ok(())
     }
@@ -299,7 +304,7 @@ mod tests {
     fn test_evaluate_statistics() -> Result<()> {
         let _schema = &Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
         let a = Arc::new(Column::new("a", 0)) as _;
-        let expr = not(a)?;
+        let expr = not(a, &Funding::default())?;
 
         // Uniform with non-boolean bounds
         assert!(
@@ -378,7 +383,7 @@ mod tests {
     fn test_fmt_sql() -> Result<()> {
         let schema = schema();
 
-        let expr = not(col("a", &schema)?)?;
+        let expr = not(col("a", &schema)?, &Funding::default())?;
 
         let display_string = expr.to_string();
         assert_eq!(display_string, "NOT a@0");

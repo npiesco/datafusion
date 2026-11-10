@@ -17,6 +17,7 @@
 
 //! [`MemTable`] for querying `Vec<RecordBatch>` by DataFusion.
 
+use datafusion_common::funding::Funding;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -216,6 +217,7 @@ impl TableProvider for MemTable {
                     &df_schema,
                     eqp,
                     &PhysicalPlanningContext::default(),
+                    &Funding::default(),
                 )?;
                 file_sort_order.extend(LexOrdering::new(physical_exprs));
             }
@@ -367,6 +369,7 @@ impl TableProvider for MemTable {
                     &df_schema,
                     state.execution_props(),
                     &PhysicalPlanningContext::default(),
+                    &Funding::default(),
                 )?;
                 Ok((name.clone(), physical_expr))
             })
@@ -485,6 +488,7 @@ fn evaluate_filters_to_mask(
             df_schema,
             execution_props,
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?;
 
         let result = physical_expr.evaluate(batch)?;

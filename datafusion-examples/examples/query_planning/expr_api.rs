@@ -17,6 +17,7 @@
 
 //! See `main.rs` for how to run it.
 
+use datafusion_common::funding::Funding;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -547,6 +548,7 @@ fn type_coercion_demo() -> Result<()> {
         &df_schema,
         &props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )?;
     let e = physical_expr.evaluate(&batch).unwrap_err();
     assert!(
@@ -572,6 +574,7 @@ fn type_coercion_demo() -> Result<()> {
         &df_schema,
         &props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )?;
     assert!(physical_expr.evaluate(&batch).is_ok());
 
@@ -585,6 +588,7 @@ fn type_coercion_demo() -> Result<()> {
         &df_schema,
         &props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )?;
     assert!(physical_expr.evaluate(&batch).is_ok());
 
@@ -614,6 +618,7 @@ fn type_coercion_demo() -> Result<()> {
         &df_schema,
         &props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )?;
     assert!(physical_expr.evaluate(&batch).is_ok());
 

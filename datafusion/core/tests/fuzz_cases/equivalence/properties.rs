@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::fuzz_cases::equivalence::utils::{
@@ -51,6 +52,7 @@ fn test_find_longest_permutation_random() -> Result<()> {
             vec![col_a],
             &test_schema,
             Arc::new(ConfigOptions::default()),
+            &Funding::default(),
         )?) as _;
 
         let a_plus_b = Arc::new(BinaryExpr::new(

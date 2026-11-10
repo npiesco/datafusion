@@ -432,7 +432,8 @@ impl DefaultPhysicalExprAdapterRewriter {
                     return Ok(Some(Arc::new(Literal::new_with_metadata(
                         null_value,
                         Some(FieldMetadata::from(logical_struct_field.as_ref())),
-                    ))));
+                        &Funding::default(),
+                    )?)));
                 }
                 FieldPathResolution::NotAStruct => return Ok(None),
             };
@@ -447,6 +448,7 @@ impl DefaultPhysicalExprAdapterRewriter {
             args,
             &self.physical_file_schema,
             Arc::clone(get_field_expr.config_options()),
+            &Funding::default(),
         )?) as Arc<dyn PhysicalExpr>;
 
         if physical_struct_field == logical_struct_field {
@@ -538,7 +540,8 @@ impl DefaultPhysicalExprAdapterRewriter {
         Ok(Some(Arc::new(Literal::new_with_metadata(
             null_value,
             Some(FieldMetadata::from(logical_struct_field.as_ref())),
-        ))))
+            &Funding::default(),
+        )?)))
     }
 
     fn rewrite_column(
@@ -585,7 +588,8 @@ impl DefaultPhysicalExprAdapterRewriter {
             return Ok(Transformed::yes(Arc::new(Literal::new_with_metadata(
                 null_value,
                 Some(FieldMetadata::from(logical_field)),
-            ))));
+                &Funding::default(),
+            )?)));
         };
 
         let fields_match = logical_field == physical_field.as_ref();
@@ -802,6 +806,7 @@ mod tests {
     use arrow::datatypes as arrow_schema;
     use arrow::datatypes::{Field, Fields, Schema};
     use datafusion_common::assert_contains;
+    use datafusion_common::funding::Funding;
     use datafusion_expr::Operator;
     use datafusion_physical_expr::expressions::{Column, Literal, col};
 
@@ -907,7 +912,9 @@ mod tests {
         let expr = expressions::BinaryExpr::new(
             Arc::clone(&column_a),
             Operator::Plus,
-            Arc::new(Literal::new(ScalarValue::Int64(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int64(Some(5)), &Funding::default()).unwrap(),
+            ),
         );
         let expr = expressions::BinaryExpr::new(
             Arc::new(expr),
@@ -915,7 +922,10 @@ mod tests {
             Arc::new(expressions::BinaryExpr::new(
                 Arc::clone(&column_c),
                 Operator::Gt,
-                Arc::new(Literal::new(ScalarValue::Float64(Some(0.0)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Float64(Some(0.0)), &Funding::default())
+                        .unwrap(),
+                ),
             )),
         );
 
@@ -1118,7 +1128,8 @@ mod tests {
         let result = adapter.rewrite(column_expr).unwrap();
 
         let expected =
-            Arc::new(Literal::new(ScalarValue::Utf8(None))) as Arc<dyn PhysicalExpr>;
+            Arc::new(Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap())
+                as Arc<dyn PhysicalExpr>;
 
         assert_eq!(result.to_string(), expected.to_string());
     }
@@ -1608,10 +1619,14 @@ mod tests {
                 Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
                 vec![
                     Arc::new(Column::new(column, index)),
-                    Arc::new(Literal::new(ScalarValue::from(field))),
+                    Arc::new(
+                        Literal::new(ScalarValue::from(field), &Funding::default())
+                            .unwrap(),
+                    ),
                 ],
                 schema,
                 Arc::new(datafusion_common::config::ConfigOptions::default()),
+                &Funding::default(),
             )
             .unwrap(),
         )
@@ -1690,9 +1705,16 @@ mod tests {
         let expr = Arc::new(
             ScalarFunctionExpr::try_new(
                 Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
-                vec![outer, Arc::new(Literal::new(ScalarValue::from("x")))],
+                vec![
+                    outer,
+                    Arc::new(
+                        Literal::new(ScalarValue::from("x"), &Funding::default())
+                            .unwrap(),
+                    ),
+                ],
                 &logical_schema,
                 Arc::new(datafusion_common::config::ConfigOptions::default()),
+                &Funding::default(),
             )
             .unwrap(),
         ) as Arc<dyn PhysicalExpr>;
@@ -1761,10 +1783,14 @@ mod tests {
                 Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
                 vec![
                     Arc::new(Column::new("s", 0)),
-                    Arc::new(Literal::new(ScalarValue::from("x"))),
+                    Arc::new(
+                        Literal::new(ScalarValue::from("x"), &Funding::default())
+                            .unwrap(),
+                    ),
                 ],
                 &logical_schema,
                 Arc::new(datafusion_common::config::ConfigOptions::default()),
+                &Funding::default(),
             )
             .unwrap(),
         ) as Arc<dyn PhysicalExpr>;
@@ -1810,11 +1836,18 @@ mod tests {
                 Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
                 vec![
                     Arc::new(Column::new("s", 0)),
-                    Arc::new(Literal::new(ScalarValue::from("inner"))),
-                    Arc::new(Literal::new(ScalarValue::from("x"))),
+                    Arc::new(
+                        Literal::new(ScalarValue::from("inner"), &Funding::default())
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        Literal::new(ScalarValue::from("x"), &Funding::default())
+                            .unwrap(),
+                    ),
                 ],
                 &logical_schema,
                 Arc::new(datafusion_common::config::ConfigOptions::default()),
+                &Funding::default(),
             )
             .unwrap(),
         ) as Arc<dyn PhysicalExpr>;
@@ -1870,11 +1903,18 @@ mod tests {
                 Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
                 vec![
                     Arc::new(Column::new("s", 0)),
-                    Arc::new(Literal::new(ScalarValue::from("inner"))),
-                    Arc::new(Literal::new(ScalarValue::from("y"))),
+                    Arc::new(
+                        Literal::new(ScalarValue::from("inner"), &Funding::default())
+                            .unwrap(),
+                    ),
+                    Arc::new(
+                        Literal::new(ScalarValue::from("y"), &Funding::default())
+                            .unwrap(),
+                    ),
                 ],
                 &logical_schema,
                 Arc::new(datafusion_common::config::ConfigOptions::default()),
+                &Funding::default(),
             )
             .unwrap(),
         ) as Arc<dyn PhysicalExpr>;

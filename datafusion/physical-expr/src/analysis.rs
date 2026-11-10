@@ -344,6 +344,7 @@ fn calculate_selectivity(
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -418,6 +419,7 @@ mod tests {
                 &df_schema,
                 &ExecutionProps::new(),
                 &PhysicalPlanningContext::default(),
+                &Funding::default(),
             )
             .unwrap();
             let analysis_result = analyze(
@@ -464,6 +466,7 @@ mod tests {
                 &df_schema,
                 &ExecutionProps::new(),
                 &PhysicalPlanningContext::default(),
+                &Funding::default(),
             )
             .unwrap();
             let analysis_result = analyze(
@@ -491,6 +494,7 @@ mod tests {
             &df_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )
         .unwrap();
         let analysis_error = analyze(

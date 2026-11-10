@@ -2662,7 +2662,9 @@ mod tests {
                 .unwrap();
 
         let expressions = [PhysicalSortExpr {
-            expr: Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+            expr: Arc::new(
+                Literal::new(ScalarValue::Int64(Some(1)), &Funding::default()).unwrap(),
+            ),
             options: SortOptions::default(),
         }]
         .into();

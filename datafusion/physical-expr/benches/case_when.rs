@@ -21,6 +21,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::test_util::seedable_rng;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use datafusion_common::funding::Funding;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::expressions::{BinaryExpr, case, col, lit};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -116,6 +117,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
                     None,
                     vec![(make_x_cmp_y(&c1, Operator::LtEq, 500), lit(1))],
                     Some(lit(0)),
+                    &Funding::default(),
                 )
                 .unwrap(),
             );
@@ -137,6 +139,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
                     None,
                     vec![(make_x_cmp_y(&c1, Operator::LtEq, 500), Arc::clone(&c2))],
                     Some(Arc::clone(&c3)),
+                    &Funding::default(),
                 )
                 .unwrap(),
             );
@@ -158,6 +161,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
                     None,
                     vec![(make_x_cmp_y(&c1, Operator::LtEq, 500), Arc::clone(&c2))],
                     None,
+                    &Funding::default(),
                 )
                 .unwrap(),
             );
@@ -179,6 +183,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
                     Some(Arc::clone(&c1)),
                     vec![(lit(1), Arc::clone(&c2)), (lit(2), Arc::clone(&c3))],
                     None,
+                    &Funding::default(),
                 )
                 .unwrap(),
             );
@@ -193,7 +198,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
             case(
                 None,
                 when_thens,
-                Some(lit(batch.num_rows() as i32))
+                Some(lit(batch.num_rows() as i32)), &Funding::default()
             )
                 .unwrap(),
         );
@@ -207,7 +212,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
             case(
                 None,
                 when_thens,
-                Some(lit(batch.num_rows() as i32))
+                Some(lit(batch.num_rows() as i32)), &Funding::default()
             )
                 .unwrap(),
         );
@@ -221,7 +226,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
             case(
                 Some(Arc::clone(&c1)),
                 when_thens,
-                Some(lit(batch.num_rows() as i32))
+                Some(lit(batch.num_rows() as i32)), &Funding::default()
             )
                 .unwrap(),
         );
@@ -235,7 +240,7 @@ fn run_benchmarks(c: &mut Criterion, batch: &RecordBatch) {
             case(
                 Some(Arc::clone(&c2)),
                 when_thens,
-                Some(lit(batch.num_rows() as i32))
+                Some(lit(batch.num_rows() as i32)), &Funding::default()
             )
                 .unwrap(),
         );
@@ -451,6 +456,7 @@ fn benchmark_lookup_table_case_when(c: &mut Criterion, batch_size: usize) {
                                     Some(col("col1", batch.schema_ref()).unwrap()),
                                     when_thens,
                                     Some(lit("whatever")),
+                                    &Funding::default(),
                                 )
                                 .unwrap(),
                             );
@@ -504,6 +510,7 @@ fn benchmark_lookup_table_case_when(c: &mut Criterion, batch_size: usize) {
                                     Some(col("col1", batch.schema_ref()).unwrap()),
                                     when_thens,
                                     Some(lit(1000)),
+                                    &Funding::default(),
                                 )
                                 .unwrap(),
                             );
@@ -586,8 +593,15 @@ fn benchmark_divide_by_zero_protection(c: &mut Criterion, batch_size: usize) {
                     Arc::clone(&divisor_col),
                 ));
                 let else_null: Arc<dyn PhysicalExpr> = lit(ScalarValue::Int32(None));
-                let expr =
-                    Arc::new(case(None, vec![(when, then)], Some(else_null)).unwrap());
+                let expr = Arc::new(
+                    case(
+                        None,
+                        vec![(when, then)],
+                        Some(else_null),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                );
 
                 b.iter(|| black_box(expr.evaluate(black_box(&batch)).unwrap()))
             },

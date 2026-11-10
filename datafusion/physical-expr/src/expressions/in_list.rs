@@ -31,6 +31,7 @@ use arrow::compute::kernels::boolean::{not, or_kleene};
 use arrow::compute::kernels::cmp::eq as arrow_eq;
 use arrow::datatypes::*;
 
+use datafusion_common::funding::Funding;
 use datafusion_common::{
     DFSchema, Result, ScalarValue, assert_or_internal_err, exec_err,
 };
@@ -516,8 +517,9 @@ pub fn in_list(
     list: Vec<Arc<dyn PhysicalExpr>>,
     negated: &bool,
     schema: &Schema,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(InListExpr::try_new(expr, list, *negated, schema)?))
+    Ok(funding.arc(InListExpr::try_new(expr, list, *negated, schema)?)?)
 }
 
 #[cfg(test)]
@@ -525,6 +527,7 @@ mod tests {
     use super::*;
     use crate::expressions::{col, lit, try_cast};
     use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano, i256};
+    use datafusion_common::funding::Funding;
     use datafusion_common::plan_err;
     use datafusion_expr::type_coercion::binary::comparison_coercion;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
@@ -617,7 +620,14 @@ mod tests {
     macro_rules! in_list_raw {
         ($BATCH:expr, $LIST:expr, $NEGATED:expr, $EXPECTED:expr, $COL:expr, $SCHEMA:expr) => {{
             let col_expr = $COL;
-            let expr = in_list(Arc::clone(&col_expr), $LIST, $NEGATED, $SCHEMA).unwrap();
+            let expr = in_list(
+                Arc::clone(&col_expr),
+                $LIST,
+                $NEGATED,
+                $SCHEMA,
+                &Funding::default(),
+            )
+            .unwrap();
             let result = expr
                 .evaluate(&$BATCH)?
                 .into_array($BATCH.num_rows())
@@ -1178,7 +1188,14 @@ mod tests {
     macro_rules! test_nullable {
         ($COL:expr, $LIST:expr, $SCHEMA:expr, $EXPECTED:expr) => {{
             let (cast_expr, cast_list_exprs) = in_list_cast($COL, $LIST, $SCHEMA)?;
-            let expr = in_list(cast_expr, cast_list_exprs, &false, $SCHEMA).unwrap();
+            let expr = in_list(
+                cast_expr,
+                cast_list_exprs,
+                &false,
+                $SCHEMA,
+                &Funding::default(),
+            )
+            .unwrap();
             let result = expr.nullable($SCHEMA)?;
             assert_eq!($EXPECTED, result);
         }};
@@ -1363,7 +1380,13 @@ mod tests {
 
         // Test: a IN ('a', 'b')
         let list = vec![lit("a"), lit("b")];
-        let expr = in_list(Arc::clone(&col_a), list, &false, &schema)?;
+        let expr = in_list(
+            Arc::clone(&col_a),
+            list,
+            &false,
+            &schema,
+            &Funding::default(),
+        )?;
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
         assert_snapshot!(sql_string, @"a IN (a, b)");
@@ -1378,7 +1401,13 @@ mod tests {
 
         // Test: a NOT IN ('a', 'b')
         let list = vec![lit("a"), lit("b")];
-        let expr = in_list(Arc::clone(&col_a), list, &true, &schema)?;
+        let expr = in_list(
+            Arc::clone(&col_a),
+            list,
+            &true,
+            &schema,
+            &Funding::default(),
+        )?;
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
 
@@ -1393,7 +1422,13 @@ mod tests {
         let col_a = col("a", &schema)?;
         // Test: a IN ('a', 'b', NULL)
         let list = vec![lit("a"), lit("b"), lit(ScalarValue::Utf8(None))];
-        let expr = in_list(Arc::clone(&col_a), list, &false, &schema)?;
+        let expr = in_list(
+            Arc::clone(&col_a),
+            list,
+            &false,
+            &schema,
+            &Funding::default(),
+        )?;
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
 
@@ -1408,7 +1443,13 @@ mod tests {
         let col_a = col("a", &schema)?;
         // Test: a NOT IN ('a', 'b', NULL)
         let list = vec![lit("a"), lit("b"), lit(ScalarValue::Utf8(None))];
-        let expr = in_list(Arc::clone(&col_a), list, &true, &schema)?;
+        let expr = in_list(
+            Arc::clone(&col_a),
+            list,
+            &true,
+            &schema,
+            &Funding::default(),
+        )?;
         let sql_string = fmt_sql(expr.as_ref()).to_string();
         let display_string = expr.to_string();
         assert_snapshot!(sql_string, @"a NOT IN (a, b, NULL)");
@@ -2100,7 +2141,8 @@ mod tests {
                         list: Vec<Arc<dyn PhysicalExpr>>,
                         expected: Vec<Option<bool>>|
          -> Result<()> {
-            let in_expr = in_list(expr, list, &false, schema.as_ref())?;
+            let in_expr =
+                in_list(expr, list, &false, schema.as_ref(), &Funding::default())?;
             let result = in_expr.evaluate(batch)?.into_array(batch.num_rows())?;
             let result = as_boolean_array(&result);
             assert_eq!(result, &BooleanArray::from(expected));
@@ -2296,7 +2338,8 @@ mod tests {
                         negated: bool,
                         expected: Vec<Option<bool>>|
          -> Result<()> {
-            let in_expr = in_list(expr, list, &negated, schema.as_ref())?;
+            let in_expr =
+                in_list(expr, list, &negated, schema.as_ref(), &Funding::default())?;
             let result = in_expr.evaluate(batch)?.into_array(batch.num_rows())?;
             let result = as_boolean_array(&result);
             let expected_array = BooleanArray::from(expected);
@@ -2404,7 +2447,13 @@ mod tests {
                             negated: bool,
                             expected: Vec<Option<bool>>|
          -> Result<()> {
-            let in_expr = in_list(expr, list, &negated, schema_str.as_ref())?;
+            let in_expr = in_list(
+                expr,
+                list,
+                &negated,
+                schema_str.as_ref(),
+                &Funding::default(),
+            )?;
             let result = in_expr
                 .evaluate(&batch_str)?
                 .into_array(batch_str.num_rows())?;
@@ -2494,6 +2543,7 @@ mod tests {
                 list.into_iter().map(lit).collect(),
                 &false,
                 schema.as_ref(),
+                &Funding::default(),
             )?;
             let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
             let result = as_boolean_array(&result);
@@ -2593,7 +2643,7 @@ mod tests {
         let list = vec![lit(100i32), lit(200i32), lit(300i32)];
 
         // Create InListExpr via in_list() - this uses Int32StaticFilter for Int32 lists
-        let expr = in_list(col_a, list, &false, &schema)?;
+        let expr = in_list(col_a, list, &false, &schema, &Funding::default())?;
 
         // Create dictionary-encoded batch with values [100, 200, 500]
         // Dictionary: keys [0, 1, 2] -> values [100, 200, 500]

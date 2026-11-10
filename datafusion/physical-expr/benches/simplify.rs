@@ -20,6 +20,7 @@
 
 use arrow::datatypes::{DataType, Field, Schema};
 use criterion::{Criterion, criterion_group, criterion_main};
+use datafusion_common::funding::Funding;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
 use std::hint::black_box;
@@ -112,15 +113,15 @@ fn web_sales_schema() -> Schema {
 
 // Helper to create a literal
 fn lit_i64(val: i64) -> Arc<dyn PhysicalExpr> {
-    Arc::new(Literal::new(ScalarValue::Int64(Some(val))))
+    Arc::new(Literal::new(ScalarValue::Int64(Some(val)), &Funding::default()).unwrap())
 }
 
 fn lit_i32(val: i32) -> Arc<dyn PhysicalExpr> {
-    Arc::new(Literal::new(ScalarValue::Int32(Some(val))))
+    Arc::new(Literal::new(ScalarValue::Int32(Some(val)), &Funding::default()).unwrap())
 }
 
 fn lit_bool(val: bool) -> Arc<dyn PhysicalExpr> {
-    Arc::new(Literal::new(ScalarValue::Boolean(Some(val))))
+    Arc::new(Literal::new(ScalarValue::Boolean(Some(val)), &Funding::default()).unwrap())
 }
 
 // Helper to create binary expressions

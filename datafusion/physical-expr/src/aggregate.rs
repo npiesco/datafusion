@@ -43,6 +43,7 @@ use crate::planner::{create_physical_expr, create_physical_exprs};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
     DFSchema, Result, ScalarValue, assert_or_internal_err, internal_err, not_impl_err,
@@ -425,6 +426,7 @@ pub struct LoweredAggregateBuilder<'a> {
     physical_input_schema: &'a Schema,
     execution_props: &'a ExecutionProps,
     planning_ctx: &'a PhysicalPlanningContext,
+    funding: &'a Funding,
 }
 
 impl<'a> LoweredAggregateBuilder<'a> {
@@ -436,13 +438,15 @@ impl<'a> LoweredAggregateBuilder<'a> {
     /// physical expressions that reference uncorrelated scalar subqueries.
     /// Callers creating physical aggregates outside of physical planning should
     /// pass `&PhysicalPlanningContext::default()`, in which case converting a
-    /// scalar-subquery expression returns a planning error.
+    /// scalar-subquery expression returns a planning error. The physical arguments,
+    /// filter and ordering are charged to `funding` before they are allocated.
     pub fn new(
         expr: &'a Expr,
         logical_input_schema: &'a DFSchema,
         physical_input_schema: &'a Schema,
         execution_props: &'a ExecutionProps,
         planning_ctx: &'a PhysicalPlanningContext,
+        funding: &'a Funding,
     ) -> Self {
         Self {
             expr,
@@ -454,6 +458,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
             physical_input_schema,
             execution_props,
             planning_ctx,
+            funding,
         }
     }
 
@@ -493,6 +498,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
             physical_input_schema,
             execution_props,
             planning_ctx,
+            funding,
         } = self;
 
         let (name, human_display, output_metadata, expr) = lower_aggregate_display(
@@ -521,7 +527,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
         let name = if let Some(name) = name {
             name
         } else {
-            physical_name(&expr)?
+            physical_name(&expr, funding)?
         };
 
         let physical_args = create_physical_exprs(
@@ -529,6 +535,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
             logical_input_schema,
             execution_props,
             planning_ctx,
+            funding,
         )?;
         let filter = filter
             .as_ref()
@@ -538,6 +545,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
                     logical_input_schema,
                     execution_props,
                     planning_ctx,
+                    funding,
                 )
             })
             .transpose()?;
@@ -546,6 +554,7 @@ impl<'a> LoweredAggregateBuilder<'a> {
             logical_input_schema,
             execution_props,
             planning_ctx,
+            funding,
         )?;
         let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
             == NullTreatment::IgnoreNulls;
@@ -1150,6 +1159,7 @@ fn replace_fn_name_clause(aggr_name: &mut String, fn_name_old: &str, fn_name_new
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     use std::collections::HashMap;
 
@@ -1185,6 +1195,7 @@ mod tests {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )
         .build()?;
 
@@ -1209,6 +1220,7 @@ mod tests {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )
         .with_human_display(expr.human_display().to_string())
         .build()?;

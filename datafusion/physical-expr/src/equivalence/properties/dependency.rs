@@ -1498,9 +1498,21 @@ mod tests {
             "named_struct",
             named_struct_udf,
             vec![
-                Arc::new(Literal::new(ScalarValue::Utf8(Some("a".to_string())))),
+                Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("a".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
                 Arc::clone(&col_a),
-                Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
+                Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("b".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
                 Arc::clone(&col_b),
             ],
             Arc::new(Field::new(
@@ -1546,7 +1558,13 @@ mod tests {
             get_field_udf,
             vec![
                 Arc::clone(&col_s),
-                Arc::new(Literal::new(ScalarValue::Utf8(Some("a".to_string())))),
+                Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("a".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
             ],
             Arc::new(Field::new("a", DataType::Int32, true)),
             Arc::clone(&config),

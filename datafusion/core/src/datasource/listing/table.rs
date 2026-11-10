@@ -106,6 +106,8 @@ impl ListingTableConfigExt for ListingTableConfig {
 #[cfg(test)]
 mod tests {
 
+    use datafusion_common::funding::Funding;
+
     #[cfg(feature = "parquet")]
     use crate::datasource::file_format::parquet::ParquetFormat;
     use crate::datasource::listing::table::ListingTableConfigExt;
@@ -314,6 +316,7 @@ mod tests {
                             Operator::Plus,
                             physical_lit(1),
                             &schema,
+                            &Funding::default(),
                         )
                         .unwrap(),
                         options: SortOptions {

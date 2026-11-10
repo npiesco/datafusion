@@ -24,6 +24,7 @@ use arrow::datatypes::FieldRef;
 use datafusion_common::arrow::array::ArrayRef;
 use datafusion_common::arrow::datatypes::DataType;
 use datafusion_common::arrow::datatypes::Field;
+use datafusion_common::funding::Funding;
 use datafusion_common::{DataFusionError, Result, ScalarValue, arrow_datafusion_err};
 use datafusion_doc::window_doc_sections::DOC_SECTION_ANALYTICAL;
 use datafusion_expr::{
@@ -359,8 +360,10 @@ fn parse_expr(
 
     let default_value = get_scalar_value_from_args(input_exprs, 2)?;
     default_value.map_or(Ok(expr), |value| {
-        ScalarValue::try_from(&value.data_type())
-            .map(|v| Arc::new(expressions::Literal::new(v)) as Arc<dyn PhysicalExpr>)
+        ScalarValue::try_from(&value.data_type()).and_then(|v| {
+            Ok(Arc::new(expressions::Literal::new(v, &Funding::default())?)
+                as Arc<dyn PhysicalExpr>)
+        })
     })
 }
 
@@ -746,6 +749,7 @@ mod tests {
     use arrow::array::*;
     use arrow::datatypes::Int8Type;
     use datafusion_common::cast::{as_dictionary_array, as_int32_array, as_string_array};
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr::expressions::{Column, Literal};
 
     fn test_i32_result(
@@ -866,10 +870,12 @@ mod tests {
     #[test]
     fn test_lag_with_default() -> Result<()> {
         let expr = Arc::new(Column::new("c3", 0)) as Arc<dyn PhysicalExpr>;
-        let shift_offset =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>;
-        let default_value = Arc::new(Literal::new(ScalarValue::Int32(Some(100))))
-            as Arc<dyn PhysicalExpr>;
+        let shift_offset = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
+        let default_value = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(100)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
 
         let input_exprs = &[expr, shift_offset, default_value];
         let input_fields = [DataType::Int32, DataType::Int32, DataType::Int32]

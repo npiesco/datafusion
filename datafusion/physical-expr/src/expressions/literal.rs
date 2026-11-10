@@ -27,6 +27,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Expr;
@@ -34,6 +35,9 @@ use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::interval_arithmetic::Interval;
 use datafusion_expr_common::placement::ExpressionPlacement;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
+
+/// The name of a literal's field
+const LITERAL_NAME: &str = "lit";
 
 /// Represents a literal value
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -56,25 +60,38 @@ impl Hash for Literal {
 }
 
 impl Literal {
-    /// Create a literal value expression
-    pub fn new(value: ScalarValue) -> Self {
-        Self::new_with_metadata(value, None)
+    /// Create a literal value expression, what it allocates charged to `funding` first
+    pub fn new(value: ScalarValue, funding: &Funding) -> Result<Self> {
+        Self::new_with_metadata(value, None, funding)
     }
 
-    /// Create a literal value expression
+    /// Create a literal value expression, what it allocates charged to `funding` first.
+    /// A non-empty `metadata` map is copied into the field uncharged: its table's size is
+    /// not measured.
     pub fn new_with_metadata(
         value: ScalarValue,
         metadata: Option<FieldMetadata>,
-    ) -> Self {
-        let mut field = Field::new("lit".to_string(), value.data_type(), value.is_null());
-
-        if let Some(metadata) = metadata {
-            field = metadata.add_to_field(field);
-        }
-
-        Self {
+        funding: &Funding,
+    ) -> Result<Self> {
+        let data_type = funding.scalar_type(&value)?;
+        let name = funding.string(LITERAL_NAME)?;
+        let field = Self::field(name, data_type, &value, metadata.as_ref());
+        Ok(Self {
+            field: funding.arc(field)?,
             value,
-            field: field.into(),
+        })
+    }
+
+    fn field(
+        name: String,
+        data_type: DataType,
+        value: &ScalarValue,
+        metadata: Option<&FieldMetadata>,
+    ) -> Field {
+        let field = Field::new(name, data_type, value.is_null());
+        match metadata {
+            Some(metadata) => metadata.add_to_field(field),
+            None => field,
         }
     }
 
@@ -168,15 +185,22 @@ impl Literal {
             "Literal",
         );
         let value = ScalarValue::try_from(scalar_proto)?;
-        Ok(Arc::new(Literal::new(value)))
+        Ok(Arc::new(Literal::new(value, &Funding::default())?))
     }
 }
 
-/// Create a literal expression
+/// Create a literal expression, uncharged: for code outside planning. Planning makes
+/// its literals with [`Literal::new`].
 #[expect(clippy::needless_pass_by_value)]
 pub fn lit<T: datafusion_expr::Literal>(value: T) -> Arc<dyn PhysicalExpr> {
     match value.lit() {
-        Expr::Literal(v, _) => Arc::new(Literal::new(v)),
+        Expr::Literal(v, _) => {
+            let field = Literal::field(LITERAL_NAME.to_string(), v.data_type(), &v, None);
+            Arc::new(Literal {
+                value: v,
+                field: Arc::new(field),
+            })
+        }
         _ => unreachable!(),
     }
 }
@@ -234,12 +258,13 @@ mod proto_tests {
     use super::*;
     use crate::proto_test_util::{StubEncoder, UnreachableDecoder, column_node};
     use datafusion_common::DataFusionError;
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr_common::physical_expr::proto_decode::PhysicalExprDecodeCtx;
     use datafusion_physical_expr_common::physical_expr::proto_encode::PhysicalExprEncodeCtx;
     use datafusion_proto_models::protobuf::physical_expr_node;
 
     fn i32_literal() -> Literal {
-        Literal::new(ScalarValue::Int32(Some(42)))
+        Literal::new(ScalarValue::Int32(Some(42)), &Funding::default()).unwrap()
     }
 
     // ── try_to_proto ─────────────────────────────────────────────────────────
@@ -266,7 +291,8 @@ mod proto_tests {
 
     #[test]
     fn try_to_proto_null_literal() {
-        let literal = Literal::new(ScalarValue::Int32(None));
+        let literal =
+            Literal::new(ScalarValue::Int32(None), &Funding::default()).unwrap();
         let encoder = StubEncoder::ok();
         let ctx = PhysicalExprEncodeCtx::new(&encoder);
 

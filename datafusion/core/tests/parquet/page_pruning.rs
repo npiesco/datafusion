@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::parquet::Unit::Page;
@@ -80,6 +81,7 @@ async fn get_parquet_exec(
         &df_schema,
         &execution_props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )
     .unwrap();
 

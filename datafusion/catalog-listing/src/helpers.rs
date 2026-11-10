@@ -17,6 +17,7 @@
 
 //! Helper functions for the table implementation
 
+use datafusion_common::funding::Funding;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -334,6 +335,7 @@ pub fn filter_partitioned_file(
         df_schema,
         &props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )?;
 
     // Since we're only operating on a single file, our batch and resulting "array" holds only one

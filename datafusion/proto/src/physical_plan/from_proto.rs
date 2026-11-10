@@ -17,6 +17,7 @@
 
 //! Serde code to convert from protocol buffers to Rust data structures.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -344,6 +345,7 @@ pub fn parse_physical_expr_with_converter(
                 args,
                 input_schema,
                 config_options,
+                &Funding::default(),
             )?)
         }
         ExprType::LikeExpr(_) => LikeExpr::try_from_proto(proto, &decode_ctx)?,

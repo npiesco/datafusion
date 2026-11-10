@@ -2811,9 +2811,13 @@ mod tests {
     /// Returns a simple literal `Arc<dyn PhysicalExpr>` for use in tests.
     fn lit_expr(val: i64) -> Arc<dyn PhysicalExpr> {
         use datafusion_physical_expr::expressions::Literal;
-        Arc::new(Literal::new(datafusion_common::ScalarValue::Int64(Some(
-            val,
-        ))))
+        Arc::new(
+            Literal::new(
+                datafusion_common::ScalarValue::Int64(Some(val)),
+                &Funding::default(),
+            )
+            .unwrap(),
+        )
     }
 
     /// `apply_expressions` visits all expressions when `f` always returns `Continue`.

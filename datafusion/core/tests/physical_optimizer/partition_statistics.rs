@@ -399,6 +399,7 @@ mod test {
             Operator::Lt,
             lit(1i32),
             &schema,
+            &Funding::default(),
         )?;
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, scan, &Funding::default())?);
@@ -861,6 +862,7 @@ mod test {
                     Operator::Plus,
                     col("id", &scan_schema)?,
                     &scan_schema,
+                    &Funding::default(),
                 )?,
                 "expr".to_string(),
             ),

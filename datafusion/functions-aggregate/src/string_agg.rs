@@ -535,6 +535,7 @@ mod tests {
     use arrow::array::LargeStringArray;
     use arrow::compute::SortOptions;
     use arrow::datatypes::{Fields, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr::expressions::Column;
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
     use std::sync::Arc;
@@ -729,7 +730,13 @@ mod tests {
                 is_distinct: self.distinct,
                 exprs: &[
                     Arc::new(Column::new("col", 0)),
-                    Arc::new(Literal::new(ScalarValue::Utf8(Some(self.sep.to_string())))),
+                    Arc::new(
+                        Literal::new(
+                            ScalarValue::Utf8(Some(self.sep.to_string())),
+                            &Funding::default(),
+                        )
+                        .unwrap(),
+                    ),
                 ],
             })
         }

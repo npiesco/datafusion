@@ -53,6 +53,8 @@ pub use datafusion_physical_expr::create_ordering;
 #[cfg(all(test, feature = "parquet"))]
 mod tests {
 
+    use datafusion_common::funding::Funding;
+
     use crate::prelude::SessionContext;
     use ::object_store::{ObjectMeta, path::Path};
     use arrow::{
@@ -174,7 +176,8 @@ mod tests {
                     {
                         return Ok(Transformed::yes(Arc::new(Literal::new(
                             ScalarValue::Utf8(Some("foo".to_string())),
-                        ))
+                            &Funding::default(),
+                        )?)
                             as Arc<dyn PhysicalExpr>));
                     }
                 }

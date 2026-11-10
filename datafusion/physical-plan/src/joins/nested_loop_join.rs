@@ -3191,6 +3191,7 @@ pub(crate) mod tests {
     use crate::{
         common, expressions::Column, repartition::RepartitionExec, test::build_table_i32,
     };
+    use datafusion_common::funding::Funding;
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field};
@@ -3286,13 +3287,17 @@ pub(crate) mod tests {
         let left_filter = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(8)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(8)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
         // right.b2!=10
         let right_filter = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 1)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
         // filter = left.b1!=8 and right.b2!=10
         // after filter:

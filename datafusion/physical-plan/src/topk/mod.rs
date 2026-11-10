@@ -25,6 +25,7 @@ use arrow::{
     },
     row::{OwnedRow, RowConverter, Rows, SortField},
 };
+use datafusion_common::funding::Funding;
 use datafusion_expr::{ColumnarValue, Operator};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -625,13 +626,15 @@ impl TopK {
                 // For nulls first, transform to (threshold.value is not null) and (threshold.expr is null or comparison)
                 (true, true) => lit(false),
                 (true, false) => Arc::new(BinaryExpr::new(
-                    is_null(Arc::clone(&sort_expr.expr))?,
+                    is_null(Arc::clone(&sort_expr.expr), &Funding::default())?,
                     Operator::Or,
                     comparison,
                 )),
                 // For nulls last, transform to (threshold.value is null and threshold.expr is not null)
                 // or (threshold.value is not null and comparison)
-                (false, true) => is_not_null(Arc::clone(&sort_expr.expr))?,
+                (false, true) => {
+                    is_not_null(Arc::clone(&sort_expr.expr), &Funding::default())?
+                }
                 (false, false) => comparison,
             };
 
@@ -643,7 +646,7 @@ impl TopK {
 
             if value_null {
                 eq_expr = Arc::new(BinaryExpr::new(
-                    is_null(Arc::clone(&sort_expr.expr))?,
+                    is_null(Arc::clone(&sort_expr.expr), &Funding::default())?,
                     Operator::Or,
                     eq_expr,
                 ));

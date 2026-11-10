@@ -351,7 +351,7 @@ impl ProjectionExprs {
     ///             expr: Arc::new(BinaryExpr::new(
     ///                 Arc::new(Column::new("x", 0)),
     ///                 Operator::Plus,
-    ///                 Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+    ///                 Arc::new(Literal::new(ScalarValue::Int32(Some(1)), &datafusion_common::funding::Funding::default()).unwrap()),
     ///             )),
     ///             alias: "c1".to_string(),
     ///         },
@@ -815,7 +815,7 @@ impl ProjectionExprs {
     /// let projection = ProjectionExprs::new([
     ///     ProjectionExpr::new(Arc::new(Column::new("b", 1)), "b"),
     ///     ProjectionExpr::new(
-    ///         Arc::new(Literal::new(ScalarValue::Int32(Some(42)))),
+    ///         Arc::new(Literal::new(ScalarValue::Int32(Some(42)), &datafusion_common::funding::Funding::default()).unwrap()),
     ///         "answer",
     ///     ),
     ///     ProjectionExpr::new(Arc::new(Column::new("a", 0)), "a"),
@@ -1294,8 +1294,10 @@ impl ProjectionMapping {
                             funding.vec_with_capacity(1 + accessor_args.len())?;
                         accessor_fn_args.push(Arc::clone(&target_expr));
                         for sv in accessor_args {
-                            accessor_fn_args
-                                .push(funding.arc(Literal::new(funding.cloned(sv)?))?);
+                            accessor_fn_args.push(
+                                funding
+                                    .arc(Literal::new(funding.cloned(sv)?, funding)?)?,
+                            );
                         }
 
                         // Look up the field's return type from the struct schema
@@ -1356,7 +1358,7 @@ impl ProjectionMapping {
 
 /// The column `name` at `index`, its name and block charged to `funding` before they are
 /// allocated.
-fn funded_column(
+pub(crate) fn funded_column(
     name: &str,
     index: usize,
     funding: &Funding,
@@ -2013,6 +2015,7 @@ pub(crate) mod tests {
             vec![Arc::clone(col_c)],
             &schema,
             Arc::new(ConfigOptions::default()),
+            &Funding::default(),
         )?) as PhysicalExprRef;
 
         let option_asc = SortOptions {
@@ -2364,7 +2367,10 @@ pub(crate) mod tests {
     fn test_projected_column_position_returns_none_for_non_column_or_missing() {
         let projection = ProjectionExprs::new([
             ProjectionExpr::new(
-                Arc::new(Literal::new(ScalarValue::Int64(Some(42)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int64(Some(42)), &Funding::default())
+                        .unwrap(),
+                ),
                 "col1",
             ),
             ProjectionExpr::new(Arc::new(Column::new("col0", 0)), "col0"),
@@ -2695,7 +2701,10 @@ pub(crate) mod tests {
                 expr: Arc::new(BinaryExpr::new(
                     Arc::new(Column::new("x", 0)),
                     Operator::Plus,
-                    Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Int32(Some(1)), &Funding::default())
+                            .unwrap(),
+                    ),
                 )),
                 alias: "c1".to_string(),
             },
@@ -2748,7 +2757,9 @@ pub(crate) mod tests {
 
         // Top projection with a literal expression: SELECT 1
         let top_projection = ProjectionExprs::new(vec![ProjectionExpr {
-            expr: Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+            expr: Arc::new(
+                Literal::new(ScalarValue::Int64(Some(1)), &Funding::default()).unwrap(),
+            ),
             alias: "Int64(1)".to_string(),
         }]);
 
@@ -2763,8 +2774,9 @@ pub(crate) mod tests {
     #[test]
     fn test_update_expr_with_literal() -> Result<()> {
         // Test that update_expr correctly handles expressions without column references
-        let literal_expr: Arc<dyn PhysicalExpr> =
-            Arc::new(Literal::new(ScalarValue::Int64(Some(42))));
+        let literal_expr: Arc<dyn PhysicalExpr> = Arc::new(
+            Literal::new(ScalarValue::Int64(Some(42)), &Funding::default()).unwrap(),
+        );
         let empty_projection: Vec<ProjectionExpr> = vec![];
 
         // Updating a literal with an empty projection should return the literal unchanged
@@ -2785,7 +2797,9 @@ pub(crate) mod tests {
         // Test update_expr with an expression containing both literals and a column
         // This tests the case where we have: literal + column
         let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(Literal::new(ScalarValue::Int64(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int64(Some(10)), &Funding::default()).unwrap(),
+            ),
             Operator::Plus,
             Arc::new(Column::new("x", 0)),
         ));
@@ -2862,7 +2876,10 @@ pub(crate) mod tests {
             expr: Arc::new(BinaryExpr::new(
                 Arc::new(Column::new("col0", 0)),
                 Operator::Plus,
-                Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int64(Some(1)), &Funding::default())
+                        .unwrap(),
+                ),
             )),
             alias: "incremented".to_string(),
         }]);
@@ -2986,7 +3003,10 @@ pub(crate) mod tests {
                 expr: Arc::new(BinaryExpr::new(
                     Arc::new(Column::new("col0", 0)),
                     Operator::Plus,
-                    Arc::new(Literal::new(ScalarValue::Int64(Some(1)))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Int64(Some(1)), &Funding::default())
+                            .unwrap(),
+                    ),
                 )),
                 alias: "incremented".to_string(),
             },
@@ -3258,7 +3278,10 @@ pub(crate) mod tests {
         // Projection with literal: SELECT 42 AS constant, col0 AS num
         let projection = ProjectionExprs::new(vec![
             ProjectionExpr {
-                expr: Arc::new(Literal::new(ScalarValue::Int64(Some(42)))),
+                expr: Arc::new(
+                    Literal::new(ScalarValue::Int64(Some(42)), &Funding::default())
+                        .unwrap(),
+                ),
                 alias: "constant".to_string(),
             },
             ProjectionExpr {
@@ -3326,7 +3349,10 @@ pub(crate) mod tests {
 
         let projection = ProjectionExprs::new(vec![
             ProjectionExpr {
-                expr: Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+                expr: Arc::new(
+                    Literal::new(ScalarValue::Int32(Some(10)), &Funding::default())
+                        .unwrap(),
+                ),
                 alias: "constant".to_string(),
             },
             ProjectionExpr {
@@ -3357,7 +3383,9 @@ pub(crate) mod tests {
         // Projection with NULL literal: SELECT NULL AS null_col, col0 AS num
         let projection = ProjectionExprs::new(vec![
             ProjectionExpr {
-                expr: Arc::new(Literal::new(ScalarValue::Int64(None))),
+                expr: Arc::new(
+                    Literal::new(ScalarValue::Int64(None), &Funding::default()).unwrap(),
+                ),
                 alias: "null_col".to_string(),
             },
             ProjectionExpr {
@@ -3425,9 +3453,13 @@ pub(crate) mod tests {
         // Projection with Utf8 literal (complex type): SELECT 'hello' AS text, col0 AS num
         let projection = ProjectionExprs::new(vec![
             ProjectionExpr {
-                expr: Arc::new(Literal::new(ScalarValue::Utf8(Some(
-                    "hello".to_string(),
-                )))),
+                expr: Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("hello".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
                 alias: "text".to_string(),
             },
             ProjectionExpr {

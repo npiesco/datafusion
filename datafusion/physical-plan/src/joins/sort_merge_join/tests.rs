@@ -24,6 +24,7 @@
 //!
 //! Add relevant tests under the specified sections.
 
+use datafusion_common::funding::Funding;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -2090,7 +2091,10 @@ async fn join_full_null_filter_result() -> Result<()> {
 
     // Filter: b1 < (b2 + 1) AND b1 < (a2 + 1)
     // When b2 is NULL, (b2 + 1) is NULL, so b1 < NULL is NULL → unmatched.
-    let lit_1: PhysicalExprRef = Arc::new(Literal::new(ScalarValue::Int32(Some(1))));
+    let lit_1: PhysicalExprRef = Arc::new(Literal::new(
+        ScalarValue::Int32(Some(1)),
+        &Funding::default(),
+    )?);
     let b1_lt_b2_plus_1: PhysicalExprRef = Arc::new(BinaryExpr::new(
         Arc::new(Column::new("b1", 0)),
         Operator::Lt,
@@ -3934,7 +3938,10 @@ async fn join_filtered_with_multiple_buffered_batches() -> Result<()> {
                 Arc::new(Column::new("val_r", 1)),
             )),
             Operator::Lt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(350)))),
+            Arc::new(Literal::new(
+                ScalarValue::Int32(Some(350)),
+                &Funding::default(),
+            )?),
         )),
         vec![
             ColumnIndex {

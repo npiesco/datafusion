@@ -209,7 +209,13 @@ async fn agg_grouping_yields(
     let inf = Arc::new(make_lazy_exec("value", pretend_infinite));
 
     let value_col = col("value", &inf.schema())?;
-    let group = binary(value_col.clone(), Divide, lit(1000000i64), &inf.schema())?;
+    let group = binary(
+        value_col.clone(),
+        Divide,
+        lit(1000000i64),
+        &inf.schema(),
+        &Funding::default(),
+    )?;
 
     let aggr = Arc::new(AggregateExec::try_new(
         AggregateMode::Single,
@@ -241,7 +247,13 @@ async fn agg_grouped_topk_yields(
     let inf = Arc::new(make_lazy_exec("value", pretend_infinite));
 
     let value_col = col("value", &inf.schema())?;
-    let group = binary(value_col.clone(), Divide, lit(1000000i64), &inf.schema())?;
+    let group = binary(
+        value_col.clone(),
+        Divide,
+        lit(1000000i64),
+        &inf.schema(),
+        &Funding::default(),
+    )?;
 
     let aggr = Arc::new(
         AggregateExec::try_new(
@@ -401,6 +413,7 @@ async fn filter_yields(
         Operator::Lt,
         lit(i64::MIN),
         &inf.schema(),
+        &Funding::default(),
     )?;
     let filter = Arc::new(FilterExec::try_new(
         filter_expr,
@@ -426,7 +439,7 @@ async fn filter_reject_all_batches_yields(
     let false_predicate = Arc::new(BinaryExpr::new(
         Arc::new(Column::new("value", 0)),
         Gt,
-        Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+        Arc::new(Literal::new(ScalarValue::Int64(Some(0)), &Funding::default()).unwrap()),
     ));
     let filtered = Arc::new(FilterExec::try_new(
         false_predicate,
@@ -468,14 +481,17 @@ async fn interleave_then_filter_all_yields(
                     Divide,
                     lit(8192i64),
                     &inf.schema(),
+                    &Funding::default(),
                 )?,
                 Modulo,
                 lit(threshold as i64),
                 &inf.schema(),
+                &Funding::default(),
             )?,
             Eq,
             lit(0i64),
             &inf.schema(),
+            &Funding::default(),
         )?;
         let filtered = Arc::new(FilterExec::try_new(
             filter_expr,
@@ -491,7 +507,9 @@ async fn interleave_then_filter_all_yields(
 
     // Wrap the InterleaveExec in a FilterExec that always returns false,
     // ensuring that no rows are ever emitted.
-    let always_false = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
+    let always_false = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(false)), &Funding::default()).unwrap(),
+    );
     let filtered_interleave = Arc::new(FilterExec::try_new(
         always_false,
         interleave,
@@ -532,14 +550,17 @@ async fn interleave_then_aggregate_yields(
                     Divide,
                     lit(8192i64),
                     &inf.schema(),
+                    &Funding::default(),
                 )?,
                 Modulo,
                 lit(threshold as i64),
                 &inf.schema(),
+                &Funding::default(),
             )?,
             Eq,
             lit(0i64),
             &inf.schema(),
+            &Funding::default(),
         )?;
         let filtered = Arc::new(FilterExec::try_new(
             filter_expr,

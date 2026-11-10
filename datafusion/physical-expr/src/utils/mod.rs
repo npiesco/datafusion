@@ -326,6 +326,8 @@ pub fn reassign_expr_columns(
 #[cfg(test)]
 pub(crate) mod tests {
 
+    use datafusion_common::funding::Funding;
+
     use std::fmt::{Display, Formatter};
 
     use super::*;
@@ -481,6 +483,7 @@ pub(crate) mod tests {
                     Operator::Plus,
                     col("1", &schema)?,
                     &schema,
+                    &Funding::default(),
                 )?,
                 &schema,
                 DataType::Int64,
@@ -491,8 +494,10 @@ pub(crate) mod tests {
                 Operator::Plus,
                 lit(ScalarValue::Int64(Some(10))),
                 &schema,
+                &Funding::default(),
             )?,
             &schema,
+            &Funding::default(),
         )?;
         let mut vector_dummy_props = vec![];
         let (root, graph) = build_dag(expr, &make_dummy_node)?;
@@ -579,6 +584,7 @@ pub(crate) mod tests {
             ))],
             &false,
             &schema_big,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -592,6 +598,7 @@ pub(crate) mod tests {
             ))],
             &false,
             &schema_small,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -630,6 +637,7 @@ pub(crate) mod tests {
             Operator::Eq,
             lit(ScalarValue::Utf8(Some("NGJ26".to_string()))),
             schema.as_ref(),
+            &Funding::default(),
         )?;
         let eq_properties = EquivalenceProperties::new(schema);
 

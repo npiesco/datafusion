@@ -572,7 +572,7 @@ impl ExprIntervalGraph {
     /// let expr = Arc::new(BinaryExpr::new(
     ///     Arc::new(Column::new("gnz", 0)),
     ///     Operator::Plus,
-    ///     Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+    ///     Arc::new(Literal::new(ScalarValue::Int32(Some(10)), &datafusion_common::funding::Funding::default()).unwrap()),
     /// ));
     ///
     /// let schema = Schema::new(vec![Field::new("gnz".to_string(), DataType::Int32, true)]);
@@ -769,6 +769,7 @@ mod tests {
     use super::*;
     use crate::expressions::Column;
     use crate::intervals::test_utils::gen_conjunctive_numerical_expr;
+    use datafusion_common::funding::Funding;
 
     use arrow::array::types::{IntervalDayTime, IntervalMonthDayNano};
     use arrow::datatypes::{Field, TimeUnit};
@@ -919,7 +920,9 @@ mod tests {
         let left_and_1 = Arc::new(BinaryExpr::new(
             Arc::clone(&left_col) as Arc<dyn PhysicalExpr>,
             Operator::Plus,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(5)), &Funding::default()).unwrap(),
+            ),
         ));
         let expr = Arc::new(BinaryExpr::new(
             left_and_1,
@@ -1236,7 +1239,9 @@ mod tests {
                 Arc::new(Column::new("b", 1)),
             )),
             Operator::Plus,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+            ),
         ));
 
         let right_expr = Arc::new(BinaryExpr::new(
@@ -1282,7 +1287,9 @@ mod tests {
                 Arc::new(Column::new("b", 1)),
             )),
             Operator::Plus,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+            ),
         ));
 
         let right_expr = Arc::new(BinaryExpr::new(
@@ -1330,7 +1337,9 @@ mod tests {
                 Arc::new(Column::new("b", 1)),
             )),
             Operator::Plus,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+            ),
         ));
 
         let right_expr = Arc::new(BinaryExpr::new(
@@ -1377,7 +1386,10 @@ mod tests {
             Arc::new(BinaryExpr::new(
                 Arc::new(Column::new("a", 0)),
                 Operator::Plus,
-                Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int32(Some(1)), &Funding::default())
+                        .unwrap(),
+                ),
             )),
             Operator::Plus,
             Arc::new(Column::new("b", 1)),
@@ -1421,7 +1433,13 @@ mod tests {
         let expression = BinaryExpr::new(
             Arc::new(Column::new("ts_column", 0)),
             Operator::Plus,
-            Arc::new(Literal::new(ScalarValue::new_interval_mdn(0, 1, 321))),
+            Arc::new(
+                Literal::new(
+                    ScalarValue::new_interval_mdn(0, 1, 321),
+                    &Funding::default(),
+                )
+                .unwrap(),
+            ),
         );
         let parent = Interval::try_new(
             // 15.10.2020 - 10:11:12.000_000_321 AM

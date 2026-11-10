@@ -218,6 +218,7 @@ impl ExprStatisticsGraph {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use crate::expressions::{Column, binary, try_cast};
@@ -245,7 +246,7 @@ mod tests {
 
         let left_expr = try_cast(left, schema, lhs)?;
         let right_expr = try_cast(right, schema, rhs)?;
-        binary(left_expr, op, right_expr, schema)
+        binary(left_expr, op, right_expr, schema, &Funding::default())
     }
 
     #[test]

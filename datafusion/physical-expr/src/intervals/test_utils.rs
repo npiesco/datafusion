@@ -17,6 +17,7 @@
 
 //! Test utilities for the interval arithmetic library
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
@@ -43,17 +44,23 @@ pub fn gen_conjunctive_numerical_expr(
     let left_and_1 = Arc::new(BinaryExpr::new(
         Arc::clone(&left_col),
         op_1,
-        Arc::new(Literal::new(a)),
+        Arc::new(Literal::new(a, &Funding::default())?),
     ));
     let left_and_2 = Arc::new(BinaryExpr::new(
         Arc::clone(&right_col),
         op_2,
-        Arc::new(Literal::new(b)),
+        Arc::new(Literal::new(b, &Funding::default())?),
     ));
-    let right_and_1 =
-        Arc::new(BinaryExpr::new(left_col, op_3, Arc::new(Literal::new(c))));
-    let right_and_2 =
-        Arc::new(BinaryExpr::new(right_col, op_4, Arc::new(Literal::new(d))));
+    let right_and_1 = Arc::new(BinaryExpr::new(
+        left_col,
+        op_3,
+        Arc::new(Literal::new(c, &Funding::default())?),
+    ));
+    let right_and_2 = Arc::new(BinaryExpr::new(
+        right_col,
+        op_4,
+        Arc::new(Literal::new(d, &Funding::default())?),
+    ));
     let (greater_op, less_op) = bounds;
 
     let left_expr = Arc::new(BinaryExpr::new(left_and_1, greater_op, left_and_2));
@@ -81,17 +88,31 @@ pub fn gen_conjunctive_temporal_expr(
     let left_and_1 = binary(
         Arc::clone(&left_col),
         op_1,
-        Arc::new(Literal::new(a)),
+        Arc::new(Literal::new(a, &Funding::default())?),
         schema,
+        &Funding::default(),
     )?;
     let left_and_2 = binary(
         Arc::clone(&right_col),
         op_2,
-        Arc::new(Literal::new(b)),
+        Arc::new(Literal::new(b, &Funding::default())?),
         schema,
+        &Funding::default(),
     )?;
-    let right_and_1 = binary(left_col, op_3, Arc::new(Literal::new(c)), schema)?;
-    let right_and_2 = binary(right_col, op_4, Arc::new(Literal::new(d)), schema)?;
+    let right_and_1 = binary(
+        left_col,
+        op_3,
+        Arc::new(Literal::new(c, &Funding::default())?),
+        schema,
+        &Funding::default(),
+    )?;
+    let right_and_2 = binary(
+        right_col,
+        op_4,
+        Arc::new(Literal::new(d, &Funding::default())?),
+        schema,
+        &Funding::default(),
+    )?;
     let left_expr = Arc::new(BinaryExpr::new(left_and_1, Operator::Gt, left_and_2));
     let right_expr = Arc::new(BinaryExpr::new(right_and_1, Operator::Lt, right_and_2));
     Ok(Arc::new(BinaryExpr::new(

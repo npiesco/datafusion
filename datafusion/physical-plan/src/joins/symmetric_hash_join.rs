@@ -2072,6 +2072,7 @@ pub enum SHJStreamState {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
@@ -2202,6 +2203,7 @@ mod tests {
                 Operator::Plus,
                 col("la2", left_schema)?,
                 left_schema,
+                &Funding::default(),
             )?,
             options: SortOptions::default(),
         }]
@@ -2224,6 +2226,7 @@ mod tests {
                 Operator::Plus,
                 lit(ScalarValue::Int32(Some(1))),
                 left_schema,
+                &Funding::default(),
             )?,
             Arc::new(Column::new_with_schema("rc1", right_schema)?) as _,
         )];

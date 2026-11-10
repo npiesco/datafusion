@@ -17,6 +17,7 @@
 
 //! [`SessionState`]: information required to run queries in a session
 
+use datafusion_common::funding::Funding;
 use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -841,6 +842,7 @@ impl SessionState {
             df_schema,
             self.execution_props(),
             &PhysicalPlanningContext::default(),
+            &config_options.funding,
         )
     }
 
@@ -891,7 +893,7 @@ impl SessionState {
 
     /// The funding planning is charged to
     /// ([`SessionConfig::with_planning_funding`]).
-    pub fn planning_funding(&self) -> &datafusion_common::funding::Funding {
+    pub fn planning_funding(&self) -> &Funding {
         self.config.planning_funding()
     }
 

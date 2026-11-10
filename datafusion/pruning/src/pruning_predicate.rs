@@ -552,7 +552,7 @@ struct ConstantUnhandledPredicateHook {
 impl Default for ConstantUnhandledPredicateHook {
     fn default() -> Self {
         Self {
-            default: Arc::new(phys_expr::Literal::new(ScalarValue::from(true))),
+            default: phys_expr::lit(ScalarValue::from(true)),
         }
     }
 }
@@ -1448,7 +1448,7 @@ fn build_is_null_column_expr(
                     Arc::new(phys_expr::BinaryExpr::new(
                         null_count_column_expr,
                         Operator::Gt,
-                        Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
+                        phys_expr::lit(ScalarValue::UInt64(Some(0))),
                     )) as _
                 })
                 .ok()
@@ -1669,14 +1669,14 @@ fn build_predicate_expression(
             (left, Operator::And, right)
                 if is_always_false(left) || is_always_false(right) =>
             {
-                Arc::new(phys_expr::Literal::new(ScalarValue::Boolean(Some(false))))
+                phys_expr::lit(ScalarValue::Boolean(Some(false)))
             }
             (left, Operator::And, _) if is_always_true(left) => right_expr,
             (_, Operator::And, right) if is_always_true(right) => left_expr,
             (left, Operator::Or, right)
                 if is_always_true(left) || is_always_true(right) =>
             {
-                Arc::new(phys_expr::Literal::new(ScalarValue::Boolean(Some(true))))
+                phys_expr::lit(ScalarValue::Boolean(Some(true)))
             }
             (left, Operator::Or, _) if is_always_false(left) => right_expr,
             (_, Operator::Or, right) if is_always_false(right) => left_expr,
@@ -1882,7 +1882,7 @@ fn column_has_nulls_expr(
     Ok(binary_expr(
         expr_builder.null_count_column_expr()?,
         Operator::Gt,
-        Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
+        phys_expr::lit(ScalarValue::UInt64(Some(0))),
     ))
 }
 
@@ -1953,7 +1953,7 @@ fn extract_string_literal(expr: &Arc<dyn PhysicalExpr>) -> Option<&str> {
 fn string_literal_as(value: String, target_type: &DataType) -> Arc<dyn PhysicalExpr> {
     let utf8 = ScalarValue::Utf8(Some(value));
     let scalar = try_cast_literal_to_type(&utf8, target_type).unwrap_or(utf8);
-    Arc::new(phys_expr::Literal::new(scalar))
+    phys_expr::lit(scalar)
 }
 
 /// Convert `column LIKE literal` where P is a constant prefix of the literal
@@ -2176,6 +2176,7 @@ pub(crate) enum StatisticsType {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::collections::HashMap;
     use std::ops::{Not, Rem};
 
@@ -3219,9 +3220,13 @@ mod tests {
                 };
                 if col_expr.name() == "part" {
                     // simulate dynamic filter replacement with literal "A"
-                    Arc::new(phys_expr::Literal::new(ScalarValue::Utf8(Some(
-                        "A".to_string(),
-                    )))) as Arc<dyn PhysicalExpr>
+                    Arc::new(
+                        phys_expr::Literal::new(
+                            ScalarValue::Utf8(Some("A".to_string())),
+                            &Funding::default(),
+                        )
+                        .unwrap(),
+                    ) as Arc<dyn PhysicalExpr>
                 } else {
                     Arc::clone(child_expr)
                 }
@@ -5430,7 +5435,13 @@ mod tests {
             /// by renaming it to yet another column that doesn't exist in the schema
             /// (the transformation is arbitrary, the point is that it can do whatever it wants)
             fn handle(&self, _expr: &Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
-                Arc::new(phys_expr::Literal::new(ScalarValue::Int32(Some(42))))
+                Arc::new(
+                    phys_expr::Literal::new(
+                        ScalarValue::Int32(Some(42)),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                )
             }
         }
 

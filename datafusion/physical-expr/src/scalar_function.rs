@@ -39,6 +39,7 @@ use crate::expressions::Literal;
 use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, FieldRef, Schema};
 use datafusion_common::config::{ConfigEntry, ConfigOptions};
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::sort_properties::ExprProperties;
@@ -86,31 +87,37 @@ impl ScalarFunctionExpr {
         }
     }
 
-    /// Create a new Scalar function
+    /// Create a new Scalar function, its name and the lists it resolves its return field
+    /// with charged to `funding` before they are allocated
     pub fn try_new(
         fun: Arc<ScalarUDF>,
         args: Vec<Arc<dyn PhysicalExpr>>,
         schema: &Schema,
         config_options: Arc<ConfigOptions>,
+        funding: &Funding,
     ) -> Result<Self> {
-        let name = fun.name().to_string();
-        let arg_fields = args
-            .iter()
-            .map(|e| e.return_field(schema))
-            .collect::<Result<Vec<_>>>()?;
+        let name = funding.string(fun.name())?;
+        let mut arg_fields = funding.held::<Vec<FieldRef>>();
+        arg_fields.reserve_exact(args.len())?;
+        for e in &args {
+            arg_fields.push(e.return_field(schema)?)?;
+        }
 
         // verify that input data types is consistent with function's `TypeSignature`
         fields_with_udf(&arg_fields, fun.as_ref())?;
 
-        let arguments = args
-            .iter()
-            .map(|e| e.downcast_ref::<Literal>().map(|literal| literal.value()))
-            .collect::<Vec<_>>();
+        let mut arguments = funding.held::<Vec<Option<&ScalarValue>>>();
+        arguments.reserve_exact(args.len())?;
+        for e in &args {
+            arguments.push(e.downcast_ref::<Literal>().map(|literal| literal.value()))?;
+        }
         let ret_args = ReturnFieldArgs {
             arg_fields: &arg_fields,
             scalar_arguments: &arguments,
         };
         let return_field = fun.return_field_from_args(ret_args)?;
+        drop(arguments);
+        drop(arg_fields);
         Ok(Self {
             fun,
             name,
@@ -358,6 +365,7 @@ mod tests {
     use super::*;
     use crate::expressions::Column;
     use arrow::datatypes::Field;
+    use datafusion_common::funding::Funding;
     use datafusion_expr::{ScalarUDFImpl, Signature};
     use datafusion_physical_expr_common::physical_expr::is_volatile;
 
@@ -411,6 +419,7 @@ mod tests {
             args.clone(),
             &schema,
             Arc::clone(&config_options),
+            &Funding::default(),
         )
         .unwrap();
 
@@ -419,9 +428,14 @@ mod tests {
         assert!(is_volatile(&volatile_arc));
 
         // Test non-volatile function
-        let stable_expr =
-            ScalarFunctionExpr::try_new(stable_udf, args, &schema, config_options)
-                .unwrap();
+        let stable_expr = ScalarFunctionExpr::try_new(
+            stable_udf,
+            args,
+            &schema,
+            config_options,
+            &Funding::default(),
+        )
+        .unwrap();
 
         assert!(!stable_expr.is_volatile_node());
         let stable_arc: Arc<dyn PhysicalExpr> = Arc::new(stable_expr);

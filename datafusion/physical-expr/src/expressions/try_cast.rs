@@ -29,6 +29,7 @@ use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_K
 use compute::can_cast_types;
 use datafusion_common::datatype::DataTypeExt;
 use datafusion_common::format::DEFAULT_FORMAT_OPTIONS;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, not_impl_err};
 use datafusion_expr::ColumnarValue;
 
@@ -299,6 +300,7 @@ pub fn try_cast_with_target_field(
     expr: Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
     target_field: &FieldRef,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = expr.data_type(input_schema)?;
     let cast_type = target_field.data_type();
@@ -332,12 +334,12 @@ pub fn try_cast_with_target_field(
     // For explicit target fields, use new_with_target_field which applies the target's
     // metadata exactly.
     if is_type_only {
-        Ok(Arc::new(TryCastExpr::new(expr, cast_type.clone())))
+        Ok(funding.arc(TryCastExpr::new(expr, funding.cloned(cast_type)?))?)
     } else {
-        Ok(Arc::new(TryCastExpr::new_with_target_field(
+        Ok(funding.arc(TryCastExpr::new_with_target_field(
             expr,
             Arc::clone(target_field),
-        )))
+        ))?)
     }
 }
 

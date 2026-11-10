@@ -19,6 +19,7 @@ mod kernels;
 
 use crate::PhysicalExpr;
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
+use datafusion_common::funding::Funding;
 use std::cmp::Ordering;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -1354,8 +1355,9 @@ pub fn binary(
     op: Operator,
     rhs: Arc<dyn PhysicalExpr>,
     _input_schema: &Schema,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(BinaryExpr::new(lhs, op, rhs)))
+    Ok(funding.arc(BinaryExpr::new(lhs, op, rhs))?)
 }
 
 /// Create a similar to expression
@@ -1364,6 +1366,7 @@ pub fn similar_to(
     case_insensitive: bool,
     expr: Arc<dyn PhysicalExpr>,
     pattern: Arc<dyn PhysicalExpr>,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let binary_op = match (negated, case_insensitive) {
         (false, false) => Operator::RegexMatch,
@@ -1371,13 +1374,14 @@ pub fn similar_to(
         (true, false) => Operator::RegexNotMatch,
         (true, true) => Operator::RegexNotIMatch,
     };
-    Ok(Arc::new(BinaryExpr::new(expr, binary_op, pattern)))
+    Ok(funding.arc(BinaryExpr::new(expr, binary_op, pattern))?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::expressions::{Column, Literal, col, lit, try_cast};
+    use datafusion_common::funding::Funding;
     use datafusion_expr::lit as expr_lit;
 
     use datafusion_common::{assert_contains, plan_datafusion_err};
@@ -1569,7 +1573,7 @@ mod tests {
 
         let left_expr = try_cast(left, schema, lhs)?;
         let right_expr = try_cast(right, schema, rhs)?;
-        binary(left_expr, op, right_expr, schema)
+        binary(left_expr, op, right_expr, schema, &Funding::default())
     }
 
     #[test]
@@ -1587,6 +1591,7 @@ mod tests {
             Operator::Lt,
             col("b", &schema)?,
             &schema,
+            &Funding::default(),
         )?;
         let batch =
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])?;
@@ -1623,6 +1628,7 @@ mod tests {
                 Operator::Lt,
                 col("b", &schema)?,
                 &schema,
+                &Funding::default(),
             )?,
             Operator::Or,
             binary(
@@ -1630,8 +1636,10 @@ mod tests {
                 Operator::Eq,
                 col("b", &schema)?,
                 &schema,
+                &Funding::default(),
             )?,
             &schema,
+            &Funding::default(),
         )?;
         let batch =
             RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])?;
@@ -1676,7 +1684,7 @@ mod tests {
             let right = try_cast(col("b", &schema)?, &schema, rhs)?;
 
             // verify that we can construct the expression
-            let expression = binary(left, $OP, right, &schema)?;
+            let expression = binary(left, $OP, right, &schema, &Funding::default())?;
             let batch = RecordBatch::try_new(
                 Arc::new(schema.clone()),
                 vec![Arc::new(a), Arc::new(b)],
@@ -3380,7 +3388,7 @@ mod tests {
         literal: ScalarValue,
         expected: ArrayRef,
     ) -> Result<()> {
-        let lit = Arc::new(Literal::new(literal));
+        let lit = Arc::new(Literal::new(literal, &Funding::default()).unwrap());
         let arithmetic_op = binary_op(col("a", &schema)?, op, lit, &schema)?;
         let batch = RecordBatch::try_new(schema, data)?;
         let result = arithmetic_op
@@ -3624,7 +3632,13 @@ mod tests {
 
         let evaluate =
             |schema: &SchemaRef, array: &ArrayRef, op: Operator| -> Result<ArrayRef> {
-                let expr = binary(col("a", schema)?, op, lit(pattern.clone()), schema)?;
+                let expr = binary(
+                    col("a", schema)?,
+                    op,
+                    lit(pattern.clone()),
+                    schema,
+                    &Funding::default(),
+                )?;
                 let batch =
                     RecordBatch::try_new(Arc::clone(schema), vec![Arc::clone(array)])?;
                 Ok(expr
@@ -3692,6 +3706,7 @@ mod tests {
             Operator::RegexMatch,
             col("b", &schema)?,
             &schema,
+            &Funding::default(),
         )?;
         let batch = RecordBatch::try_new(Arc::new(schema), vec![a, b])?;
         let err = expr.evaluate(&batch).unwrap_err();
@@ -4215,7 +4230,9 @@ mod tests {
         let tree_depth: i32 = 100;
         let expr = (0..tree_depth)
             .map(|_| col("a", schema.as_ref()).unwrap())
-            .reduce(|l, r| binary(l, Operator::Plus, r, &schema).unwrap())
+            .reduce(|l, r| {
+                binary(l, Operator::Plus, r, &schema, &Funding::default()).unwrap()
+            })
             .unwrap();
 
         let result = expr
@@ -5343,6 +5360,7 @@ mod tests {
             case_insensitive,
             col("a", schema)?,
             col("b", schema)?,
+            &Funding::default(),
         )?;
         let batch =
             RecordBatch::try_new(Arc::clone(schema), vec![Arc::new(a), Arc::new(b)])?;

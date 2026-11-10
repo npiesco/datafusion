@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::hint::black_box;
 use std::ops::Range;
 use std::slice;
@@ -48,8 +49,9 @@ fn create_evaluator(
         NthValueKind::First => (NthValue::first(), vec![expr]),
         NthValueKind::Last => (NthValue::last(), vec![expr]),
         NthValueKind::Nth => {
-            let n_value =
-                Arc::new(Literal::new(ScalarValue::Int64(n))) as Arc<dyn PhysicalExpr>;
+            let n_value = Arc::new(
+                Literal::new(ScalarValue::Int64(n), &Funding::default()).unwrap(),
+            ) as Arc<dyn PhysicalExpr>;
             (NthValue::nth(), vec![expr, n_value])
         }
     };

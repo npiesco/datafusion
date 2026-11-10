@@ -1988,7 +1988,10 @@ mod tests {
             &nth_value_udwf(),
             &[
                 Arc::clone(&col_a),
-                Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int32(Some(1)), &Funding::default())
+                        .unwrap(),
+                ),
             ],
             &schema,
             "nth_value(-1)".to_string(),
@@ -2000,7 +2003,10 @@ mod tests {
             &nth_value_udwf(),
             &[
                 Arc::clone(&col_a),
-                Arc::new(Literal::new(ScalarValue::Int32(Some(2)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int32(Some(2)), &Funding::default())
+                        .unwrap(),
+                ),
             ],
             &schema,
             "nth_value(-2)".to_string(),

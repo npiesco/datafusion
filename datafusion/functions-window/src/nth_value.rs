@@ -557,6 +557,7 @@ mod tests {
     use super::*;
     use arrow::array::*;
     use datafusion_common::cast::as_int32_array;
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr::expressions::{Column, Literal};
 
     fn test_i32_result(
@@ -626,8 +627,9 @@ mod tests {
     #[test]
     fn nth_value_1() -> Result<()> {
         let expr = Arc::new(Column::new("c3", 0)) as Arc<dyn PhysicalExpr>;
-        let n_value =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))) as Arc<dyn PhysicalExpr>;
+        let n_value = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(1)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
 
         test_i32_result(
             NthValue::nth(),
@@ -645,8 +647,9 @@ mod tests {
     #[test]
     fn nth_value_2() -> Result<()> {
         let expr = Arc::new(Column::new("c3", 0)) as Arc<dyn PhysicalExpr>;
-        let n_value =
-            Arc::new(Literal::new(ScalarValue::Int32(Some(2)))) as Arc<dyn PhysicalExpr>;
+        let n_value = Arc::new(
+            Literal::new(ScalarValue::Int32(Some(2)), &Funding::default()).unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
 
         test_i32_result(
             NthValue::nth(),
@@ -673,8 +676,10 @@ mod tests {
     #[test]
     fn nth_value_i64_min_returns_error() {
         let expr = Arc::new(Column::new("c3", 0)) as Arc<dyn PhysicalExpr>;
-        let n_value = Arc::new(Literal::new(ScalarValue::Int64(Some(i64::MIN))))
-            as Arc<dyn PhysicalExpr>;
+        let n_value = Arc::new(
+            Literal::new(ScalarValue::Int64(Some(i64::MIN)), &Funding::default())
+                .unwrap(),
+        ) as Arc<dyn PhysicalExpr>;
 
         let err = NthValue::nth()
             .partition_evaluator(PartitionEvaluatorArgs::new(

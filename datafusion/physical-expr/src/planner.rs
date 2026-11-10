@@ -15,8 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
+use crate::projection::funded_column;
 use crate::scalar_subquery::ScalarSubqueryExpr;
 use crate::{HigherOrderFunctionExpr, ScalarFunctionExpr};
 use crate::{
@@ -26,7 +28,6 @@ use crate::{
 
 use arrow::datatypes::Schema;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::datatype::FieldExt;
 use datafusion_common::metadata::FieldMetadata;
 use datafusion_common::{
     DFSchema, Result, ScalarValue, TableReference, ToDFSchema, exec_err,
@@ -40,9 +41,7 @@ use datafusion_expr::expr::{
 use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::var_provider::VarType;
 use datafusion_expr::var_provider::is_system_variables;
-use datafusion_expr::{
-    Between, BinaryExpr, Expr, Like, Operator, TryCast, binary_expr, lit,
-};
+use datafusion_expr::{Between, BinaryExpr, Expr, Like, Operator, TryCast};
 
 /// [PhysicalExpr] evaluate DataFusion expressions such as `A + 1`, or `CAST(c1
 /// AS int)`.
@@ -75,7 +74,13 @@ use datafusion_expr::{
 /// // We can now create a PhysicalExpr. Expressions with no scalar
 /// // subqueries use an empty `PhysicalPlanningContext`:
 /// let physical_expr =
-///     create_physical_expr(&expr, &df_schema, &props, &PhysicalPlanningContext::default())
+///     create_physical_expr(
+///         &expr,
+///         &df_schema,
+///         &props,
+///         &PhysicalPlanningContext::default(),
+///         &datafusion_common::funding::Funding::default(),
+///     )
 ///         .unwrap();
 /// ```
 ///
@@ -95,7 +100,13 @@ use datafusion_expr::{
 /// # let props = ExecutionProps::new();
 /// // Given a PhysicalExpr, for `a = 1` we can evaluate it against a RecordBatch like this:
 /// let physical_expr =
-///     create_physical_expr(&expr, &df_schema, &props, &PhysicalPlanningContext::default())
+///     create_physical_expr(
+///         &expr,
+///         &df_schema,
+///         &props,
+///         &PhysicalPlanningContext::default(),
+///         &datafusion_common::funding::Funding::default(),
+///     )
 ///         .unwrap();
 /// // Input of [1,2,3]
 /// let input_batch = RecordBatch::try_from_iter(vec![
@@ -129,14 +140,35 @@ use datafusion_expr::{
 ///   physical expressions outside of physical planning should pass
 ///   `&PhysicalPlanningContext::default()`; converting a scalar subquery then returns a
 ///   planning error.
+/// * `funding` - What the expression allocates is charged to it before it allocates;
+///   the expression returned keeps what was charged for it. A charge refused fails the
+///   conversion. Pass `&Funding::default()` outside of planning.
 #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
 pub fn create_physical_expr(
     e: &Expr,
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let input_schema = input_dfschema.as_arrow();
+    let create = |expr: &Expr| {
+        create_physical_expr(expr, input_dfschema, execution_props, planning_ctx, funding)
+    };
+    let create_all = |exprs: &[Expr]| {
+        create_physical_exprs(
+            exprs,
+            input_dfschema,
+            execution_props,
+            planning_ctx,
+            funding,
+        )
+    };
+    let truth_test = |expr: &Expr, op: Operator, value: Option<bool>| {
+        let lhs = create(expr)?;
+        let rhs = funding.arc(Literal::new(ScalarValue::Boolean(value), funding)?)?;
+        binary(lhs, op, rhs, input_schema, funding)
+    };
 
     match e {
         Expr::Alias(Alias { expr, metadata, .. }) => {
@@ -145,132 +177,51 @@ pub fn create_physical_expr(
                     prior_metadata.as_ref(),
                     metadata.as_ref(),
                 );
-                Ok(Arc::new(Literal::new_with_metadata(
-                    v.clone(),
+                Ok(funding.arc(Literal::new_with_metadata(
+                    funding.cloned(v)?,
                     new_metadata,
-                )))
+                    funding,
+                )?)?)
             } else {
-                Ok(create_physical_expr(
-                    expr,
-                    input_dfschema,
-                    execution_props,
-                    planning_ctx,
-                )?)
+                create(expr)
             }
         }
         Expr::Column(c) => {
             let idx = input_dfschema.index_of_column(c)?;
-            Ok(Arc::new(Column::new(&c.name, idx)))
+            funded_column(&c.name, idx, funding)
         }
-        Expr::Literal(value, metadata) => Ok(Arc::new(Literal::new_with_metadata(
-            value.clone(),
-            metadata.clone(),
-        ))),
+        Expr::Literal(value, metadata) => Ok(funding.arc(Literal::new_with_metadata(
+            funding.cloned(value)?,
+            funding.cloned(metadata)?,
+            funding,
+        )?)?),
         Expr::ScalarVariable(_, variable_names) => {
-            if is_system_variables(variable_names) {
-                match execution_props.get_var_provider(VarType::System) {
-                    Some(provider) => {
-                        let scalar_value = provider.get_value(variable_names.clone())?;
-                        Ok(Arc::new(Literal::new(scalar_value)))
-                    }
-                    _ => plan_err!("No system variable provider found"),
-                }
+            let system = is_system_variables(variable_names);
+            let var_type = if system {
+                VarType::System
             } else {
-                match execution_props.get_var_provider(VarType::UserDefined) {
-                    Some(provider) => {
-                        let scalar_value = provider.get_value(variable_names.clone())?;
-                        Ok(Arc::new(Literal::new(scalar_value)))
-                    }
-                    _ => plan_err!("No user defined variable provider found"),
+                VarType::UserDefined
+            };
+            match execution_props.get_var_provider(var_type) {
+                Some(provider) => {
+                    let scalar_value =
+                        provider.get_value(funding.cloned(variable_names)?)?;
+                    Ok(funding.arc(Literal::new(scalar_value, funding)?)?)
                 }
+                None if system => plan_err!("No system variable provider found"),
+                None => plan_err!("No user defined variable provider found"),
             }
         }
-        Expr::IsTrue(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsNotDistinctFrom,
-                lit(true),
-            );
-            create_physical_expr(
-                &binary_op,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )
-        }
-        Expr::IsNotTrue(expr) => {
-            let binary_op =
-                binary_expr(expr.as_ref().clone(), Operator::IsDistinctFrom, lit(true));
-            create_physical_expr(
-                &binary_op,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )
-        }
-        Expr::IsFalse(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsNotDistinctFrom,
-                lit(false),
-            );
-            create_physical_expr(
-                &binary_op,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )
-        }
-        Expr::IsNotFalse(expr) => {
-            let binary_op =
-                binary_expr(expr.as_ref().clone(), Operator::IsDistinctFrom, lit(false));
-            create_physical_expr(
-                &binary_op,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )
-        }
-        Expr::IsUnknown(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsNotDistinctFrom,
-                Expr::Literal(ScalarValue::Boolean(None), None),
-            );
-            create_physical_expr(
-                &binary_op,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )
-        }
-        Expr::IsNotUnknown(expr) => {
-            let binary_op = binary_expr(
-                expr.as_ref().clone(),
-                Operator::IsDistinctFrom,
-                Expr::Literal(ScalarValue::Boolean(None), None),
-            );
-            create_physical_expr(
-                &binary_op,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )
-        }
+        Expr::IsTrue(expr) => truth_test(expr, Operator::IsNotDistinctFrom, Some(true)),
+        Expr::IsNotTrue(expr) => truth_test(expr, Operator::IsDistinctFrom, Some(true)),
+        Expr::IsFalse(expr) => truth_test(expr, Operator::IsNotDistinctFrom, Some(false)),
+        Expr::IsNotFalse(expr) => truth_test(expr, Operator::IsDistinctFrom, Some(false)),
+        Expr::IsUnknown(expr) => truth_test(expr, Operator::IsNotDistinctFrom, None),
+        Expr::IsNotUnknown(expr) => truth_test(expr, Operator::IsDistinctFrom, None),
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
             // Create physical expressions for left and right operands
-            let lhs = create_physical_expr(
-                left,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            let rhs = create_physical_expr(
-                right,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
+            let lhs = create(left)?;
+            let rhs = create(right)?;
             // Note that the logical planner is responsible
             // for type coercion on the arguments (e.g. if one
             // argument was originally Int32 and one was
@@ -278,7 +229,7 @@ pub fn create_physical_expr(
             //
             // There should be no coercion during physical
             // planning.
-            binary(lhs, *op, rhs, input_schema)
+            binary(lhs, *op, rhs, input_schema, funding)
         }
         Expr::Like(Like {
             negated,
@@ -293,24 +244,15 @@ pub fn create_physical_expr(
                     "LIKE does not support escape_char other than the backslash (\\)"
                 );
             }
-            let physical_expr = create_physical_expr(
-                expr,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            let physical_pattern = create_physical_expr(
-                pattern,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
+            let physical_expr = create(expr)?;
+            let physical_pattern = create(pattern)?;
             like(
                 *negated,
                 *case_insensitive,
                 physical_expr,
                 physical_pattern,
                 input_schema,
+                funding,
             )
         }
         Expr::SimilarTo(Like {
@@ -323,125 +265,62 @@ pub fn create_physical_expr(
             if escape_char.is_some() {
                 return exec_err!("SIMILAR TO does not support escape_char yet");
             }
-            let physical_expr = create_physical_expr(
-                expr,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            let physical_pattern = create_physical_expr(
-                pattern,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            similar_to(*negated, *case_insensitive, physical_expr, physical_pattern)
+            let physical_expr = create(expr)?;
+            let physical_pattern = create(pattern)?;
+            similar_to(
+                *negated,
+                *case_insensitive,
+                physical_expr,
+                physical_pattern,
+                funding,
+            )
         }
         Expr::Case(case) => {
-            let expr: Option<Arc<dyn PhysicalExpr>> = if let Some(e) = &case.expr {
-                Some(create_physical_expr(
-                    e.as_ref(),
-                    input_dfschema,
-                    execution_props,
-                    planning_ctx,
-                )?)
-            } else {
-                None
-            };
-            let (when_expr, then_expr): (Vec<&Expr>, Vec<&Expr>) = case
-                .when_then_expr
-                .iter()
-                .map(|(w, t)| (w.as_ref(), t.as_ref()))
-                .unzip();
-            let when_expr = create_physical_exprs(
-                when_expr,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            let then_expr = create_physical_exprs(
-                then_expr,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            let when_then_expr: Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)> =
-                when_expr
-                    .iter()
-                    .zip(then_expr.iter())
-                    .map(|(w, t)| (Arc::clone(w), Arc::clone(t)))
-                    .collect();
-            let else_expr: Option<Arc<dyn PhysicalExpr>> =
-                if let Some(e) = &case.else_expr {
-                    Some(create_physical_expr(
-                        e.as_ref(),
-                        input_dfschema,
-                        execution_props,
-                        planning_ctx,
-                    )?)
-                } else {
-                    None
-                };
-            Ok(expressions::case(expr, when_then_expr, else_expr)?)
+            let expr = case.expr.as_deref().map(create).transpose()?;
+            let mut when_then_expr =
+                funding.held::<Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>>();
+            when_then_expr.reserve_exact(case.when_then_expr.len())?;
+            for (when, then) in &case.when_then_expr {
+                when_then_expr.push((create(when)?, create(then)?))?;
+            }
+            let else_expr = case.else_expr.as_deref().map(create).transpose()?;
+            expressions::case(expr, when_then_expr.keep(), else_expr, funding)
         }
         Expr::Cast(Cast { expr, field }) => expressions::cast_with_target_field(
-            create_physical_expr(expr, input_dfschema, execution_props, planning_ctx)?,
+            create(expr)?,
             input_schema,
             field,
             None,
+            funding,
         ),
         Expr::TryCast(TryCast { expr, field }) => {
             expressions::try_cast_with_target_field(
-                create_physical_expr(
-                    expr,
-                    input_dfschema,
-                    execution_props,
-                    planning_ctx,
-                )?,
+                create(expr)?,
                 input_schema,
                 field,
+                funding,
             )
         }
-        Expr::Not(expr) => expressions::not(create_physical_expr(
-            expr,
-            input_dfschema,
-            execution_props,
-            planning_ctx,
-        )?),
-        Expr::Negative(expr) => expressions::negative(
-            create_physical_expr(expr, input_dfschema, execution_props, planning_ctx)?,
-            input_schema,
-        ),
-        Expr::IsNull(expr) => expressions::is_null(create_physical_expr(
-            expr,
-            input_dfschema,
-            execution_props,
-            planning_ctx,
-        )?),
-        Expr::IsNotNull(expr) => expressions::is_not_null(create_physical_expr(
-            expr,
-            input_dfschema,
-            execution_props,
-            planning_ctx,
-        )?),
+        Expr::Not(expr) => expressions::not(create(expr)?, funding),
+        Expr::Negative(expr) => {
+            expressions::negative(create(expr)?, input_schema, funding)
+        }
+        Expr::IsNull(expr) => expressions::is_null(create(expr)?, funding),
+        Expr::IsNotNull(expr) => expressions::is_not_null(create(expr)?, funding),
         Expr::ScalarFunction(ScalarFunction { func, args }) => {
-            let physical_args = create_physical_exprs(
-                args,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
+            let physical_args = create_all(args)?;
             let config_options = match execution_props.config_options.as_ref() {
                 Some(config_options) => Arc::clone(config_options),
-                None => Arc::new(ConfigOptions::default()),
+                None => funding.arc(ConfigOptions::default())?,
             };
 
-            Ok(Arc::new(ScalarFunctionExpr::try_new(
+            Ok(funding.arc(ScalarFunctionExpr::try_new(
                 Arc::clone(func),
                 physical_args,
                 input_schema,
                 config_options,
-            )?))
+                funding,
+            )?)?)
         }
         Expr::Between(Between {
             expr,
@@ -449,20 +328,9 @@ pub fn create_physical_expr(
             low,
             high,
         }) => {
-            let value_expr = create_physical_expr(
-                expr,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
-            let low_expr =
-                create_physical_expr(low, input_dfschema, execution_props, planning_ctx)?;
-            let high_expr = create_physical_expr(
-                high,
-                input_dfschema,
-                execution_props,
-                planning_ctx,
-            )?;
+            let value_expr = create(expr)?;
+            let low_expr = create(low)?;
+            let high_expr = create(high)?;
 
             // rewrite the between into the two binary operators
             let binary_expr = binary(
@@ -471,6 +339,7 @@ pub fn create_physical_expr(
                     Operator::GtEq,
                     low_expr,
                     input_schema,
+                    funding,
                 )?,
                 Operator::And,
                 binary(
@@ -478,14 +347,16 @@ pub fn create_physical_expr(
                     Operator::LtEq,
                     high_expr,
                     input_schema,
+                    funding,
                 )?,
                 input_schema,
-            );
+                funding,
+            )?;
 
             if *negated {
-                expressions::not(binary_expr?)
+                expressions::not(binary_expr, funding)
             } else {
-                binary_expr
+                Ok(binary_expr)
             }
         }
         Expr::InList(InList {
@@ -494,23 +365,18 @@ pub fn create_physical_expr(
             negated,
         }) => match expr.as_ref() {
             Expr::Literal(ScalarValue::Utf8(None), _) => {
-                Ok(expressions::lit(ScalarValue::Boolean(None)))
+                Ok(funding.arc(Literal::new(ScalarValue::Boolean(None), funding)?)?)
             }
             _ => {
-                let value_expr = create_physical_expr(
-                    expr,
-                    input_dfschema,
-                    execution_props,
-                    planning_ctx,
-                )?;
-
-                let list_exprs = create_physical_exprs(
-                    list,
-                    input_dfschema,
-                    execution_props,
-                    planning_ctx,
-                )?;
-                expressions::in_list(value_expr, list_exprs, negated, input_schema)
+                let value_expr = create(expr)?;
+                let list_exprs = create_all(list)?;
+                expressions::in_list(
+                    value_expr,
+                    list_exprs,
+                    negated,
+                    input_schema,
+                    funding,
+                )
             }
         },
         Expr::ScalarSubquery(sq) => {
@@ -523,14 +389,14 @@ pub fn create_physical_expr(
                             schema.fields().len()
                         );
                     }
-                    let dt = schema.field(0).data_type().clone();
+                    let dt = funding.cloned(schema.field(0).data_type())?;
                     let nullable = schema.field(0).is_nullable();
-                    Ok(Arc::new(ScalarSubqueryExpr::new(
+                    Ok(funding.arc(ScalarSubqueryExpr::new(
                         dt,
                         nullable,
                         index,
                         planning_ctx.results().clone(),
-                    )))
+                    ))?)
                 }
                 None => {
                     // Not found: either a correlated subquery that wasn't
@@ -572,33 +438,42 @@ pub fn create_physical_expr(
                 .max()
                 .unwrap_or_default();
 
-            let qualifier = TableReference::bare(format!("lambda_{lambda_qualifier}"));
+            let qualifier_name =
+                funding.format(format_args!("lambda_{lambda_qualifier}"))?;
+            let qualifier_table = funding.arc_str(&qualifier_name);
+            funding.released(qualifier_name);
+            let qualifier = TableReference::bare(qualifier_table?);
 
-            let physical_args = args
-                .iter()
-                .map(|arg| match arg {
+            let mut physical_args = funding.held::<Vec<Arc<dyn PhysicalExpr>>>();
+            physical_args.reserve_exact(args.len())?;
+            for arg in args {
+                let physical_arg = match arg {
                     Expr::Lambda(lambda) => {
-                        let lambda_parameters = lambda_parameters
-                            .next()
-                            .ok_or_else(|| {
+                        let lambda_parameters =
+                            lambda_parameters.next().ok_or_else(|| {
                                 internal_datafusion_err!(
                                     "lambda_parameters len should have been checked above"
                                 )
-                            })?
-                            .into_iter()
-                            .zip(&lambda.params)
-                            .map(|(field, name)| {
-                                (Some(qualifier.clone()), field.renamed(name.as_str()))
-                            });
+                            })?;
 
-                        let new_fields = input_dfschema
-                            .iter()
-                            .map(|(tbl, field)| (tbl.cloned(), Arc::clone(field)))
-                            .chain(lambda_parameters)
-                            .collect();
+                        let mut new_fields = funding.held::<Vec<_>>();
+                        new_fields.reserve_exact(
+                            input_dfschema.fields().len() + lambda.params.len(),
+                        )?;
+                        for (tbl, field) in input_dfschema.iter() {
+                            new_fields.push((tbl.cloned(), Arc::clone(field)))?;
+                        }
+                        for (field, name) in
+                            lambda_parameters.into_iter().zip(&lambda.params)
+                        {
+                            new_fields.push((
+                                Some(qualifier.clone()),
+                                funding.renamed_field(field, name)?,
+                            ))?;
+                        }
 
                         let lambda_schema = DFSchema::new_with_metadata(
-                            new_fields,
+                            new_fields.keep(),
                             input_dfschema.metadata().clone(),
                         )?;
 
@@ -611,33 +486,30 @@ pub fn create_physical_expr(
                             &lambda_schema,
                             execution_props,
                             &planning_ctx,
-                        )
+                            funding,
+                        )?
                     }
-                    _ => create_physical_expr(
-                        arg,
-                        input_dfschema,
-                        execution_props,
-                        planning_ctx,
-                    ),
-                })
-                .collect::<Result<_>>()?;
+                    _ => create(arg)?,
+                };
+                physical_args.push(physical_arg)?;
+            }
 
             let config_options = match execution_props.config_options.as_ref() {
                 Some(config_options) => Arc::clone(config_options),
-                None => Arc::new(ConfigOptions::default()),
+                None => funding.arc(ConfigOptions::default())?,
             };
 
-            Ok(Arc::new(HigherOrderFunctionExpr::try_new_with_schema(
+            Ok(funding.arc(HigherOrderFunctionExpr::try_new_with_schema(
                 Arc::clone(func),
-                physical_args,
+                physical_args.keep(),
                 input_schema,
                 config_options,
-            )?))
+                funding,
+            )?)?)
         }
-        Expr::Lambda(Lambda { params, body }) => expressions::lambda(
-            params,
-            create_physical_expr(body, input_dfschema, execution_props, planning_ctx)?,
-        ),
+        Expr::Lambda(Lambda { params, body }) => {
+            expressions::lambda(params, create(body)?, funding)
+        }
         Expr::LambdaVariable(LambdaVariable {
             name,
             field,
@@ -673,7 +545,7 @@ pub fn create_physical_expr(
             // of checking property by property and fail if new properties get's added to it.
             // While not necessary, the sql planner does create lambda vars with matching names,
             // so this shouldn't allocate with a lambda var from it
-            let renamed_field = Arc::clone(field).renamed(name);
+            let renamed_field = funding.renamed_field(Arc::clone(field), name)?;
 
             if &renamed_field != schema_field {
                 return plan_err!(
@@ -683,10 +555,10 @@ pub fn create_physical_expr(
                 );
             }
 
-            Ok(Arc::new(expressions::LambdaVariable::new(
+            Ok(funding.arc(expressions::LambdaVariable::new(
                 index,
                 Arc::clone(schema_field),
-            )))
+            ))?)
         }
         other => {
             not_impl_err!("Physical plan does not support logical expression {other:?}")
@@ -694,7 +566,8 @@ pub fn create_physical_expr(
     }
 }
 
-/// Create vector of Physical Expression from a vector of logical expression
+/// Create vector of Physical Expression from a vector of logical expression, the list
+/// and what each expression allocates charged to `funding` first
 ///
 /// See [`create_physical_expr`] for details on the `planning_ctx` argument.
 pub fn create_physical_exprs<'a, I>(
@@ -702,16 +575,24 @@ pub fn create_physical_exprs<'a, I>(
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<Vec<Arc<dyn PhysicalExpr>>>
 where
     I: IntoIterator<Item = &'a Expr>,
 {
-    exprs
-        .into_iter()
-        .map(|expr| {
-            create_physical_expr(expr, input_dfschema, execution_props, planning_ctx)
-        })
-        .collect()
+    let exprs = exprs.into_iter();
+    let mut physical = funding.held::<Vec<_>>();
+    physical.reserve_exact(exprs.size_hint().0)?;
+    for expr in exprs {
+        physical.push(create_physical_expr(
+            expr,
+            input_dfschema,
+            execution_props,
+            planning_ctx,
+            funding,
+        )?)?;
+    }
+    Ok(physical.keep())
 }
 
 /// Convert a logical expression to a physical expression (without any simplification, etc)
@@ -724,6 +605,7 @@ pub fn logical2physical(expr: &Expr, schema: &Schema) -> Arc<dyn PhysicalExpr> {
         &df_schema,
         &execution_props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )
     .unwrap()
 }
@@ -733,7 +615,8 @@ mod tests {
     use arrow::array::{ArrayRef, BooleanArray, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field};
     use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
-    use datafusion_expr::col;
+    use datafusion_common::funding::Funding;
+    use datafusion_expr::{col, lit};
 
     use super::*;
 
@@ -748,6 +631,7 @@ mod tests {
             &df_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )
     }
 
@@ -776,6 +660,7 @@ mod tests {
             &df_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?;
 
         let batch = RecordBatch::try_new(
@@ -988,6 +873,7 @@ mod tests {
             &df_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?;
 
         Ok(())

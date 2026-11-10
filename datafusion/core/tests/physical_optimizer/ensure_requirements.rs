@@ -446,7 +446,9 @@ fn test_filter_over_multi_partition_sort_limit() {
     let source = Arc::new(MockMultiPartitionExec::new(16));
 
     // Simple always-true filter
-    let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(true))));
+    let predicate = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(true)), &Funding::default()).unwrap(),
+    );
     let filter = Arc::new(
         FilterExec::try_new(predicate, source as _, &Funding::default()).unwrap(),
     );

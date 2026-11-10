@@ -1402,7 +1402,9 @@ mod tests {
         let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
             Arc::new(PhysColumn::new("a", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(900)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(900)), &Funding::default()).unwrap(),
+            ),
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, source, &Funding::default())?);
@@ -1704,11 +1706,17 @@ mod tests {
             ],
             vec![
                 (
-                    Arc::new(Literal::new(ScalarValue::Int32(None))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Int32(None), &Funding::default())
+                            .unwrap(),
+                    ),
                     "c0".to_string(),
                 ),
                 (
-                    Arc::new(Literal::new(ScalarValue::Int32(None))),
+                    Arc::new(
+                        Literal::new(ScalarValue::Int32(None), &Funding::default())
+                            .unwrap(),
+                    ),
                     "c1".to_string(),
                 ),
             ],

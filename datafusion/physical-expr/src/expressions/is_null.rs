@@ -22,6 +22,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::ColumnarValue;
 use std::hash::Hash;
@@ -143,8 +144,11 @@ impl IsNullExpr {
 }
 
 /// Create an IS NULL expression
-pub fn is_null(arg: Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(IsNullExpr::new(arg)))
+pub fn is_null(
+    arg: Arc<dyn PhysicalExpr>,
+    funding: &Funding,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    Ok(funding.arc(IsNullExpr::new(arg))?)
 }
 
 #[cfg(test)]
@@ -157,6 +161,7 @@ mod tests {
     use arrow::buffer::ScalarBuffer;
     use arrow::datatypes::*;
     use datafusion_common::cast::as_boolean_array;
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     #[test]
@@ -165,7 +170,7 @@ mod tests {
         let a = StringArray::from(vec![Some("foo"), None]);
 
         // expression: "a is null"
-        let expr = is_null(col("a", &schema)?).unwrap();
+        let expr = is_null(col("a", &schema)?, &Funding::default()).unwrap();
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)])?;
 
         let result = expr
@@ -253,7 +258,7 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
 
         // expression: "a is null"
-        let expr = is_null(col("a", &schema)?).unwrap();
+        let expr = is_null(col("a", &schema)?, &Funding::default()).unwrap();
         let display_string = expr.to_string();
         assert_eq!(display_string, "a@0 IS NULL");
         let sql_string = fmt_sql(expr.as_ref()).to_string();

@@ -74,6 +74,7 @@ impl<'a> TreeNodeRewriter for PhysicalColumnRewriter<'a> {
 mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::funding::Funding;
     use datafusion_common::{Result, tree_node::TreeNode};
     use datafusion_physical_expr::{
         PhysicalExpr,
@@ -103,18 +104,38 @@ mod tests {
         let col_d = col("d", schema).unwrap();
         let col_e = col("e", schema).unwrap();
 
-        let add_expr =
-            binary(col_a, datafusion_expr::Operator::Plus, col_b, schema).unwrap();
-        let sub_expr =
-            binary(col_c, datafusion_expr::Operator::Minus, col_d, schema).unwrap();
+        let add_expr = binary(
+            col_a,
+            datafusion_expr::Operator::Plus,
+            col_b,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap();
+        let sub_expr = binary(
+            col_c,
+            datafusion_expr::Operator::Minus,
+            col_d,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap();
         let mul_expr = binary(
             add_expr,
             datafusion_expr::Operator::Multiply,
             sub_expr,
             schema,
+            &Funding::default(),
         )
         .unwrap();
-        binary(mul_expr, datafusion_expr::Operator::Plus, col_e, schema).unwrap()
+        binary(
+            mul_expr,
+            datafusion_expr::Operator::Plus,
+            col_e,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap()
     }
 
     /// Helper function to create a deeply nested expression
@@ -126,13 +147,38 @@ mod tests {
         let col_d = col("d", schema).unwrap();
         let col_e = col("e", schema).unwrap();
 
-        let inner1 =
-            binary(col_d, datafusion_expr::Operator::Plus, col_e, schema).unwrap();
-        let inner2 =
-            binary(col_c, datafusion_expr::Operator::Plus, inner1, schema).unwrap();
-        let inner3 =
-            binary(col_b, datafusion_expr::Operator::Plus, inner2, schema).unwrap();
-        binary(col_a, datafusion_expr::Operator::Plus, inner3, schema).unwrap()
+        let inner1 = binary(
+            col_d,
+            datafusion_expr::Operator::Plus,
+            col_e,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap();
+        let inner2 = binary(
+            col_c,
+            datafusion_expr::Operator::Plus,
+            inner1,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap();
+        let inner3 = binary(
+            col_b,
+            datafusion_expr::Operator::Plus,
+            inner2,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap();
+        binary(
+            col_a,
+            datafusion_expr::Operator::Plus,
+            inner3,
+            schema,
+            &Funding::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -186,6 +232,7 @@ mod tests {
             datafusion_expr::Operator::Plus,
             col("new_col", &schema).unwrap(),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
         column_map.insert(
@@ -249,6 +296,7 @@ mod tests {
             datafusion_expr::Operator::Plus,
             col("b", &schema).unwrap(),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -305,6 +353,7 @@ mod tests {
             datafusion_expr::Operator::Multiply,
             col("a", &schema).unwrap(),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
         let middle_expr = binary(
@@ -312,6 +361,7 @@ mod tests {
             datafusion_expr::Operator::Plus,
             lit(3i32),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
         let complex_replacement = binary(
@@ -319,6 +369,7 @@ mod tests {
             datafusion_expr::Operator::Minus,
             col("another_col", &schema).unwrap(),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -339,6 +390,7 @@ mod tests {
             datafusion_expr::Operator::Plus,
             col("b", &schema).unwrap(),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -371,6 +423,7 @@ mod tests {
             datafusion_expr::Operator::Plus,
             col("b", &schema).unwrap(),
             &schema,
+            &Funding::default(),
         )
         .unwrap();
 

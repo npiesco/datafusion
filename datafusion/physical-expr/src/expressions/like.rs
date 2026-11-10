@@ -18,6 +18,7 @@
 use crate::PhysicalExpr;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, assert_or_internal_err};
 use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr_common::datum::apply_cmp;
@@ -221,6 +222,7 @@ pub fn like(
     expr: Arc<dyn PhysicalExpr>,
     pattern: Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let expr_type = &expr.data_type(input_schema)?;
     let pattern_type = &pattern.data_type(input_schema)?;
@@ -228,12 +230,7 @@ pub fn like(
         expr_type.eq(pattern_type) || can_like_type(expr_type),
         "The type of {expr_type} AND {pattern_type} of like physical should be same"
     );
-    Ok(Arc::new(LikeExpr::new(
-        negated,
-        case_insensitive,
-        expr,
-        pattern,
-    )))
+    Ok(funding.arc(LikeExpr::new(negated, case_insensitive, expr, pattern))?)
 }
 
 #[cfg(test)]
@@ -243,6 +240,7 @@ mod test {
     use arrow::array::*;
     use arrow::datatypes::Field;
     use datafusion_common::cast::as_boolean_array;
+    use datafusion_common::funding::Funding;
     use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
     macro_rules! test_like {
@@ -260,6 +258,7 @@ mod test {
                 col("a", &schema)?,
                 col("b", &schema)?,
                 &schema,
+                &Funding::default(),
             )?;
             let batch = RecordBatch::try_new(
                 Arc::new(schema.clone()),
@@ -329,6 +328,7 @@ mod test {
             col("a", &schema)?,
             col("b", &schema)?,
             &schema,
+            &Funding::default(),
         )?;
 
         // Display format

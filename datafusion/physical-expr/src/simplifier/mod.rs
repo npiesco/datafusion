@@ -99,6 +99,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, Field};
     use datafusion_common::ScalarValue;
+    use datafusion_common::funding::Funding;
     use datafusion_expr::Operator;
 
     fn test_schema() -> Schema {
@@ -386,10 +387,22 @@ mod tests {
             lit(ScalarValue::Int32(Some(2))),
             lit(ScalarValue::Int32(Some(3))),
         ];
-        let in_list_expr = in_list(col("c", &schema)?, list.clone(), &false, &schema)?;
+        let in_list_expr = in_list(
+            col("c", &schema)?,
+            list.clone(),
+            &false,
+            &schema,
+            &Funding::default(),
+        )?;
         let not_in: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(in_list_expr));
 
-        let expected = in_list(col("c", &schema)?, list, &true, &schema)?;
+        let expected = in_list(
+            col("c", &schema)?,
+            list,
+            &true,
+            &schema,
+            &Funding::default(),
+        )?;
         assert_not_simplify(&simplifier, not_in, expected);
 
         Ok(())
@@ -406,10 +419,22 @@ mod tests {
             lit(ScalarValue::Int32(Some(2))),
             lit(ScalarValue::Int32(Some(3))),
         ];
-        let not_in_list_expr = in_list(col("c", &schema)?, list.clone(), &true, &schema)?;
+        let not_in_list_expr = in_list(
+            col("c", &schema)?,
+            list.clone(),
+            &true,
+            &schema,
+            &Funding::default(),
+        )?;
         let not_not_in: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(not_in_list_expr));
 
-        let expected = in_list(col("c", &schema)?, list, &false, &schema)?;
+        let expected = in_list(
+            col("c", &schema)?,
+            list,
+            &false,
+            &schema,
+            &Funding::default(),
+        )?;
         assert_not_simplify(&simplifier, not_not_in, expected);
 
         Ok(())
@@ -426,11 +451,23 @@ mod tests {
             lit(ScalarValue::Int32(Some(2))),
             lit(ScalarValue::Int32(Some(3))),
         ];
-        let in_list_expr = in_list(col("c", &schema)?, list.clone(), &false, &schema)?;
+        let in_list_expr = in_list(
+            col("c", &schema)?,
+            list.clone(),
+            &false,
+            &schema,
+            &Funding::default(),
+        )?;
         let not_in = Arc::new(NotExpr::new(in_list_expr));
         let double_not: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(not_in));
 
-        let expected = in_list(col("c", &schema)?, list, &false, &schema)?;
+        let expected = in_list(
+            col("c", &schema)?,
+            list,
+            &false,
+            &schema,
+            &Funding::default(),
+        )?;
         assert_not_simplify(&simplifier, double_not, expected);
 
         Ok(())

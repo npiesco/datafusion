@@ -17,6 +17,7 @@
 
 //! This file has test utils for hash joins
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::joins::utils::{JoinFilter, JoinOn};
@@ -554,6 +555,7 @@ pub(crate) fn complicated_filter(
                 Operator::Plus,
                 col("1", filter_schema)?,
                 filter_schema,
+                &Funding::default(),
             )?,
             filter_schema,
             DataType::Int64,
@@ -564,8 +566,10 @@ pub(crate) fn complicated_filter(
             Operator::Plus,
             lit(ScalarValue::Int64(Some(10))),
             filter_schema,
+            &Funding::default(),
         )?,
         filter_schema,
+        &Funding::default(),
     )?;
 
     let right_expr = binary(
@@ -575,6 +579,7 @@ pub(crate) fn complicated_filter(
                 Operator::Plus,
                 col("1", filter_schema)?,
                 filter_schema,
+                &Funding::default(),
             )?,
             filter_schema,
             DataType::Int64,
@@ -585,10 +590,18 @@ pub(crate) fn complicated_filter(
             Operator::Plus,
             lit(ScalarValue::Int64(Some(100))),
             filter_schema,
+            &Funding::default(),
         )?,
         filter_schema,
+        &Funding::default(),
     )?;
-    binary(left_expr, Operator::And, right_expr, filter_schema)
+    binary(
+        left_expr,
+        Operator::And,
+        right_expr,
+        filter_schema,
+        &Funding::default(),
+    )
 }
 
 fn generate_ordered_array(size: i32, duplicate_ratio: f32) -> Arc<Int32Array> {

@@ -17,6 +17,7 @@
 
 //! See `main.rs` for how to run it.
 
+use datafusion_common::funding::Funding;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -202,6 +203,7 @@ fn create_pruning_predicate(expr: Expr, schema: &SchemaRef) -> PruningPredicate 
         &df_schema,
         &props,
         &PhysicalPlanningContext::default(),
+        &Funding::default(),
     )
     .unwrap();
     PruningPredicateBuilder::new()

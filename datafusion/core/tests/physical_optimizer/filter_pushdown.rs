@@ -117,6 +117,7 @@ fn test_pushdown_volatile_functions_not_allowed() {
                 vec![],
                 &schema(),
                 cfg,
+                &Funding::default(),
             )
             .unwrap(),
         ),
@@ -607,6 +608,7 @@ fn test_filter_with_fetch_partially_pushed_to_scan() {
                     vec![],
                     &schema(),
                     cfg,
+                    &Funding::default(),
                 )
                 .unwrap(),
             ),
@@ -1778,7 +1780,9 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
         )
         .unwrap(),
     );
-    let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
+    let predicate = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(false)), &Funding::default()).unwrap(),
+    );
     let plan =
         Arc::new(FilterExec::try_new(predicate, join, &Funding::default()).unwrap());
     assert_parent_filter_remains(plan);
@@ -2019,7 +2023,7 @@ fn col_lit_predicate(
     Arc::new(BinaryExpr::new(
         Arc::new(Column::new_with_schema(column_name, schema).unwrap()),
         Operator::Eq,
-        Arc::new(Literal::new(scalar_value)),
+        Arc::new(Literal::new(scalar_value, &Funding::default()).unwrap()),
     ))
 }
 
@@ -2161,11 +2165,15 @@ fn test_no_pushdown_grouping_sets_filter_on_missing_column() {
         ],
         vec![
             (
-                Arc::new(Literal::new(ScalarValue::Utf8(None))),
+                Arc::new(
+                    Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap(),
+                ),
                 "a".to_string(),
             ),
             (
-                Arc::new(Literal::new(ScalarValue::Utf8(None))),
+                Arc::new(
+                    Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap(),
+                ),
                 "b".to_string(),
             ),
         ],
@@ -2232,11 +2240,15 @@ fn test_pushdown_grouping_sets_filter_on_common_column() {
         ],
         vec![
             (
-                Arc::new(Literal::new(ScalarValue::Utf8(None))),
+                Arc::new(
+                    Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap(),
+                ),
                 "a".to_string(),
             ),
             (
-                Arc::new(Literal::new(ScalarValue::Utf8(None))),
+                Arc::new(
+                    Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap(),
+                ),
                 "b".to_string(),
             ),
         ],
@@ -2313,7 +2325,9 @@ async fn test_no_pushdown_through_global_aggregate_with_name_collision() {
     let predicate = Arc::new(BinaryExpr::new(
         col("a", aggregate.schema().as_ref()).unwrap(),
         Operator::Lt,
-        Arc::new(Literal::new(ScalarValue::Int64(Some(10)))),
+        Arc::new(
+            Literal::new(ScalarValue::Int64(Some(10)), &Funding::default()).unwrap(),
+        ),
     ));
     let plan =
         Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
@@ -2359,7 +2373,9 @@ fn test_no_pushdown_constant_false_through_global_aggregate() {
         )
         .unwrap(),
     );
-    let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
+    let predicate = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(false)), &Funding::default()).unwrap(),
+    );
     let plan =
         Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
@@ -2372,7 +2388,7 @@ fn test_no_pushdown_constant_false_through_empty_grouping_set() {
     let group_by = PhysicalGroupBy::new(
         vec![(col("a", &schema()).unwrap(), "a".to_string())],
         vec![(
-            Arc::new(Literal::new(ScalarValue::Utf8(None))),
+            Arc::new(Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap()),
             "a".to_string(),
         )],
         vec![vec![true]],
@@ -2397,7 +2413,9 @@ fn test_no_pushdown_constant_false_through_empty_grouping_set() {
         )
         .unwrap(),
     );
-    let predicate = Arc::new(Literal::new(ScalarValue::Boolean(Some(false))));
+    let predicate = Arc::new(
+        Literal::new(ScalarValue::Boolean(Some(false)), &Funding::default()).unwrap(),
+    );
     let plan =
         Arc::new(FilterExec::try_new(predicate, aggregate, &Funding::default()).unwrap());
 
@@ -2525,11 +2543,15 @@ fn test_pushdown_through_aggregate_grouping_sets_with_reordered_input() {
         ],
         vec![
             (
-                Arc::new(Literal::new(ScalarValue::Utf8(None))),
+                Arc::new(
+                    Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap(),
+                ),
                 "a".to_string(),
             ),
             (
-                Arc::new(Literal::new(ScalarValue::Utf8(None))),
+                Arc::new(
+                    Literal::new(ScalarValue::Utf8(None), &Funding::default()).unwrap(),
+                ),
                 "b".to_string(),
             ),
         ],
@@ -2612,7 +2634,9 @@ fn test_pushdown_with_computed_grouping_key() {
     let predicate = Arc::new(BinaryExpr::new(
         col("c", &schema()).unwrap(),
         Operator::Gt,
-        Arc::new(Literal::new(ScalarValue::Float64(Some(5.0)))),
+        Arc::new(
+            Literal::new(ScalarValue::Float64(Some(5.0)), &Funding::default()).unwrap(),
+        ),
     )) as Arc<dyn PhysicalExpr>;
     let filter =
         Arc::new(FilterExec::try_new(predicate, scan, &Funding::default()).unwrap());
@@ -2629,7 +2653,9 @@ fn test_pushdown_with_computed_grouping_key() {
     let c_plus_one = Arc::new(BinaryExpr::new(
         col("c", &schema()).unwrap(),
         Operator::Plus,
-        Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))),
+        Arc::new(
+            Literal::new(ScalarValue::Float64(Some(1.0)), &Funding::default()).unwrap(),
+        ),
     )) as Arc<dyn PhysicalExpr>;
 
     let group_by =
@@ -3161,7 +3187,9 @@ async fn test_filter_with_projection_pushdown() {
     let time_filter = Arc::new(BinaryExpr::new(
         time_col,
         Operator::Lt,
-        Arc::new(Literal::new(ScalarValue::Int64(Some(350)))),
+        Arc::new(
+            Literal::new(ScalarValue::Int64(Some(350)), &Funding::default()).unwrap(),
+        ),
     ));
     let filter1 = Arc::new(
         FilterExecBuilder::new(time_filter, memory_exec, &Funding::default())
@@ -3176,9 +3204,13 @@ async fn test_filter_with_projection_pushdown() {
     let event_filter = Arc::new(BinaryExpr::new(
         event_col,
         Operator::Eq,
-        Arc::new(Literal::new(ScalarValue::Utf8(Some(
-            "Ingestion".to_string(),
-        )))),
+        Arc::new(
+            Literal::new(
+                ScalarValue::Utf8(Some("Ingestion".to_string())),
+                &Funding::default(),
+            )
+            .unwrap(),
+        ),
     ));
     let filter2 = Arc::new(
         FilterExecBuilder::new(event_filter, filter1, &Funding::default())

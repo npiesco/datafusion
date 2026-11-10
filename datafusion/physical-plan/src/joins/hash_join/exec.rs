@@ -4071,7 +4071,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(
@@ -4114,7 +4116,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(10)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
         let filter = JoinFilter::new(
             filter_expression,
@@ -4228,7 +4232,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(9)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(9)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(
@@ -4272,7 +4278,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::Gt,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(11)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(11)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(
@@ -4382,7 +4390,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(8)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(8)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(
@@ -4428,7 +4438,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(8)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(8)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(
@@ -4545,7 +4557,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(13)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(13)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(
@@ -4595,7 +4609,9 @@ mod tests {
         let filter_expression = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("x", 0)),
             Operator::NotEq,
-            Arc::new(Literal::new(ScalarValue::Int32(Some(8)))),
+            Arc::new(
+                Literal::new(ScalarValue::Int32(Some(8)), &Funding::default()).unwrap(),
+            ),
         )) as Arc<dyn PhysicalExpr>;
 
         let filter = JoinFilter::new(

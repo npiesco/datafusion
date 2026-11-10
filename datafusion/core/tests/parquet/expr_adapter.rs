@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -582,7 +583,7 @@ impl PhysicalExprAdapter for CustomPhysicalExprAdapter {
                             ),
                         };
                         return Ok(Transformed::yes(Arc::new(
-                            expressions::Literal::new(default_value),
+                            expressions::Literal::new(default_value, &Funding::default()).unwrap(),
                         )));
                     }
                 }

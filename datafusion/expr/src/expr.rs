@@ -35,6 +35,7 @@ use crate::{ExprSchemable, Operator, Signature, WindowFrame, WindowUDF};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::cse::{HashNode, NormalizeEq, Normalizeable};
 use datafusion_common::datatype::DataTypeExt;
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::format_type_and_metadata;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeContainer, TreeNodeRecursion,
@@ -3818,13 +3819,14 @@ fn fmt_function(
     write!(f, "{}({}{})", fun, distinct_str, args.join(", "))
 }
 
-/// The name of the column (field) that this `Expr` will produce in the physical plan.
+/// The name of the column (field) that this `Expr` will produce in the physical plan,
+/// charged to `funding` before it is allocated.
 /// The difference from [Expr::schema_name] is that top-level columns are unqualified.
-pub fn physical_name(expr: &Expr) -> Result<String> {
+pub fn physical_name(expr: &Expr, funding: &Funding) -> Result<String> {
     match expr {
-        Expr::Column(col) => Ok(col.name.clone()),
-        Expr::Alias(alias) => Ok(alias.name.clone()),
-        _ => Ok(expr.schema_name().to_string()),
+        Expr::Column(col) => funding.string(&col.name),
+        Expr::Alias(alias) => funding.string(&alias.name),
+        _ => funding.format(format_args!("{}", expr.schema_name())),
     }
 }
 

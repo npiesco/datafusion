@@ -67,6 +67,7 @@ use arrow_schema::Field;
 use datafusion_catalog::ScanArgs;
 use datafusion_common::Column;
 use datafusion_common::HashMap as DFHashMap;
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::format::ExplainAnalyzeCategories;
 use datafusion_common::funding::{Funding, Held, HeldFuture};
@@ -183,6 +184,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
             input_dfschema,
             session_state.execution_props(),
             planning_ctx,
+            &session_state.config_options().funding,
         )
     }
 }
@@ -775,6 +777,7 @@ impl DefaultPhysicalPlanner {
                                     schema,
                                     execution_props,
                                     planning_ctx,
+                                    funding,
                                 )
                             })
                             .collect::<Result<Vec<Arc<dyn PhysicalExpr>>>>()
@@ -1064,17 +1067,18 @@ impl DefaultPhysicalPlanner {
                 }
 
                 let logical_schema = node.schema();
-                let window_expr = window_expr
-                    .iter()
-                    .map(|e| {
-                        create_window_expr(
-                            e,
-                            logical_schema,
-                            execution_props,
-                            planning_ctx,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let mut window_exprs = funding.held::<Vec<_>>();
+                window_exprs.reserve_exact(window_expr.len())?;
+                for e in window_expr {
+                    window_exprs.push(create_window_expr(
+                        e,
+                        logical_schema,
+                        execution_props,
+                        planning_ctx,
+                        funding,
+                    )?)?;
+                }
+                let window_expr = window_exprs.keep();
 
                 let can_repartition = session_state.config().target_partitions() > 1
                     && session_state.config().repartition_window_functions();
@@ -1180,6 +1184,7 @@ impl DefaultPhysicalPlanner {
                     &physical_input_schema,
                     execution_props,
                     planning_ctx,
+                    funding,
                 )?;
 
                 let agg_filter = aggr_expr
@@ -1191,6 +1196,7 @@ impl DefaultPhysicalPlanner {
                             &physical_input_schema,
                             execution_props,
                             planning_ctx,
+                            funding,
                         )
                         .build()
                         .map(lowered_aggregate_to_tuple)
@@ -1309,6 +1315,7 @@ impl DefaultPhysicalPlanner {
                     input_dfschema,
                     execution_props,
                     planning_ctx,
+                    funding,
                 )?;
 
                 let input_schema = input.schema();
@@ -1379,6 +1386,7 @@ impl DefaultPhysicalPlanner {
                     input_dfschema,
                     execution_props,
                     planning_ctx,
+                    funding,
                 )?;
                 Arc::new(RepartitionExec::try_new(
                     physical_input,
@@ -1395,6 +1403,7 @@ impl DefaultPhysicalPlanner {
                     input_dfschema,
                     execution_props,
                     planning_ctx,
+                    funding,
                 )?;
                 let Some(ordering) = LexOrdering::new(sort_exprs) else {
                     return internal_err!(
@@ -1615,12 +1624,14 @@ impl DefaultPhysicalPlanner {
                             left_df_schema,
                             execution_props,
                             planning_ctx,
+                            funding,
                         )?;
                         let r = create_physical_expr(
                             r,
                             right_df_schema,
                             execution_props,
                             planning_ctx,
+                            funding,
                         )?;
                         Ok((l, r))
                     })
@@ -1723,6 +1734,7 @@ impl DefaultPhysicalPlanner {
                             &filter_df_schema,
                             execution_props,
                             planning_ctx,
+                            funding,
                         )?;
                         let column_indices = join_utils::JoinFilter::build_column_indices(
                             left_field_indices,
@@ -1844,12 +1856,14 @@ impl DefaultPhysicalPlanner {
                             left_df_schema,
                             execution_props,
                             planning_ctx,
+                            funding,
                         )?;
                         let on_right = create_physical_expr(
                             rhs_logical,
                             right_df_schema,
                             execution_props,
                             planning_ctx,
+                            funding,
                         )?;
 
                         Arc::new(PiecewiseMergeJoinExec::try_new(
@@ -2035,66 +2049,65 @@ impl DefaultPhysicalPlanner {
         input_schema: &Schema,
         execution_props: &ExecutionProps,
         planning_ctx: &PhysicalPlanningContext,
+        funding: &Funding,
     ) -> Result<PhysicalGroupBy> {
-        if group_expr.len() == 1 {
-            match &group_expr[0] {
-                Expr::GroupingSet(GroupingSet::GroupingSets(grouping_sets)) => {
+        if let [Expr::GroupingSet(grouping_set)] = group_expr {
+            return match grouping_set {
+                GroupingSet::GroupingSets(grouping_sets) => {
                     merge_grouping_set_physical_expr(
                         grouping_sets,
                         input_dfschema,
                         input_schema,
                         execution_props,
                         planning_ctx,
+                        funding,
                     )
                 }
-                Expr::GroupingSet(GroupingSet::Cube(exprs)) => create_cube_physical_expr(
+                GroupingSet::Cube(exprs) => create_cube_physical_expr(
                     exprs,
                     input_dfschema,
                     input_schema,
                     execution_props,
                     planning_ctx,
+                    funding,
                 ),
-                Expr::GroupingSet(GroupingSet::Rollup(exprs)) => {
-                    create_rollup_physical_expr(
-                        exprs,
-                        input_dfschema,
-                        input_schema,
-                        execution_props,
-                        planning_ctx,
-                    )
-                }
-                expr => Ok(PhysicalGroupBy::new_single(vec![tuple_err((
-                    create_physical_expr(
-                        expr,
-                        input_dfschema,
-                        execution_props,
-                        planning_ctx,
-                    ),
-                    physical_name(expr),
-                ))?])),
-            }
-        } else if group_expr.is_empty() {
+                GroupingSet::Rollup(exprs) => create_rollup_physical_expr(
+                    exprs,
+                    input_dfschema,
+                    input_schema,
+                    execution_props,
+                    planning_ctx,
+                    funding,
+                ),
+            };
+        }
+        if group_expr.is_empty() {
             // No GROUP BY clause - create empty PhysicalGroupBy
             // no expressions, no null expressions and no grouping expressions
-            Ok(PhysicalGroupBy::new(vec![], vec![], vec![], false))
-        } else {
-            Ok(PhysicalGroupBy::new_single(
-                group_expr
-                    .iter()
-                    .map(|e| {
-                        tuple_err((
-                            create_physical_expr(
-                                e,
-                                input_dfschema,
-                                execution_props,
-                                planning_ctx,
-                            ),
-                            physical_name(e),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-            ))
+            return Ok(PhysicalGroupBy::new(vec![], vec![], vec![], false));
         }
+        // A single group of every expression, as `PhysicalGroupBy::new_single` makes,
+        // each list charged first
+        let mut exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+        exprs.reserve_exact(group_expr.len())?;
+        for e in group_expr {
+            exprs.push(get_physical_expr_pair(
+                e,
+                input_dfschema,
+                execution_props,
+                planning_ctx,
+                funding,
+            )?)?;
+        }
+        let mut groups = funding.held::<Vec<Vec<bool>>>();
+        groups.reserve_exact(1)?;
+        groups.push(group_of(group_expr.len(), &[], funding)?)?;
+        Ok(PhysicalGroupBy::new(
+            exprs.keep(),
+            vec![],
+            groups.keep(),
+            false,
+        ))
     }
 }
 
@@ -2114,22 +2127,23 @@ fn merge_grouping_set_physical_expr(
     input_schema: &Schema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<PhysicalGroupBy> {
-    let num_groups = grouping_sets.len();
-    let mut all_exprs: Vec<Expr> = vec![];
-    let mut grouping_set_expr: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
-    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = vec![];
+    let mut all_exprs = funding.held::<Vec<&Expr>>();
+    let mut grouping_set_expr = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+    let mut null_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
 
     for expr in grouping_sets.iter().flatten() {
-        if !all_exprs.contains(expr) {
-            all_exprs.push(expr.clone());
+        if !all_exprs.contains(&expr) {
+            all_exprs.push(expr)?;
 
             grouping_set_expr.push(get_physical_expr_pair(
                 expr,
                 input_dfschema,
                 execution_props,
                 planning_ctx,
-            )?);
+                funding,
+            )?)?;
 
             null_exprs.push(get_null_physical_expr_pair(
                 expr,
@@ -2137,27 +2151,76 @@ fn merge_grouping_set_physical_expr(
                 input_schema,
                 execution_props,
                 planning_ctx,
-            )?);
+                funding,
+            )?)?;
         }
     }
 
-    let mut merged_sets: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
+    let mut merged_sets = funding.held::<Vec<Vec<bool>>>();
+    merged_sets.reserve_exact(grouping_sets.len())?;
 
     for expr_group in grouping_sets.iter() {
-        let group: Vec<bool> = all_exprs
-            .iter()
-            .map(|expr| !expr_group.contains(expr))
-            .collect();
-
-        merged_sets.push(group)
+        let mut group = funding.vec_with_capacity(all_exprs.len())?;
+        group.extend(all_exprs.iter().map(|expr| !expr_group.contains(expr)));
+        merged_sets.push(group)?;
     }
 
     Ok(PhysicalGroupBy::new(
-        grouping_set_expr,
-        null_exprs,
-        merged_sets,
+        grouping_set_expr.keep(),
+        null_exprs.keep(),
+        merged_sets.keep(),
         true,
     ))
+}
+
+/// A group of `len` expressions where those at `nulls` are NULL, charged to `funding`
+/// first.
+fn group_of(len: usize, nulls: &[usize], funding: &Funding) -> Result<Vec<bool>> {
+    let mut group = funding.vec_with_capacity(len)?;
+    group.resize(len, false);
+    for &i in nulls {
+        group[i] = true;
+    }
+    Ok(group)
+}
+
+/// The physical and NULL expression of each of `exprs`, both lists charged to
+/// `funding` first.
+fn grouping_exprs_with_nulls(
+    exprs: &[Expr],
+    input_dfschema: &DFSchema,
+    input_schema: &Schema,
+    execution_props: &ExecutionProps,
+    planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
+) -> Result<(
+    Vec<(Arc<dyn PhysicalExpr>, String)>,
+    Vec<(Arc<dyn PhysicalExpr>, String)>,
+)> {
+    let mut null_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+    null_exprs.reserve_exact(exprs.len())?;
+    let mut all_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+    all_exprs.reserve_exact(exprs.len())?;
+
+    for expr in exprs {
+        null_exprs.push(get_null_physical_expr_pair(
+            expr,
+            input_dfschema,
+            input_schema,
+            execution_props,
+            planning_ctx,
+            funding,
+        )?)?;
+
+        all_exprs.push(get_physical_expr_pair(
+            expr,
+            input_dfschema,
+            execution_props,
+            planning_ctx,
+            funding,
+        )?)?;
+    }
+    Ok((all_exprs.keep(), null_exprs.keep()))
 }
 
 /// Expand and align a CUBE expression. This is a special case of GROUPING SETS
@@ -2168,45 +2231,52 @@ fn create_cube_physical_expr(
     input_schema: &Schema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<PhysicalGroupBy> {
     let num_of_exprs = exprs.len();
     let num_groups = num_of_exprs * num_of_exprs;
 
-    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
-    let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
+    let (all_exprs, null_exprs) = grouping_exprs_with_nulls(
+        exprs,
+        input_dfschema,
+        input_schema,
+        execution_props,
+        planning_ctx,
+        funding,
+    )?;
 
-    for expr in exprs {
-        null_exprs.push(get_null_physical_expr_pair(
-            expr,
-            input_dfschema,
-            input_schema,
-            execution_props,
-            planning_ctx,
-        )?);
+    let mut groups = funding.held::<Vec<Vec<bool>>>();
+    groups.reserve_exact(num_groups)?;
 
-        all_exprs.push(get_physical_expr_pair(
-            expr,
-            input_dfschema,
-            execution_props,
-            planning_ctx,
-        )?)
-    }
+    groups.push(group_of(num_of_exprs, &[], funding)?)?;
 
-    let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
-
-    groups.push(vec![false; num_of_exprs]);
-
+    // Every combination of `null_count` NULL positions, in lexicographic order
+    let mut null_idx = funding.held::<Vec<usize>>();
+    null_idx.reserve_exact(num_of_exprs)?;
     for null_count in 1..=num_of_exprs {
-        for null_idx in (0..num_of_exprs).combinations(null_count) {
-            let mut next_group: Vec<bool> = vec![false; num_of_exprs];
-            null_idx.into_iter().for_each(|i| next_group[i] = true);
-            groups.push(next_group);
+        null_idx.clear();
+        null_idx.extend(0..null_count);
+        loop {
+            groups.push(group_of(num_of_exprs, &null_idx, funding)?)?;
+            let Some(pos) = (0..null_count)
+                .rev()
+                .find(|&pos| null_idx[pos] != num_of_exprs - null_count + pos)
+            else {
+                break;
+            };
+            null_idx[pos] += 1;
+            for next in pos + 1..null_count {
+                null_idx[next] = null_idx[next - 1] + 1;
+            }
         }
     }
 
-    Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups, true))
+    Ok(PhysicalGroupBy::new(
+        all_exprs,
+        null_exprs,
+        groups.keep(),
+        true,
+    ))
 }
 
 /// Expand and align a ROLLUP expression. This is a special case of GROUPING SETS
@@ -2217,48 +2287,34 @@ fn create_rollup_physical_expr(
     input_schema: &Schema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<PhysicalGroupBy> {
     let num_of_exprs = exprs.len();
 
-    let mut null_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
-    let mut all_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> =
-        Vec::with_capacity(num_of_exprs);
+    let (all_exprs, null_exprs) = grouping_exprs_with_nulls(
+        exprs,
+        input_dfschema,
+        input_schema,
+        execution_props,
+        planning_ctx,
+        funding,
+    )?;
 
-    let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_of_exprs + 1);
-
-    for expr in exprs {
-        null_exprs.push(get_null_physical_expr_pair(
-            expr,
-            input_dfschema,
-            input_schema,
-            execution_props,
-            planning_ctx,
-        )?);
-
-        all_exprs.push(get_physical_expr_pair(
-            expr,
-            input_dfschema,
-            execution_props,
-            planning_ctx,
-        )?)
-    }
+    let mut groups = funding.held::<Vec<Vec<bool>>>();
+    groups.reserve_exact(num_of_exprs + 1)?;
 
     for total in 0..=num_of_exprs {
-        let mut group: Vec<bool> = Vec::with_capacity(num_of_exprs);
-
-        for index in 0..num_of_exprs {
-            if index < total {
-                group.push(false);
-            } else {
-                group.push(true);
-            }
-        }
-
-        groups.push(group)
+        let mut group = funding.vec_with_capacity(num_of_exprs)?;
+        group.extend((0..num_of_exprs).map(|index| index >= total));
+        groups.push(group)?;
     }
 
-    Ok(PhysicalGroupBy::new(all_exprs, null_exprs, groups, true))
+    Ok(PhysicalGroupBy::new(
+        all_exprs,
+        null_exprs,
+        groups.keep(),
+        true,
+    ))
 }
 
 /// For a given logical expr, get a properly typed NULL ScalarValue physical expression
@@ -2268,16 +2324,27 @@ fn get_null_physical_expr_pair(
     input_schema: &Schema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<(Arc<dyn PhysicalExpr>, String)> {
-    let physical_expr =
-        create_physical_expr(expr, input_dfschema, execution_props, planning_ctx)?;
-    let physical_name = physical_name(&expr.clone())?;
-
+    // The expression is made only for its type: freed again, what it was charged is
+    // given back.
+    let before = funding.outstanding();
+    let physical_expr = create_physical_expr(
+        expr,
+        input_dfschema,
+        execution_props,
+        planning_ctx,
+        funding,
+    )?;
     let data_type = physical_expr.data_type(input_schema)?;
+    drop(physical_expr);
+    funding.unwound(before);
     let null_value: ScalarValue = (&data_type).try_into()?;
 
-    let null_value = Literal::new(null_value);
-    Ok((Arc::new(null_value), physical_name))
+    let null_value: Arc<dyn PhysicalExpr> =
+        funding.arc(Literal::new(null_value, funding)?)?;
+    let physical_name = physical_name(expr, funding)?;
+    Ok((null_value, physical_name))
 }
 
 /// Qualifies the fields in a join schema with "left" and "right" qualifiers
@@ -2341,10 +2408,16 @@ fn get_physical_expr_pair(
     input_dfschema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<(Arc<dyn PhysicalExpr>, String)> {
-    let physical_expr =
-        create_physical_expr(expr, input_dfschema, execution_props, planning_ctx)?;
-    let physical_name = physical_name(expr)?;
+    let physical_expr = create_physical_expr(
+        expr,
+        input_dfschema,
+        execution_props,
+        planning_ctx,
+        funding,
+    )?;
+    let physical_name = physical_name(expr, funding)?;
     Ok((physical_expr, physical_name))
 }
 
@@ -2604,6 +2677,7 @@ pub fn create_window_expr_with_name(
     logical_schema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<Arc<dyn WindowExpr>> {
     let name = name.into();
     let physical_schema = Arc::clone(logical_schema.inner());
@@ -2627,18 +2701,21 @@ pub fn create_window_expr_with_name(
                 logical_schema,
                 execution_props,
                 planning_ctx,
+                funding,
             )?;
             let partition_by = create_physical_exprs(
                 partition_by,
                 logical_schema,
                 execution_props,
                 planning_ctx,
+                funding,
             )?;
             let order_by = create_physical_sort_exprs(
                 order_by,
                 logical_schema,
                 execution_props,
                 planning_ctx,
+                funding,
             )?;
 
             if !is_window_frame_bound_valid(window_frame) {
@@ -2649,13 +2726,19 @@ pub fn create_window_expr_with_name(
                 );
             }
 
-            let window_frame = Arc::new(window_frame.clone());
+            let window_frame = funding.arc(funding.cloned(window_frame)?)?;
             let ignore_nulls = null_treatment.unwrap_or(NullTreatment::RespectNulls)
                 == NullTreatment::IgnoreNulls;
             let physical_filter = filter
                 .as_ref()
                 .map(|f| {
-                    create_physical_expr(f, logical_schema, execution_props, planning_ctx)
+                    create_physical_expr(
+                        f,
+                        logical_schema,
+                        execution_props,
+                        planning_ctx,
+                        funding,
+                    )
                 })
                 .transpose()?;
 
@@ -2684,16 +2767,37 @@ pub fn create_window_expr(
     logical_schema: &DFSchema,
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
+    funding: &Funding,
 ) -> Result<Arc<dyn WindowExpr>> {
     // unpack aliased logical expressions, e.g. "sum(col) over () as total"
-    let (name, e) = match e {
-        Expr::Alias(alias) => (
-            alias.name.clone(),
-            alias.expr.as_ref().clone().unalias_nested().data,
+    match e {
+        Expr::Alias(alias) => {
+            let name = funding.string(&alias.name)?;
+            // The unaliased copy is freed again once planned: what its clone was
+            // charged is given back.
+            let cloned_bytes = alias.expr.as_ref().clone_bytes();
+            let e = funding.cloned(alias.expr.as_ref())?.unalias_nested().data;
+            let window_expr = create_window_expr_with_name(
+                &e,
+                name,
+                logical_schema,
+                execution_props,
+                planning_ctx,
+                funding,
+            );
+            drop(e);
+            funding.discharge(cloned_bytes);
+            window_expr
+        }
+        _ => create_window_expr_with_name(
+            e,
+            funding.format(format_args!("{}", e.schema_name()))?,
+            logical_schema,
+            execution_props,
+            planning_ctx,
+            funding,
         ),
-        _ => (e.schema_name().to_string(), e.clone()),
-    };
-    create_window_expr_with_name(&e, name, logical_schema, execution_props, planning_ctx)
+    }
 }
 
 type AggregateExprWithOptionalArgs = (
@@ -2721,6 +2825,7 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
         physical_input_schema,
         execution_props,
         &planning_ctx,
+        &Funding::default(),
     )
     .with_human_display(human_display);
 
@@ -2762,6 +2867,7 @@ pub fn create_aggregate_expr_and_maybe_filter(
         physical_input_schema,
         execution_props,
         &planning_ctx,
+        &Funding::default(),
     )
     .with_human_display(human_display);
 
@@ -3202,10 +3308,10 @@ impl DefaultPhysicalPlanner {
                     }
                     // logical column is not a derived column, safe to pass along to
                     // physical_name
-                    Err(_) => physical_name(e),
+                    Err(_) => physical_name(e, funding),
                 }
             } else {
-                physical_name(e)
+                physical_name(e, funding)
             };
 
             let physical_expr = create_physical_expr(
@@ -3213,6 +3319,7 @@ impl DefaultPhysicalPlanner {
                 input_logical_schema,
                 execution_props,
                 planning_ctx,
+                funding,
             );
 
             physical_exprs.push(tuple_err((physical_expr, physical_name))?)?;
@@ -3889,6 +3996,7 @@ mod tests {
             &logical_schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )?;
 
         assert_eq!(window_expr.name(), "window_alias");
@@ -4420,7 +4528,8 @@ mod tests {
             &make_session_state(),
             &PhysicalPlanningContext::default(),
         )?;
-        let expected = expressions::not(expressions::col("a", &schema)?)?;
+        let expected =
+            expressions::not(expressions::col("a", &schema)?, &Funding::default())?;
 
         assert_eq!(format!("{expr:?}"), format!("{expected:?}"));
 

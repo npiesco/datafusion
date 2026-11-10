@@ -30,6 +30,7 @@ use arrow::compute::{
 use arrow::datatypes::{DataType, Schema, UInt32Type, UnionMode};
 use arrow::error::ArrowError;
 use datafusion_common::cast::as_boolean_array;
+use datafusion_common::funding::Funding;
 use datafusion_common::{
     DataFusionError, Result, ScalarValue, assert_or_internal_err, exec_err,
     internal_datafusion_err, internal_err,
@@ -1567,13 +1568,15 @@ pub fn case(
     expr: Option<Arc<dyn PhysicalExpr>>,
     when_thens: Vec<WhenThen>,
     else_expr: Option<Arc<dyn PhysicalExpr>>,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(Arc::new(CaseExpr::try_new(expr, when_thens, else_expr)?))
+    Ok(funding.arc(CaseExpr::try_new(expr, when_thens, else_expr)?)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::funding::Funding;
 
     use crate::expressions;
     use crate::expressions::{BinaryExpr, binary, cast, col, is_not_null};
@@ -1821,6 +1824,7 @@ mod tests {
             Operator::Divide,
             cast(col("a", &schema)?, &batch.schema(), Float64)?,
             &batch.schema(),
+            &Funding::default(),
         )?;
 
         let expr = generate_case_when_with_type_coercion(
@@ -1854,6 +1858,7 @@ mod tests {
             Operator::Eq,
             lit("foo"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then1 = lit(123i32);
         let when2 = binary(
@@ -1861,6 +1866,7 @@ mod tests {
             Operator::Eq,
             lit("bar"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then2 = lit(456i32);
 
@@ -1921,12 +1927,19 @@ mod tests {
         let schema = batch.schema();
 
         // CASE WHEN a > 0 THEN 25.0 / cast(a, float64) ELSE float64(null) END
-        let when1 = binary(col("a", &schema)?, Operator::Gt, lit(0i32), &batch.schema())?;
+        let when1 = binary(
+            col("a", &schema)?,
+            Operator::Gt,
+            lit(0i32),
+            &batch.schema(),
+            &Funding::default(),
+        )?;
         let then1 = binary(
             lit(25.0f64),
             Operator::Divide,
             cast(col("a", &schema)?, &batch.schema(), Float64)?,
             &batch.schema(),
+            &Funding::default(),
         )?;
         let x = lit(ScalarValue::Float64(None));
 
@@ -1977,6 +1990,7 @@ mod tests {
             Operator::Eq,
             lit("foo"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then1 = lit(123i32);
         let when2 = binary(
@@ -1984,6 +1998,7 @@ mod tests {
             Operator::Eq,
             lit("bar"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then2 = lit(456i32);
         let else_value = lit(999i32);
@@ -2019,6 +2034,7 @@ mod tests {
             Operator::Eq,
             lit("foo"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then = lit(123.3f64);
         let else_value = lit(999i32);
@@ -2055,6 +2071,7 @@ mod tests {
             Operator::Eq,
             lit(1.77f64),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then = col("load4", &schema)?;
 
@@ -2163,10 +2180,19 @@ mod tests {
         let schema = batch.schema();
 
         let when = binary(
-            Arc::new(Literal::new(ScalarValue::Boolean(None))),
+            Arc::new(
+                Literal::new(ScalarValue::Boolean(None), &Funding::default()).unwrap(),
+            ),
             Operator::And,
-            binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?,
+            binary(
+                col("a", &schema)?,
+                Operator::Eq,
+                lit("foo"),
+                &schema,
+                &Funding::default(),
+            )?,
             &schema,
+            &Funding::default(),
         )?;
         let then = col("a", &schema)?;
 
@@ -2231,6 +2257,7 @@ mod tests {
             Operator::Eq,
             lit("foo"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then1 = lit(123i32);
         let when2 = binary(
@@ -2238,6 +2265,7 @@ mod tests {
             Operator::Eq,
             lit("bar"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then2 = lit(true);
 
@@ -2258,6 +2286,7 @@ mod tests {
             Operator::Eq,
             lit("foo"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then1 = lit(123i32);
         let when2 = binary(
@@ -2265,6 +2294,7 @@ mod tests {
             Operator::Eq,
             lit("bar"),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then2 = lit(456i64);
         let else_expr = lit(1.23f64);
@@ -2451,6 +2481,7 @@ mod tests {
             Operator::LtEq,
             lit(2i32),
             &batch.schema(),
+            &Funding::default(),
         )?;
         let then = col("b", &schema)?;
         let else_expr = col("c", &schema)?;
@@ -2476,7 +2507,7 @@ mod tests {
     }
 
     fn make_lit_i32(n: i32) -> Arc<dyn PhysicalExpr> {
-        Arc::new(Literal::new(ScalarValue::Int32(Some(n))))
+        Arc::new(Literal::new(ScalarValue::Int32(Some(n)), &Funding::default()).unwrap())
     }
 
     fn generate_case_when_with_type_coercion(
@@ -2508,7 +2539,7 @@ mod tests {
                 Ok((left, right))
             }
         }?;
-        case(expr, when_thens, else_expr)
+        case(expr, when_thens, else_expr, &Funding::default())
     }
 
     fn get_case_common_type(
@@ -2542,7 +2573,13 @@ mod tests {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
 
         // CASE WHEN a = 'foo' THEN 123.3 ELSE 999 END
-        let when = binary(col("a", &schema)?, Operator::Eq, lit("foo"), &schema)?;
+        let when = binary(
+            col("a", &schema)?,
+            Operator::Eq,
+            lit("foo"),
+            &schema,
+            &Funding::default(),
+        )?;
         let then = lit(123.3f64);
         let else_value = lit(999i32);
 
@@ -2596,14 +2633,21 @@ mod tests {
             Schema::new(vec![Field::new("foo", DataType::Int32, col_is_nullable)]);
 
         let foo = col("foo", &schema)?;
-        let foo_is_not_null = is_not_null(Arc::clone(&foo))?;
-        let foo_is_null = expressions::is_null(Arc::clone(&foo))?;
-        let not_foo_is_null = expressions::not(Arc::clone(&foo_is_null))?;
+        let foo_is_not_null = is_not_null(Arc::clone(&foo), &Funding::default())?;
+        let foo_is_null = expressions::is_null(Arc::clone(&foo), &Funding::default())?;
+        let not_foo_is_null =
+            expressions::not(Arc::clone(&foo_is_null), &Funding::default())?;
         let zero = lit(0);
-        let foo_eq_zero =
-            binary(Arc::clone(&foo), Operator::Eq, Arc::clone(&zero), &schema)?;
+        let foo_eq_zero = binary(
+            Arc::clone(&foo),
+            Operator::Eq,
+            Arc::clone(&zero),
+            &schema,
+            &Funding::default(),
+        )?;
         let cast_foo = cast(Arc::clone(&foo), &schema, DataType::Int64)?;
-        let negative_foo = expressions::negative(Arc::clone(&foo), &schema)?;
+        let negative_foo =
+            expressions::negative(Arc::clone(&foo), &schema, &Funding::default())?;
 
         assert_not_nullable(when_then_else(&foo_is_not_null, &foo, &zero)?, &schema);
         assert_not_nullable(when_then_else(&not_foo_is_null, &foo, &zero)?, &schema);
@@ -2621,7 +2665,7 @@ mod tests {
         // still collapses `foo IS NOT NULL` to `false`, so the branch is
         // unreachable-as-null and the `CASE` is not nullable.
         let cast_negative_foo = cast(
-            expressions::negative(Arc::clone(&foo), &schema)?,
+            expressions::negative(Arc::clone(&foo), &schema, &Funding::default())?,
             &schema,
             DataType::Int64,
         )?;
@@ -2649,6 +2693,7 @@ mod tests {
                     Operator::And,
                     Arc::clone(&foo_eq_zero),
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2663,6 +2708,7 @@ mod tests {
                     Operator::And,
                     Arc::clone(&foo_is_not_null),
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2677,6 +2723,7 @@ mod tests {
                     Operator::Or,
                     Arc::clone(&foo_eq_zero),
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2691,6 +2738,7 @@ mod tests {
                     Operator::Or,
                     Arc::clone(&foo_is_not_null),
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2705,6 +2753,7 @@ mod tests {
                     Operator::Or,
                     Arc::clone(&foo_eq_zero),
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2716,10 +2765,17 @@ mod tests {
         assert_nullability(
             when_then_else(
                 &binary(
-                    binary(Arc::clone(&foo), Operator::Eq, Arc::clone(&zero), &schema)?,
+                    binary(
+                        Arc::clone(&foo),
+                        Operator::Eq,
+                        Arc::clone(&zero),
+                        &schema,
+                        &Funding::default(),
+                    )?,
                     Operator::Or,
                     Arc::clone(&foo_is_null),
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2737,10 +2793,12 @@ mod tests {
                             Operator::Eq,
                             Arc::clone(&zero),
                             &schema,
+                            &Funding::default(),
                         )?,
                         Operator::And,
                         Arc::clone(&foo_is_not_null),
                         &schema,
+                        &Funding::default(),
                     )?,
                     Operator::Or,
                     binary(
@@ -2749,12 +2807,15 @@ mod tests {
                             Operator::Eq,
                             Arc::clone(&foo),
                             &schema,
+                            &Funding::default(),
                         )?,
                         Operator::And,
                         Arc::clone(&foo_is_not_null),
                         &schema,
+                        &Funding::default(),
                     )?,
                     &schema,
+                    &Funding::default(),
                 )?,
                 &foo,
                 &zero,
@@ -2765,15 +2826,18 @@ mod tests {
         let boolean_schema =
             Schema::new(vec![Field::new("predicate", DataType::Boolean, true)]);
         let predicate = col("predicate", &boolean_schema)?;
-        let predicate_is_not_null = is_not_null(Arc::clone(&predicate))?;
-        let not_predicate = expressions::not(Arc::clone(&predicate))?;
+        let predicate_is_not_null =
+            is_not_null(Arc::clone(&predicate), &Funding::default())?;
+        let not_predicate =
+            expressions::not(Arc::clone(&predicate), &Funding::default())?;
         assert_not_nullable(
             when_then_else(&predicate_is_not_null, &not_predicate, &lit(false))?,
             &boolean_schema,
         );
 
         // Nested `NOT` is likewise unwrapped recursively.
-        let not_not_predicate = expressions::not(Arc::clone(&not_predicate))?;
+        let not_not_predicate =
+            expressions::not(Arc::clone(&not_predicate), &Funding::default())?;
         assert_not_nullable(
             when_then_else(&predicate_is_not_null, &not_not_predicate, &lit(false))?,
             &boolean_schema,
@@ -2829,14 +2893,17 @@ mod tests {
             .iter()
             .map(|(when, then)| {
                 (
-                    Arc::new(Literal::new(when.clone())) as _,
-                    Arc::new(Literal::new(then.clone())) as _,
+                    Arc::new(Literal::new(when.clone(), &Funding::default()).unwrap())
+                        as _,
+                    Arc::new(Literal::new(then.clone(), &Funding::default()).unwrap())
+                        as _,
                 )
             })
             .collect::<Vec<WhenThen>>();
 
         let else_expr = else_value.map(|else_value| {
-            Arc::new(Literal::new(else_value)) as Arc<dyn PhysicalExpr>
+            Arc::new(Literal::new(else_value, &Funding::default()).unwrap())
+                as Arc<dyn PhysicalExpr>
         });
         let expr = CaseExpr::try_new(Some(case), when_then, else_expr)
             .expect("failed to create case");
@@ -3334,7 +3401,12 @@ mod tests {
                 lit(idx.to_string()),
             )) as Arc<dyn PhysicalExpr>;
 
-            label = case(None, vec![(predicate, lit("label"))], Some(label))?;
+            label = case(
+                None,
+                vec![(predicate, lit("label"))],
+                Some(label),
+                &Funding::default(),
+            )?;
         }
 
         let mut hasher = CountingHasher::default();

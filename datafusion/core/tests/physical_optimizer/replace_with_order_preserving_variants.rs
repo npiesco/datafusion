@@ -1117,6 +1117,7 @@ fn filter_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
         Operator::Gt,
         expressions::lit(3i32),
         &input_schema,
+        &Funding::default(),
     )
     .unwrap();
     Arc::new(FilterExec::try_new(predicate, input, &Funding::default()).unwrap())

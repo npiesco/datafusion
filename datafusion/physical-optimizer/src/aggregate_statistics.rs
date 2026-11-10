@@ -75,7 +75,8 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                 if let Some((optimizable_statistic, name)) =
                     take_optimizable_value_from_statistics(&statistics_args, expr)
                 {
-                    let expr = funding.arc(Literal::new(optimizable_statistic))?;
+                    let expr =
+                        funding.arc(Literal::new(optimizable_statistic, funding)?)?;
                     projections.push(ProjectionExpr {
                         expr,
                         alias: funding.string(name)?,

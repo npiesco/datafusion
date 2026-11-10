@@ -29,6 +29,7 @@
 //! The TreeNodeRewriter will automatically call this function repeatedly until
 //! no more transformations are possible.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
@@ -82,6 +83,7 @@ pub fn simplify_not_expr(
             in_list_expr.list().to_vec(),
             &negated,
             schema,
+            &Funding::default(),
         )?;
         return Ok(Transformed::yes(new_in_list));
     }

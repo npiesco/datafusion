@@ -607,7 +607,7 @@ fn filter_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     let predicate = Arc::new(BinaryExpr::new(
         col("c", &schema()).unwrap(),
         Operator::Eq,
-        Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
+        Arc::new(Literal::new(ScalarValue::Int64(Some(0)), &Funding::default()).unwrap()),
     ));
     Arc::new(FilterExec::try_new(predicate, input, &Funding::default()).unwrap())
 }
@@ -1810,6 +1810,7 @@ fn multi_hash_join_key_ordering() -> Result<()> {
         Operator::Gt,
         lit(1i64),
         top_join.schema().deref(),
+        &Funding::default(),
     )?;
 
     let filter_top_join: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(

@@ -81,7 +81,7 @@ impl FileOpener for ProjectionOpener {
                 &self.projection,
                 &self.partition_columns,
                 partition_values,
-            )
+            )?
         };
         // Replace `input_file_name()` with a per-file literal if present.
         let projection = rewrite_input_file_name_in_projection(
@@ -118,12 +118,12 @@ fn inject_partition_columns_into_projection(
     projection: &ProjectionExprs,
     partition_columns: &[PartitionColumnIndex],
     partition_values: Vec<ScalarValue>,
-) -> ProjectionExprs {
+) -> Result<ProjectionExprs> {
     // Pre-create all literals for partition columns to avoid cloning ScalarValues multiple times.
     let partition_literals: Vec<Arc<Literal>> = partition_values
         .into_iter()
-        .map(|value| Arc::new(Literal::new(value)))
-        .collect();
+        .map(|value| Ok(Arc::new(Literal::new(value, &Funding::default())?)))
+        .collect::<Result<_>>()?;
 
     let projections = projection
         .iter()
@@ -149,7 +149,7 @@ fn inject_partition_columns_into_projection(
             ProjectionExpr::new(expr, projection.alias.clone())
         })
         .collect_vec();
-    ProjectionExprs::new(projections)
+    Ok(ProjectionExprs::new(projections))
 }
 
 /// At a high level the goal of SplitProjection is to take a ProjectionExprs meant to be applied to the table schema
@@ -336,6 +336,7 @@ mod test {
             &df_schema,
             &ExecutionProps::default(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )
         .unwrap();
         let projection_exprs = physical_exprs
@@ -473,7 +474,8 @@ mod test {
             &split.remapped_projection,
             &partition_columns,
             partition_values,
-        );
+        )
+        .unwrap();
 
         // Now the projection should work on the file batch
         let projector = injected_projection
@@ -700,7 +702,8 @@ mod test {
             &split.remapped_projection,
             &partition_columns,
             partition_values,
-        );
+        )
+        .unwrap();
 
         // Apply projection
         let projector = injected

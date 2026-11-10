@@ -56,7 +56,13 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         SubqueryIndex::new(0),
         results.clone(),
     ));
-    let predicate = binary(col("a", &schema)?, Operator::Eq, sq_expr, &schema)?;
+    let predicate = binary(
+        col("a", &schema)?,
+        Operator::Eq,
+        sq_expr,
+        &schema,
+        &Funding::default(),
+    )?;
     let filter = FilterExec::try_new(
         predicate,
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
@@ -144,8 +150,13 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
         SubqueryIndex::new(0),
         inner_results.clone(),
     ));
-    let inner_predicate =
-        binary(col("a", &schema)?, Operator::Eq, inner_sq_expr, &schema)?;
+    let inner_predicate = binary(
+        col("a", &schema)?,
+        Operator::Eq,
+        inner_sq_expr,
+        &schema,
+        &Funding::default(),
+    )?;
     let inner_filter = Arc::new(FilterExec::try_new(
         inner_predicate,
         Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap()),
@@ -169,8 +180,13 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
         SubqueryIndex::new(0),
         outer_results.clone(),
     ));
-    let outer_predicate =
-        binary(col("a", &schema)?, Operator::Eq, outer_sq_expr, &schema)?;
+    let outer_predicate = binary(
+        col("a", &schema)?,
+        Operator::Eq,
+        outer_sq_expr,
+        &schema,
+        &Funding::default(),
+    )?;
     let outer_filter = Arc::new(FilterExec::try_new(
         outer_predicate,
         inner_exec,

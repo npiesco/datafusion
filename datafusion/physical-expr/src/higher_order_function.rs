@@ -40,6 +40,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::{DataType, FieldRef, Schema};
 use datafusion_common::config::{ConfigEntry, ConfigOptions};
 use datafusion_common::datatype::FieldExt;
+use datafusion_common::funding::Funding;
 use datafusion_common::utils::remove_list_null_values;
 use datafusion_common::{
     Result, ScalarValue, exec_err, internal_datafusion_err, internal_err,
@@ -124,35 +125,44 @@ impl HigherOrderFunctionExpr {
     ///
     /// Note that lambda arguments must be present directly in args as [LambdaExpr],
     /// and not as a wrapped child of any arg
+    ///
+    /// Its name, slots and the lists it resolves its return field with are charged to
+    /// `funding` before they are allocated.
     pub fn try_new_with_schema(
         fun: Arc<HigherOrderUDF>,
         args: Vec<Arc<dyn PhysicalExpr>>,
         schema: &Schema,
         config_options: Arc<ConfigOptions>,
+        funding: &Funding,
     ) -> Result<Self> {
-        let name = fun.name().to_string();
-        let mut slots = Vec::with_capacity(args.len());
-        let arg_fields = args
-            .iter()
-            .map(|e| match e.downcast_ref::<LambdaExpr>() {
+        let name = funding.string(fun.name())?;
+        let mut slots = funding.held::<Vec<ArgSlot>>();
+        slots.reserve_exact(args.len())?;
+        let mut arg_fields = funding.held::<Vec<_>>();
+        arg_fields.reserve_exact(args.len())?;
+        for e in &args {
+            match e.downcast_ref::<LambdaExpr>() {
                 Some(lambda) => {
-                    slots.push(ArgSlot::Lambda(Arc::new(lambda.clone())));
-                    Ok(ValueOrLambda::Lambda(lambda.body().return_field(schema)?))
+                    slots.push(ArgSlot::Lambda(funding.arc(funding.cloned(lambda)?)?))?;
+                    arg_fields.push(ValueOrLambda::Lambda(
+                        lambda.body().return_field(schema)?,
+                    ))?;
                 }
                 None => {
-                    slots.push(ArgSlot::Value);
-                    Ok(ValueOrLambda::Value(e.return_field(schema)?))
+                    slots.push(ArgSlot::Value)?;
+                    arg_fields.push(ValueOrLambda::Value(e.return_field(schema)?))?;
                 }
-            })
-            .collect::<Result<Vec<_>>>()?;
+            }
+        }
 
         // verify that input data types is consistent with function's `HigherOrderTypeSignature`
         value_fields_with_higher_order_udf(&arg_fields, fun.as_ref())?;
 
-        let arguments = args
-            .iter()
-            .map(|e| e.downcast_ref::<Literal>().map(|literal| literal.value()))
-            .collect::<Vec<_>>();
+        let mut arguments = funding.held::<Vec<Option<&ScalarValue>>>();
+        arguments.reserve_exact(args.len())?;
+        for e in &args {
+            arguments.push(e.downcast_ref::<Literal>().map(|literal| literal.value()))?;
+        }
 
         let ret_args = HigherOrderReturnFieldArgs {
             arg_fields: &arg_fields,
@@ -160,6 +170,9 @@ impl HigherOrderFunctionExpr {
         };
 
         let return_field = fun.return_field_from_args(ret_args)?;
+        drop(arguments);
+        drop(arg_fields);
+        let slots = slots.keep();
 
         Ok(Self {
             fun,
@@ -506,6 +519,7 @@ fn wrapped_lambda(expr: &Arc<dyn PhysicalExpr>) -> Option<&LambdaExpr> {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use super::*;
@@ -614,6 +628,7 @@ mod tests {
             args.clone(),
             &schema,
             Arc::clone(&config_options),
+            &Funding::default(),
         )
         .unwrap();
 
@@ -627,6 +642,7 @@ mod tests {
             args,
             &schema,
             config_options,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -645,13 +661,24 @@ mod tests {
 
         let hof = HigherOrderFunctionExpr::try_new_with_schema(
             fun,
-            vec![lambda(["a"], Arc::new(Literal::new(expected.clone()))).unwrap()],
+            vec![
+                lambda(
+                    ["a"],
+                    Arc::new(
+                        Literal::new(expected.clone(), &Funding::default()).unwrap(),
+                    ),
+                    &Funding::default(),
+                )
+                .unwrap(),
+            ],
             &Schema::empty(),
             Arc::new(ConfigOptions::new()),
+            &Funding::default(),
         )
         .unwrap();
 
-        let new_children = vec![not(Arc::clone(&hof.args[0])).unwrap()];
+        let new_children =
+            vec![not(Arc::clone(&hof.args[0]), &Funding::default()).unwrap()];
         let wrapped = Arc::new(hof).with_new_children(new_children).unwrap();
 
         let result = wrapped
@@ -682,13 +709,25 @@ mod tests {
             fun,
             vec![
                 not(
-                    lambda(["a"], Arc::new(Literal::new(ScalarValue::Int32(Some(42)))))
-                        .unwrap(),
+                    lambda(
+                        ["a"],
+                        Arc::new(
+                            Literal::new(
+                                ScalarValue::Int32(Some(42)),
+                                &Funding::default(),
+                            )
+                            .unwrap(),
+                        ),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                    &Funding::default(),
                 )
                 .unwrap(),
             ],
             &Schema::empty(),
             Arc::new(ConfigOptions::new()),
+            &Funding::default(),
         )
         .unwrap();
 
@@ -720,11 +759,14 @@ mod tests {
             vec![Arc::new(NoOp::new())],
             &Schema::empty(),
             Arc::new(ConfigOptions::new()),
+            &Funding::default(),
         )
         .unwrap();
 
         let result = Arc::new(hof)
-            .with_new_children(vec![lambda(["a"], Arc::new(NoOp::new())).unwrap()])
+            .with_new_children(vec![
+                lambda(["a"], Arc::new(NoOp::new()), &Funding::default()).unwrap(),
+            ])
             .unwrap_err();
 
         assert_contains!(
@@ -764,6 +806,7 @@ mod tests {
             &schema,
             &ExecutionProps::new(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         )
         .unwrap();
 

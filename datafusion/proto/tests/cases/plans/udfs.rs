@@ -333,11 +333,16 @@ fn roundtrip_higher_order_udf() -> Result<()> {
             col("list_col", &schema)?,
             lambda(
                 ["v"],
-                is_not_null(Arc::new(LambdaVariable::new(1, element_field)))?,
+                is_not_null(
+                    Arc::new(LambdaVariable::new(1, element_field)),
+                    &Funding::default(),
+                )?,
+                &Funding::default(),
             )?,
         ],
         &schema,
         Arc::new(ConfigOptions::default()),
+        &Funding::default(),
     )?;
 
     let project = ProjectionExec::try_new(
@@ -367,7 +372,7 @@ fn roundtrip_higher_order_udf_extension_codec() -> Result<()> {
     let input = Arc::new(EmptyExec::new(schema.clone(), &Funding::default()).unwrap());
 
     let lambda_body = Arc::new(LambdaVariable::new(1, Arc::clone(&element_field)));
-    let lambda_expr = lambda(["v"], lambda_body)?;
+    let lambda_expr = lambda(["v"], lambda_body, &Funding::default())?;
 
     let hof = Arc::new(HigherOrderUDF::new_from_impl(MyHigherOrderUDF::new(
         "payload".to_string(),
@@ -377,6 +382,7 @@ fn roundtrip_higher_order_udf_extension_codec() -> Result<()> {
         vec![col("list_col", &schema)?, lambda_expr],
         &schema,
         Arc::new(ConfigOptions::default()),
+        &Funding::default(),
     )?);
 
     let project = ProjectionExec::try_new(
@@ -466,8 +472,9 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
     let udaf = Arc::new(AggregateUDF::from(MyAggregateUDF::new(
         "result".to_string(),
     )));
-    let aggr_args: Vec<Arc<dyn PhysicalExpr>> =
-        vec![Arc::new(Literal::new(ScalarValue::from(42)))];
+    let aggr_args: Vec<Arc<dyn PhysicalExpr>> = vec![Arc::new(
+        Literal::new(ScalarValue::from(42), &Funding::default()).unwrap(),
+    )];
 
     let aggr_expr = AggregateExprBuilder::new(Arc::clone(&udaf), aggr_args.clone())
         .schema(Arc::clone(&schema))

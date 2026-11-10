@@ -28,6 +28,7 @@ use arrow::{
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::sort_properties::ExprProperties;
@@ -225,6 +226,7 @@ impl NegativeExpr {
 pub fn negative(
     arg: Arc<dyn PhysicalExpr>,
     input_schema: &Schema,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     let data_type = arg.data_type(input_schema)?;
     if data_type.is_null() {
@@ -235,7 +237,7 @@ pub fn negative(
     {
         plan_err!("Negation only supports numeric, interval and timestamp types")
     } else {
-        Ok(Arc::new(NegativeExpr::new(arg)))
+        Ok(funding.arc(NegativeExpr::new(arg))?)
     }
 }
 
@@ -243,6 +245,7 @@ pub fn negative(
 mod tests {
     use super::*;
     use crate::expressions::{Column, col};
+    use datafusion_common::funding::Funding;
 
     use arrow::array::*;
     use arrow::datatypes::DataType::{Float32, Float64, Int8, Int16, Int32, Int64};
@@ -255,7 +258,7 @@ mod tests {
     macro_rules! test_array_negative_op {
         ($DATA_TY:tt, $ARRAY_TY:ty, $($VALUE:expr),*   ) => {
             let schema = Schema::new(vec![Field::new("a", DataType::$DATA_TY, true)]);
-            let expr = negative(col("a", &schema)?, &schema)?;
+            let expr = negative(col("a", &schema)?, &schema, &Funding::default())?;
             assert_eq!(expr.data_type(&schema)?, DataType::$DATA_TY);
             assert!(expr.nullable(&schema)?);
             let mut arr = Vec::new();
@@ -419,7 +422,7 @@ mod tests {
         ];
         for negatable_type in negatable_types {
             let schema = Schema::new(vec![Field::new("a", negatable_type, true)]);
-            let _expr = negative(col("a", &schema)?, &schema)?;
+            let _expr = negative(col("a", &schema)?, &schema, &Funding::default())?;
         }
         Ok(())
     }
@@ -427,7 +430,8 @@ mod tests {
     #[test]
     fn test_negation_invalid_types() -> Result<()> {
         let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
-        let expr = negative(col("a", &schema)?, &schema).unwrap_err();
+        let expr =
+            negative(col("a", &schema)?, &schema, &Funding::default()).unwrap_err();
         matches!(expr, DataFusionError::Plan(_));
         Ok(())
     }

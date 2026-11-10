@@ -99,7 +99,7 @@ pub enum DisplayFormatType {
 /// # let schema = Schema::new(vec![Field::new("i", DataType::Int32, false)]);
 /// # let plan = EmptyExec::new(Arc::new(schema), &datafusion_common::funding::Funding::default()).unwrap();
 /// # let i = col("i", &plan.schema()).unwrap();
-/// # let predicate = binary(i, Operator::Eq, lit(1), &plan.schema()).unwrap();
+/// # let predicate = binary(i, Operator::Eq, lit(1), &plan.schema(), &datafusion_common::funding::Funding::default()).unwrap();
 /// # let plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(predicate, Arc::new(plan), &datafusion_common::funding::Funding::default()).unwrap());
 /// // Get a one line description (Displayable)
 /// let display_plan = displayable(plan.as_ref());
@@ -1718,6 +1718,7 @@ mod tests {
                 datafusion_expr::Operator::Gt,
                 lit(5i32),
                 &schema,
+                &Funding::default(),
             )
             .unwrap();
             let filter = Arc::new(

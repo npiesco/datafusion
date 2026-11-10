@@ -1583,6 +1583,7 @@ pub fn wrap_partition_value_in_dict(val: ScalarValue) -> ScalarValue {
 
 #[cfg(test)]
 mod tests {
+    use datafusion_common::funding::Funding;
     use std::collections::HashMap;
 
     use super::*;
@@ -2039,6 +2040,7 @@ mod tests {
                             &DFSchema::try_from(Arc::clone(&table_schema))?,
                             &ExecutionProps::default(),
                             &PhysicalPlanningContext::default(),
+                            &Funding::default(),
                         )
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -2238,7 +2240,10 @@ mod tests {
             MockSource::new(table_schema.clone()).with_filter(Arc::new(BinaryExpr::new(
                 col("c2", &file_schema).unwrap(),
                 Operator::Eq,
-                Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Int32(Some(10)), &Funding::default())
+                        .unwrap(),
+                ),
             ))),
         );
 
@@ -2427,6 +2432,7 @@ mod tests {
                     &df_schema,
                     &exec_props,
                     &PhysicalPlanningContext::default(),
+                    &Funding::default(),
                 )
                 .unwrap()
             })
@@ -2685,9 +2691,15 @@ mod tests {
             let table_schema = TableSchema::from(&schema);
             let config = FileScanConfigBuilder::new(
                 ObjectStoreUrl::parse("test:///").unwrap(),
-                Arc::new(MockSource::new(table_schema.clone()).with_filter(Arc::new(
-                    Literal::new(ScalarValue::Boolean(Some(true))),
-                ))),
+                Arc::new(
+                    MockSource::new(table_schema.clone()).with_filter(Arc::new(
+                        Literal::new(
+                            ScalarValue::Boolean(Some(true)),
+                            &Funding::default(),
+                        )
+                        .unwrap(),
+                    )),
+                ),
             )
             .with_file_groups(vec![file_group])
             .with_statistics(stats)
@@ -3654,7 +3666,13 @@ mod tests {
             Arc::new(ScalarUDF::from(GetFieldFunc::new())),
             vec![
                 Arc::new(Column::new("s", 0)),
-                Arc::new(Literal::new(ScalarValue::Utf8(Some("x".to_string())))),
+                Arc::new(
+                    Literal::new(
+                        ScalarValue::Utf8(Some("x".to_string())),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
+                ),
             ],
             Arc::new(Field::new("x", DataType::Int32, true)),
             Arc::new(ConfigOptions::default()),
@@ -3787,7 +3805,10 @@ mod tests {
             Arc::new(BinaryExpr::new(
                 make_volatile_expr(),
                 Operator::Plus,
-                Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))),
+                Arc::new(
+                    Literal::new(ScalarValue::Float64(Some(1.0)), &Funding::default())
+                        .unwrap(),
+                ),
             )),
             "expr",
         )]);
