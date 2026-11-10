@@ -230,7 +230,7 @@ pub fn coerce_plan_expr_for_schema(
         // special case Projection to avoid adding multiple projections
         LogicalPlan::Projection(Projection { expr, input, .. }) => {
             let new_exprs = coerce_exprs_for_schema(expr, input.schema(), schema)?;
-            let projection = Projection::try_new(new_exprs, input, &datafusion_common::funding::Funding::default())?;
+            let projection = Projection::try_new(new_exprs, input, &Funding::default())?;
             Ok(LogicalPlan::Projection(projection))
         }
         _ => {
@@ -238,7 +238,8 @@ pub fn coerce_plan_expr_for_schema(
             let new_exprs = coerce_exprs_for_schema(exprs, plan.schema(), schema)?;
             let add_project = new_exprs.iter().any(|expr| expr.try_as_col().is_none());
             if add_project {
-                let projection = Projection::try_new(new_exprs, Arc::new(plan), &datafusion_common::funding::Funding::default())?;
+                let projection =
+                    Projection::try_new(new_exprs, Arc::new(plan), &Funding::default())?;
                 Ok(LogicalPlan::Projection(projection))
             } else {
                 Ok(plan)

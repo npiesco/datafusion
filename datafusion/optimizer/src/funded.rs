@@ -608,7 +608,7 @@ pub(crate) fn conjuncts<'a>(
     funding: &Funding,
     expr: &'a Expr,
 ) -> Result<Held<Vec<&'a Expr>>> {
-    let mut list = funding.held();
+    let mut list: Held<Vec<&'a Expr>> = funding.held();
     let mut refused = Ok(());
     any_conjunct(expr, &mut |conjunct| {
         refused = list.push(conjunct);
@@ -721,7 +721,7 @@ pub(crate) struct HashIndex<'a, T> {
 
 impl<'a, T: Hash + Eq> HashIndex<'a, T> {
     pub(crate) fn new(funding: &Funding, items: &'a [T]) -> Result<Self> {
-        let mut hashes = funding.held();
+        let mut hashes: Held<Vec<(u64, usize)>> = funding.held();
         hashes.reserve_exact(items.len())?;
         // Room for each is charged: extending allocates nothing.
         hashes.extend(
@@ -936,7 +936,7 @@ pub(crate) fn plan_mut<'a>(
     arc: &'a mut Arc<LogicalPlan>,
 ) -> Result<&'a mut LogicalPlan> {
     if Arc::get_mut(arc).is_none() {
-        funding.charge(sum([arc.clone_bytes(), arc_bytes::<LogicalPlan>()]))?;
+        funding.charge(sum([LogicalPlan::clone_bytes(arc), arc_bytes::<LogicalPlan>()]))?;
     }
     Ok(Arc::make_mut(arc))
 }
@@ -1797,34 +1797,6 @@ pub(crate) fn unshare(
     Ok(())
 }
 
-/// [`TreeNode::transform_up`] over `plan`, each shared input copied first, charged
-/// ([`unshare`]).
-pub(crate) fn transform_up_plan<F>(
-    funding: &Funding,
-    mut plan: LogicalPlan,
-    f: F,
-) -> Result<Transformed<LogicalPlan>>
-where
-    F: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
-{
-    unshare(funding, &mut plan, false)?;
-    plan.transform_up(f)
-}
-
-/// [`TreeNode::transform_down`] over `plan`, each shared input copied first, charged
-/// ([`unshare`]).
-pub(crate) fn transform_down_plan<F>(
-    funding: &Funding,
-    mut plan: LogicalPlan,
-    f: F,
-) -> Result<Transformed<LogicalPlan>>
-where
-    F: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
-{
-    unshare(funding, &mut plan, false)?;
-    plan.transform_down(f)
-}
-
 /// [`LogicalPlan::transform_up_with_subqueries`] over `plan`, each shared input and subquery
 /// copied first, charged ([`unshare`]).
 pub(crate) fn transform_up_plan_with_subqueries<F>(
@@ -1837,18 +1809,4 @@ where
 {
     unshare(funding, &mut plan, true)?;
     plan.transform_up_with_subqueries(f)
-}
-
-/// [`LogicalPlan::transform_down_with_subqueries`] over `plan`, each shared input and
-/// subquery copied first, charged ([`unshare`]).
-pub(crate) fn transform_down_plan_with_subqueries<F>(
-    funding: &Funding,
-    mut plan: LogicalPlan,
-    f: F,
-) -> Result<Transformed<LogicalPlan>>
-where
-    F: FnMut(LogicalPlan) -> Result<Transformed<LogicalPlan>>,
-{
-    unshare(funding, &mut plan, true)?;
-    plan.transform_down_with_subqueries(f)
 }

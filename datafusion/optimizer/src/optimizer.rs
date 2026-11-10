@@ -151,7 +151,7 @@ pub trait OptimizerConfig {
 
     /// The funding optimization charges what it allocates to: the options' own. The handle is
     /// cloned, a count bumped.
-    fn funding(&self) -> datafusion_common::funding::Funding {
+    fn funding(&self) -> Funding {
         self.options().funding.clone()
     }
 
@@ -856,12 +856,8 @@ mod tests {
 
         let new_metadata = schema.metadata().clone();
         Arc::new(
-            DFSchema::new_with_metadata(
-                &new_fields,
-                new_metadata,
-                &datafusion_common::funding::Funding::default(),
-            )
-            .unwrap(),
+            DFSchema::new_with_metadata(&new_fields, new_metadata, &Funding::default())
+                .unwrap(),
         )
     }
 
@@ -942,7 +938,11 @@ mod tests {
             let expr = Expr::from(Column::from(projection.schema.qualified_field(0)));
 
             Ok(Transformed::yes(LogicalPlan::Projection(
-                Projection::try_new(vec![expr], Arc::clone(&projection.input), &datafusion_common::funding::Funding::default())?,
+                Projection::try_new(
+                    vec![expr],
+                    Arc::clone(&projection.input),
+                    &Funding::default(),
+                )?,
             )))
         }
     }
@@ -998,7 +998,11 @@ mod tests {
             }
 
             Ok(Transformed::yes(LogicalPlan::Projection(
-                Projection::try_new(exprs, Arc::clone(&projection.input), &datafusion_common::funding::Funding::default())?,
+                Projection::try_new(
+                    exprs,
+                    Arc::clone(&projection.input),
+                    &Funding::default(),
+                )?,
             )))
         }
     }
@@ -1140,6 +1144,7 @@ mod tests {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("Int32(1)")],
             Arc::clone(&input),
+            &Funding::default(),
         )?);
         // The input's own expression, its block, and the empty relation below it, shared
         // once the input is copied.

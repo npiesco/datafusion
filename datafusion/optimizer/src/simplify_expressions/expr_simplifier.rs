@@ -1026,7 +1026,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 let mut lhs = conjuncts_owned(f, f.unboxed(left))?;
                 deduplicated(f, &mut *lhs)?;
                 let mut right = conjuncts_owned(f, f.unboxed(right))?;
-                let (mut common, mut rhs) = (f.held(), f.held());
+                let (mut common, mut rhs): (Held<Vec<Expr>>, Held<Vec<Expr>>) =
+                    (f.held(), f.held());
                 common.reserve_exact(right.len())?;
                 rhs.reserve_exact(right.len())?;
                 {
@@ -1249,14 +1250,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 && !info.get_data_type(&left)?.is_floating()
                 && is_one(&right) =>
             {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             //
@@ -1287,14 +1282,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseAnd,
                 right,
             }) if is_negative_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // A & !A -> 0 (if A not nullable)
@@ -1303,14 +1292,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseAnd,
                 right,
             }) if is_negative_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_zero(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_zero(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // (..A..) & A --> (..A..)
@@ -1373,14 +1356,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseOr,
                 right,
             }) if is_negative_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // A | !A -> -1 (if A not nullable)
@@ -1389,14 +1366,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseOr,
                 right,
             }) if is_negative_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // (..A..) | A --> (..A..)
@@ -1463,14 +1434,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseXor,
                 right,
             }) if is_negative_of(&left, &right) && !info.nullable(&right)? => {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // A ^ !A -> -1 (if A not nullable)
@@ -1479,14 +1444,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 op: BitwiseXor,
                 right,
             }) if is_negative_of(&right, &left) && !info.nullable(&left)? => {
-                Transformed::yes(replaced(
-                    f,
-                    (left, right),
-                    Expr::Literal(
-                        ScalarValue::new_negative_one(&info.get_data_type(&left)?)?,
-                        None,
-                    ),
-                ))
+                let literal = ScalarValue::new_negative_one(&info.get_data_type(&left)?)?;
+                Transformed::yes(replaced(f, (left, right), Expr::Literal(literal, None)))
             }
 
             // (..A..) ^ A --> (the expression without A, if number of A is odd, otherwise one A)

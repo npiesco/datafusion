@@ -1608,8 +1608,7 @@ impl LogicalPlan {
                     // if no placeholders.
                     Ok(Transformed::no(e))
                 } else {
-                    let original_name = name_preserver
-                        .save(&e, &datafusion_common::funding::Funding::default())?;
+                    let original_name = name_preserver.save(&e, &Funding::default())?;
                     let transformed_expr = e.transform_up(|e| {
                         if let Expr::Placeholder(Placeholder { id, .. }) = e {
                             let (value, metadata) = param_values
@@ -1621,12 +1620,8 @@ impl LogicalPlan {
                         }
                     })?;
                     // Preserve name to avoid breaking column references to this expression
-                    transformed_expr.map_data(|expr| {
-                        original_name.restore(
-                            expr,
-                            &datafusion_common::funding::Funding::default(),
-                        )
-                    })
+                    transformed_expr
+                        .map_data(|expr| original_name.restore(expr, &Funding::default()))
                 }
             })?
             .map_data(|plan| plan.update_schema_data_type())

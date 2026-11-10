@@ -155,7 +155,7 @@ impl SimplifyExpressions {
 
         // Preserve expression names to avoid changing the schema of the plan.
         let name_preserver = NamePreserver::new(&plan);
-        let mut rewrite_expr = |expr: &mut Expr| -> Result<bool> {
+        let rewrite_expr = |expr: &mut Expr| -> Result<bool> {
             let name = name_preserver.save(expr, f)?;
             let (rewritten, _) =
                 simplifier.simplify_with_cycle_count_transformed(std::mem::take(expr))?;
