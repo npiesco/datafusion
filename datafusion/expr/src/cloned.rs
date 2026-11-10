@@ -26,11 +26,20 @@ use crate::expr::{
     Placeholder, ScalarFunction, SetComparison, Sort, TryCast, Unnest, WildcardOptions,
     WindowFunction, WindowFunctionParams,
 };
-use crate::logical_plan::Subquery;
+use crate::logical_plan::{
+    Aggregate, ColumnUnnestList, Distinct, DistinctOn, Filter, Join, Limit, LogicalPlan,
+    Partitioning, Projection, RecursiveQuery, Repartition, Sort as SortPlan, Subquery,
+    SubqueryAlias, TableScan, Union, Unnest as UnnestPlan, Values, Window,
+};
 use crate::{Expr, GroupingSet, WindowFrame, WindowFrameBound};
 
 fn sum(parts: impl IntoIterator<Item = usize>) -> usize {
     parts.into_iter().fold(0, usize::saturating_add)
+}
+
+/// The list block a clone of `items` allocates, not what its items own.
+fn list_block<T>(items: &[T]) -> usize {
+    items.len().saturating_mul(size_of::<T>())
 }
 
 impl CloneBytes for Expr {
@@ -216,6 +225,102 @@ impl CloneBytes for WildcardOptions {
     }
 }
 
+impl CloneBytes for LogicalPlan {
+    /// The node alone: its inputs and schemas are counted blocks the clone shares. A node
+    /// holding parts whose clone is not measured is never funded.
+    fn clone_bytes(&self) -> usize {
+        match self {
+            LogicalPlan::Projection(Projection { expr, .. }) => expr.clone_bytes(),
+            LogicalPlan::Filter(Filter { predicate, .. }) => predicate.clone_bytes(),
+            LogicalPlan::Window(Window { window_expr, .. }) => window_expr.clone_bytes(),
+            LogicalPlan::Aggregate(Aggregate {
+                group_expr,
+                aggr_expr,
+                ..
+            }) => sum([group_expr.clone_bytes(), aggr_expr.clone_bytes()]),
+            LogicalPlan::Sort(SortPlan { expr, .. }) => expr.clone_bytes(),
+            LogicalPlan::Join(Join { on, filter, .. }) => {
+                sum([on.clone_bytes(), filter.clone_bytes()])
+            }
+            LogicalPlan::Repartition(Repartition {
+                partitioning_scheme,
+                ..
+            }) => match partitioning_scheme {
+                Partitioning::RoundRobinBatch(_) => 0,
+                Partitioning::Hash(exprs, _) | Partitioning::DistributeBy(exprs) => {
+                    exprs.clone_bytes()
+                }
+                Partitioning::Range(_) => usize::MAX,
+            },
+            LogicalPlan::Union(Union { inputs, .. }) => inputs.clone_bytes(),
+            LogicalPlan::TableScan(TableScan {
+                projection,
+                filters,
+                statistics_requests,
+                ..
+            }) => {
+                if statistics_requests.is_empty() {
+                    sum([
+                        projection.as_deref().map_or(0, list_block),
+                        filters.clone_bytes(),
+                    ])
+                } else {
+                    usize::MAX
+                }
+            }
+            LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::SubqueryAlias(SubqueryAlias { .. })
+            | LogicalPlan::Extension(_)
+            | LogicalPlan::DescribeTable(_)
+            | LogicalPlan::Distinct(Distinct::All(_)) => 0,
+            LogicalPlan::Subquery(subquery) => subquery.clone_bytes(),
+            LogicalPlan::Limit(Limit { skip, fetch, .. }) => {
+                sum([skip.clone_bytes(), fetch.clone_bytes()])
+            }
+            LogicalPlan::Values(Values { values, .. }) => values.clone_bytes(),
+            LogicalPlan::Distinct(Distinct::On(DistinctOn {
+                on_expr,
+                select_expr,
+                sort_expr,
+                ..
+            })) => sum([
+                on_expr.clone_bytes(),
+                select_expr.clone_bytes(),
+                sort_expr.clone_bytes(),
+            ]),
+            LogicalPlan::Unnest(UnnestPlan {
+                exec_columns,
+                list_type_columns,
+                struct_type_columns,
+                dependency_indices,
+                options,
+                ..
+            }) => sum([
+                exec_columns.clone_bytes(),
+                list_block(list_type_columns.as_slice()).saturating_add(sum(
+                    list_type_columns.iter().map(
+                        |(_, ColumnUnnestList { output_column, .. })| {
+                            output_column.clone_bytes()
+                        },
+                    ),
+                )),
+                list_block(struct_type_columns),
+                list_block(dependency_indices),
+                options.clone_bytes(),
+            ]),
+            LogicalPlan::RecursiveQuery(RecursiveQuery { name, .. }) => {
+                name.clone_bytes()
+            }
+            LogicalPlan::Statement(_)
+            | LogicalPlan::Explain(_)
+            | LogicalPlan::Analyze(_)
+            | LogicalPlan::Dml(_)
+            | LogicalPlan::Ddl(_)
+            | LogicalPlan::Copy(_) => usize::MAX,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +336,16 @@ mod tests {
             + "a".len()
             + "text".len();
         assert_eq!(expr.clone_bytes(), bytes);
+    }
+
+    /// A plan node's clone is measured without its inputs, which the clone shares.
+    #[test]
+    fn a_plan_clone_is_measured_without_its_inputs() {
+        let input = std::sync::Arc::new(LogicalPlan::Filter(Filter::new(
+            col("inner").eq(lit(1)),
+            std::sync::Arc::new(LogicalPlan::default()),
+        )));
+        let plan = LogicalPlan::Filter(Filter::new(col("a").eq(lit(1)), input));
+        assert_eq!(plan.clone_bytes(), 2 * size_of::<Expr>() + "a".len());
     }
 }
