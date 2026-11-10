@@ -1529,7 +1529,7 @@ impl DefaultPhysicalPlanner {
                             .map(|(qualifier, field)| {
                                 (qualifier.cloned(), Arc::clone(field))
                             })
-                            .collect();
+                            .collect::<Vec<_>>();
 
                         let metadata: HashMap<_, _> = left_df_schema
                             .metadata()

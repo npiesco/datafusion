@@ -3149,7 +3149,7 @@ impl TableScanBuilder {
                         .map(|i| {
                             (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
                         })
-                        .collect(),
+                        .collect::<Vec<_>>(),
                     schema.metadata.clone(),
                     &Funding::default(),
                 )?;
@@ -3431,7 +3431,7 @@ impl Union {
                 field.set_metadata(field_metadata);
                 Ok((None, Arc::new(field)))
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let union_schema_metadata = intersect_metadata_for_union(
             inputs.iter().map(|input| input.schema().metadata()),
         );
@@ -3819,7 +3819,7 @@ impl DistinctOn {
         }
 
         let on_expr = normalize_cols(on_expr, input.as_ref())?;
-        let qualified_fields =
+        let qualified_fields: Vec<_> =
             exprlist_to_fields(select_expr.as_slice(), &input, &Funding::default())?
                 .into_iter()
                 .collect();

@@ -587,7 +587,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// The funding what this planner allocates is charged to ([`ContextProvider::funding`]).
-    pub fn funding(&self) -> &datafusion_common::funding::Funding {
+    pub fn funding(&self) -> &Funding {
         self.context_provider.funding()
     }
 
@@ -725,10 +725,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     /// Validate the schema provides all of the columns referenced in the expressions.
     /// Checks every column `exprs` reference resolves in `schema`, walking them without
     /// allocating.
-    pub(crate) fn validate_schema_satisfies_exprs<'a>(
+    pub(crate) fn validate_schema_satisfies_exprs<'e>(
         &self,
         schema: &DFSchema,
-        exprs: impl IntoIterator<Item = &'a Expr>,
+        exprs: impl IntoIterator<Item = &'e Expr>,
     ) -> Result<()> {
         for expr in exprs {
             let mut resolved = Ok(());
@@ -1116,8 +1116,8 @@ impl IdentTaker {
 }
 
 // impl Display for a nicer error message
-impl std::fmt::Display for IdentTaker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for IdentTaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for ident in self.idents.iter() {
             if !first {
