@@ -87,7 +87,7 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Distinct(Distinct::All(input)) => {
-                let group_expr = expand_wildcard(input.schema(), &input, None)?;
+                let group_expr = expand_wildcard(input.schema(), &input, None, &datafusion_common::funding::Funding::default())?;
 
                 if group_expr.is_empty() {
                     // Special case: there are no columns to group by, so we can't replace it by a group by

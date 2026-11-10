@@ -24,7 +24,7 @@ use std::iter::once;
 use std::sync::Arc;
 
 use crate::dml::CopyTo;
-use crate::expr::{Alias, PlannedReplaceSelectItem, Sort as SortExpr};
+use crate::expr::{Alias, Sort as SortExpr, WildcardOptions};
 use crate::expr_rewriter::{
     coerce_plan_expr_for_schema, normalize_col,
     normalize_col_with_schemas_and_ambiguity_check, normalize_cols, normalize_sorts,
@@ -2070,63 +2070,41 @@ fn project_with_validation(
     schema: Option<&DFSchemaRef>,
     funding: &Funding,
 ) -> Result<LogicalPlan> {
-    let mut projected_expr = Vec::new();
+    let validated = |e: Expr, validate: bool| {
+        if validate {
+            columnize_expr(normalize_col(e, &plan)?, &plan)
+        } else {
+            Ok(e)
+        }
+    };
+    let mut projected_expr = funding.held::<Vec<Expr>>();
     let mut has_wildcard = false;
     for (e, validate) in expr {
         let e = e.into();
-        match e {
+        let expanded = match e {
             SelectExpr::Wildcard(opt) => {
                 has_wildcard = true;
-                let expanded = expand_wildcard(plan.schema(), &plan, Some(&opt))?;
-
-                // If there is a REPLACE statement, replace that column with the given
-                // replace expression. Column name remains the same.
-                let expanded = if let Some(replace) = opt.replace {
-                    replace_columns(expanded, &replace)?
-                } else {
-                    expanded
-                };
-
-                for e in expanded {
-                    let e = if validate {
-                        columnize_expr(normalize_col(e, &plan)?, &plan)?
-                    } else {
-                        e
-                    };
-                    funding.push(&mut projected_expr, e)?;
-                }
+                expand_wildcard(plan.schema(), &plan, Some(&opt), funding)
+                    .and_then(|expanded| replaced_columns(expanded, &opt, funding))?
             }
             SelectExpr::QualifiedWildcard(table_ref, opt) => {
                 has_wildcard = true;
-                let expanded =
-                    expand_qualified_wildcard(&table_ref, plan.schema(), Some(&opt))?;
-
-                // If there is a REPLACE statement, replace that column with the given
-                // replace expression. Column name remains the same.
-                let expanded = if let Some(replace) = opt.replace {
-                    replace_columns(expanded, &replace)?
-                } else {
-                    expanded
-                };
-
-                for e in expanded {
-                    let e = if validate {
-                        columnize_expr(normalize_col(e, &plan)?, &plan)?
-                    } else {
-                        e
-                    };
-                    funding.push(&mut projected_expr, e)?;
-                }
+                expand_qualified_wildcard(&table_ref, plan.schema(), Some(&opt), funding)
+                    .and_then(|expanded| replaced_columns(expanded, &opt, funding))?
             }
             SelectExpr::Expression(e) => {
-                let e = if validate {
-                    columnize_expr(normalize_col(e, &plan)?, &plan)?
-                } else {
-                    e
-                };
-                funding.push(&mut projected_expr, e)?;
+                projected_expr.push(validated(e, validate)?)?;
+                continue;
             }
-        }
+        };
+        // The expanded list is freed once its expressions are taken.
+        let mut expanded = expanded;
+        let taken = expanded.drain(..).try_for_each(|e| {
+            let e = validated(e, validate)?;
+            projected_expr.push(e)
+        });
+        funding.released(expanded);
+        taken?;
     }
 
     if has_wildcard && projected_expr.is_empty() && !plan.schema().fields().is_empty() {
@@ -2148,30 +2126,58 @@ fn project_with_validation(
 
     validate_unique_names("Projections", projected_expr.iter(), funding)?;
 
-    Projection::try_new(projected_expr, funding.arc(plan)?, funding)
+    Projection::try_new(projected_expr.keep(), funding.arc(plan)?, funding)
         .map(LogicalPlan::Projection)
 }
 
-/// If there is a REPLACE statement in the projected expression in the form of
-/// "REPLACE (some_column_within_an_expr AS some_column)", this function replaces
-/// that column with the given replace expression. Column name remains the same.
-/// Multiple REPLACEs are also possible with comma separations.
-fn replace_columns(
+/// `exprs`, a wildcard's expansion made through `funding`, with any column the wildcard's
+/// REPLACE names replaced by its expression, copied through `funding`, aliased to keep the
+/// column's name. On failure the expansion is freed.
+fn replaced_columns(
     mut exprs: Vec<Expr>,
-    replace: &PlannedReplaceSelectItem,
+    options: &WildcardOptions,
+    funding: &Funding,
 ) -> Result<Vec<Expr>> {
-    for expr in exprs.iter_mut() {
-        if let Expr::Column(Column { name, .. }) = expr
-            && let Some((_, new_expr)) = replace
+    let Some(replace) = &options.replace else {
+        return Ok(exprs);
+    };
+    let replaced = exprs.iter_mut().try_for_each(|expr| {
+        let new_expr = match &*expr {
+            Expr::Column(Column { name, .. }) => replace
                 .items()
                 .iter()
                 .zip(replace.expressions().iter())
                 .find(|(item, _)| item.column_name.value == *name)
-        {
-            *expr = new_expr.clone().alias(name.clone())
+                .map(|(_, new_expr)| new_expr),
+            _ => None,
+        };
+        if let Some(new_expr) = new_expr {
+            let new_expr = funding.cloned(new_expr)?;
+            if let Expr::Column(Column { name, .. }) = std::mem::take(expr) {
+                *expr = new_expr.alias(name);
+            }
+        }
+        Ok(())
+    });
+    match replaced {
+        Ok(()) => Ok(exprs),
+        Err(e) => {
+            // Each is a column the expansion made, or a copied expression aliased to its
+            // name: the alias's box was not made through `funding`.
+            for expr in exprs.drain(..) {
+                match expr {
+                    Expr::Column(column) => funding.released_clone(column),
+                    Expr::Alias(Alias { expr, name, .. }) => {
+                        funding.released_clone(*expr);
+                        funding.released(name);
+                    }
+                    _ => {}
+                }
+            }
+            funding.released(exprs);
+            Err(e)
         }
     }
-    Ok(exprs)
 }
 
 /// Create a SubqueryAlias to wrap a LogicalPlan.
