@@ -5957,7 +5957,8 @@ mod tests {
                         )])),
                         1,
                         &Funding::default(),
-                    ),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
         );

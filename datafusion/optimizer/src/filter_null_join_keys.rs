@@ -439,6 +439,7 @@ mod tests {
         let (t1, t2) = test_tables()?;
         let plan = build_plan(t1, t2, "t1.optional_id", "t2.id", JoinType::Inner)?;
         let mut options = ConfigOptions::default();
+        options.optimizer.filter_null_join_keys = true;
         options.funding = Funding::new(Arc::new(Refusing));
         let config = OptimizerContext::new_with_config_options(Arc::new(options));
 
