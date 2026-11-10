@@ -235,6 +235,16 @@ impl Funding {
         }
     }
 
+    /// What planning made and handed out, charged through this handle and not given back,
+    /// handed on to whoever holds it: it holds that charge from now, and gives it back to the
+    /// source itself once it frees what planning made. The handle has nothing outstanding then,
+    /// for the next statement planned within it.
+    pub fn hand_over(&self) -> usize {
+        self.0
+            .as_ref()
+            .map_or(0, |funded| funded.outstanding.swap(0, Ordering::AcqRel))
+    }
+
     /// What was made through this handle since it had `before` outstanding has all been
     /// freed (planning recovered from the attempt that made it): given back.
     pub fn unwound(&self, before: usize) {
@@ -673,6 +683,22 @@ mod tests {
         assert_eq!(held(&source), arc_slice_bytes::<u64>(4).unwrap());
         drop(made);
         funding.discharge(arc_slice_bytes::<u64>(4).unwrap());
+        assert_eq!(held(&source), 0);
+    }
+
+    /// What planning made, handed over, is no longer the handle's: given back by its holder,
+    /// straight to the source.
+    #[test]
+    fn a_plan_handed_over_leaves_the_handle_nothing_outstanding() {
+        let (source, funding) = limited(1 << 10);
+        let kept = funding.string("kept").unwrap();
+        assert_eq!(funding.hand_over(), kept.capacity());
+        assert_eq!(funding.outstanding(), 0);
+        assert_eq!(held(&source), kept.capacity());
+        funding.unwound(0);
+        assert_eq!(held(&source), kept.capacity(), "nothing of it is unwound");
+        source.discharge(kept.capacity());
+        drop(kept);
         assert_eq!(held(&source), 0);
     }
 }
