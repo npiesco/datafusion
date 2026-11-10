@@ -16,13 +16,13 @@
 // under the License.
 
 //! [`OptimizeUnions`]: removes `Union` nodes in the logical plan.
+use crate::funded::{coerced_for_schema, freed, unwrapped};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::Transformed;
-use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
+use datafusion_common::{DFSchema, Result, internal_err};
 use datafusion_expr::{Distinct, LogicalPlan, Projection, Union};
-use itertools::Itertools;
 use std::sync::Arc;
 
 #[derive(Default, Debug)]
@@ -54,43 +54,36 @@ impl OptimizerRule for OptimizeUnions {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        let funding = config.funding();
         match plan {
-            LogicalPlan::Union(Union { mut inputs, .. }) if inputs.len() == 1 => Ok(
-                Transformed::yes(Arc::unwrap_or_clone(inputs.pop().unwrap())),
-            ),
+            LogicalPlan::Union(Union { mut inputs, .. }) if inputs.len() == 1 => {
+                let input = inputs.pop().unwrap();
+                freed(&funding, inputs);
+                Ok(Transformed::yes(unwrapped(&funding, input)?))
+            }
             LogicalPlan::Union(Union { inputs, schema }) => {
-                let inputs = inputs
-                    .into_iter()
-                    .flat_map(extract_plans_from_union)
-                    .map(|plan| Ok(Arc::new(coerce_plan_expr_for_schema(plan, &schema)?)))
-                    .collect::<Result<Vec<_>>>()?;
-
+                let inputs = flattened(&funding, inputs, &schema, false)?;
                 Ok(Transformed::yes(LogicalPlan::Union(Union {
                     inputs,
                     schema,
                 })))
             }
-            LogicalPlan::Distinct(Distinct::All(nested_plan)) => {
-                match Arc::unwrap_or_clone(nested_plan) {
+            LogicalPlan::Distinct(Distinct::All(nested_plan))
+                if matches!(nested_plan.as_ref(), LogicalPlan::Union(_)) =>
+            {
+                match unwrapped(&funding, nested_plan)? {
                     LogicalPlan::Union(Union { inputs, schema }) => {
-                        let inputs = inputs
-                            .into_iter()
-                            .map(extract_plan_from_distinct)
-                            .flat_map(extract_plans_from_union)
-                            .map(|plan| coerce_plan_expr_for_schema(plan, &schema))
-                            .collect::<Result<Vec<_>>>()?;
-
+                        let inputs = flattened(&funding, inputs, &schema, true)?;
+                        let union =
+                            funding.arc(LogicalPlan::Union(Union { inputs, schema }))?;
                         Ok(Transformed::yes(LogicalPlan::Distinct(Distinct::All(
-                            Arc::new(LogicalPlan::Union(Union {
-                                inputs: inputs.into_iter().map(Arc::new).collect_vec(),
-                                schema: Arc::clone(&schema),
-                            })),
+                            union,
                         ))))
                     }
                     nested_plan => Ok(Transformed::no(LogicalPlan::Distinct(
-                        Distinct::All(Arc::new(nested_plan)),
+                        Distinct::All(funding.arc(nested_plan)?),
                     ))),
                 }
             }
@@ -99,12 +92,46 @@ impl OptimizerRule for OptimizeUnions {
     }
 }
 
-fn extract_plans_from_union(plan: Arc<LogicalPlan>) -> Vec<LogicalPlan> {
-    match Arc::unwrap_or_clone(plan) {
-        LogicalPlan::Union(Union { inputs, .. }) => inputs
-            .into_iter()
-            .map(Arc::unwrap_or_clone)
-            .collect::<Vec<_>>(),
+/// The inputs of a union over `inputs`, each nested union's inputs in its place (a
+/// `DISTINCT` over each first taken off when `distinct`), each coerced to `schema`: the
+/// list and what it holds charged as they are made, `inputs`' block given back.
+fn flattened(
+    funding: &Funding,
+    mut inputs: Vec<Arc<LogicalPlan>>,
+    schema: &DFSchema,
+    distinct: bool,
+) -> Result<Vec<Arc<LogicalPlan>>> {
+    let mut flattened = funding.vec_with_capacity(inputs.len())?;
+    for input in inputs.drain(..) {
+        let input = if distinct {
+            extract_plan_from_distinct(funding, input)?
+        } else {
+            input
+        };
+        extract_plans_from_union(funding, input, &mut |plan| {
+            let plan = funding.arc(coerced_for_schema(funding, plan, schema)?)?;
+            funding.push(&mut flattened, plan)
+        })?;
+    }
+    freed(funding, inputs);
+    Ok(flattened)
+}
+
+/// Calls `emit` with each plan `plan` unnests into: a union's inputs, or a projection's
+/// over each input of the union under it, or `plan` itself.
+fn extract_plans_from_union(
+    funding: &Funding,
+    plan: Arc<LogicalPlan>,
+    emit: &mut dyn FnMut(LogicalPlan) -> Result<()>,
+) -> Result<()> {
+    match unwrapped(funding, plan)? {
+        LogicalPlan::Union(Union { mut inputs, .. }) => {
+            for input in inputs.drain(..) {
+                emit(unwrapped(funding, input)?)?;
+            }
+            freed(funding, inputs);
+            Ok(())
+        }
         // While unnesting, unwrap a Projection whose input is a nested Union,
         // flatten the inner Union, and push the same Projection down onto
         // each of the nested Union’s children.
@@ -117,34 +144,37 @@ fn extract_plans_from_union(plan: Arc<LogicalPlan>) -> Vec<LogicalPlan> {
             input,
             schema,
             ..
-        }) => match Arc::unwrap_or_clone(input) {
-            LogicalPlan::Union(Union { inputs, .. }) => inputs
-                .into_iter()
-                .map(Arc::unwrap_or_clone)
-                .map(|plan| {
-                    LogicalPlan::Projection(
-                        Projection::try_new_with_schema(
-                            expr.clone(),
-                            Arc::new(plan),
-                            Arc::clone(&schema),
-                        )
-                        .unwrap(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-
-            plan => vec![LogicalPlan::Projection(
-                Projection::try_new_with_schema(expr, Arc::new(plan), schema).unwrap(),
-            )],
-        },
-        plan => vec![plan],
+        }) if matches!(input.as_ref(), LogicalPlan::Union(_)) => {
+            let LogicalPlan::Union(Union { mut inputs, .. }) = unwrapped(funding, input)?
+            else {
+                return internal_err!("optimize_unions: projection lost its union input");
+            };
+            for input in inputs.drain(..) {
+                emit(LogicalPlan::Projection(Projection::try_new_with_schema(
+                    funding.to_vec(&expr)?,
+                    input,
+                    Arc::clone(&schema),
+                )?))?;
+            }
+            freed(funding, inputs);
+            freed(funding, expr);
+            Ok(())
+        }
+        plan => emit(plan),
     }
 }
 
-fn extract_plan_from_distinct(plan: Arc<LogicalPlan>) -> Arc<LogicalPlan> {
-    match Arc::unwrap_or_clone(plan) {
-        LogicalPlan::Distinct(Distinct::All(plan)) => plan,
-        plan => Arc::new(plan),
+/// `plan` with a `DISTINCT` over it taken off.
+fn extract_plan_from_distinct(
+    funding: &Funding,
+    plan: Arc<LogicalPlan>,
+) -> Result<Arc<LogicalPlan>> {
+    if !matches!(plan.as_ref(), LogicalPlan::Distinct(Distinct::All(_))) {
+        return Ok(plan);
+    }
+    match unwrapped(funding, plan)? {
+        LogicalPlan::Distinct(Distinct::All(plan)) => Ok(plan),
+        plan => funding.arc(plan),
     }
 }
 
@@ -155,8 +185,10 @@ mod tests {
     use crate::analyzer::Analyzer;
     use crate::analyzer::type_coercion::TypeCoercion;
     use crate::assert_optimized_plan_eq_snapshot;
+    use crate::funded::Freed;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::PlanningFunding;
     use datafusion_expr::{col, logical_plan::table_scan};
 
     fn schema() -> Schema {
@@ -499,5 +531,71 @@ mod tests {
             plan,
             @"TableScan: table"
         )
+    }
+
+    struct Refusing;
+
+    impl PlanningFunding for Refusing {
+        fn charge(&self, _bytes: usize) -> bool {
+            false
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    struct Unlimited;
+
+    impl PlanningFunding for Unlimited {
+        fn charge(&self, _bytes: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    fn context(funding: Funding) -> OptimizerContext {
+        let mut options = ConfigOptions::default();
+        options.funding = funding;
+        OptimizerContext::new_with_config_options(Arc::new(options))
+    }
+
+    fn nested_union() -> Result<LogicalPlan> {
+        let plan_builder = table_scan(Some("table"), &schema(), None)?;
+        plan_builder
+            .clone()
+            .union(plan_builder.clone().build()?)?
+            .union(plan_builder.build()?)?
+            .build()
+    }
+
+    #[test]
+    fn flattening_a_union_is_refused_unfunded() -> Result<()> {
+        let config = context(Funding::new(Arc::new(Refusing)));
+
+        let refused = OptimizeUnions::new()
+            .rewrite(nested_union()?, &config)
+            .unwrap_err();
+
+        assert!(refused.refused().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn flattened_union_holds_what_was_charged() -> Result<()> {
+        let plan = nested_union()?;
+        let config = context(Funding::new(Arc::new(Unlimited)));
+        // Planned through the same funding.
+        config.options().funding.charge(plan.freed_bytes())?;
+
+        let flattened = OptimizeUnions::new().rewrite(plan, &config)?;
+
+        assert!(flattened.transformed);
+        assert_eq!(flattened.data.inputs().len(), 3);
+        // The nested union's node, block and list are given back.
+        assert_eq!(
+            config.options().funding.outstanding(),
+            flattened.data.freed_bytes()
+        );
+        Ok(())
     }
 }

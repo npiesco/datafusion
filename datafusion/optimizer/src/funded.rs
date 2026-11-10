@@ -41,13 +41,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
 
+use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::cloned::CloneBytes;
 use datafusion_common::funding::{Funding, Held, arc_bytes};
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, ExprSchema, RecursionUnnestOption,
-    Result, ScalarValue, Spans, TableReference, internal_err,
+    Result, ScalarValue, Spans, TableReference, internal_err, plan_err,
 };
 use datafusion_expr::dml::CopyTo;
 use datafusion_expr::expr::{
@@ -663,6 +664,197 @@ pub(crate) fn nullable_cast(
         size_of::<Expr>(),
     ]))?;
     Ok(Expr::Cast(Cast::new(Box::new(expr), data_type.clone())))
+}
+
+/// What holds an expression's place while it is moved out to be rebuilt; it allocates
+/// nothing.
+pub(crate) fn vacated() -> Expr {
+    Expr::Literal(ScalarValue::Null, None)
+}
+
+/// Whether `expr` has type `data_type` over `schema`: a column's type compared in place,
+/// any other expression's through [`ExprSchemable::get_type`].
+fn has_type(expr: &Expr, schema: &dyn ExprSchema, data_type: &DataType) -> Result<bool> {
+    Ok(match expr {
+        Expr::Column(column) => schema.data_type(column)? == data_type,
+        _ => expr.get_type(schema)? == *data_type,
+    })
+}
+
+/// `expr` cast to `data_type` over `schema` as [`ExprSchemable::cast_to`] casts it:
+/// itself if it already has the type, a scalar subquery's plan cast under a projection,
+/// any other expression boxed in a cast ([`nullable_cast`]); what each makes charged
+/// first.
+pub(crate) fn cast_to(
+    funding: &Funding,
+    expr: Expr,
+    data_type: &DataType,
+    schema: &dyn ExprSchema,
+) -> Result<Expr> {
+    let computed;
+    let this_type = match &expr {
+        Expr::Column(column) => schema.data_type(column)?,
+        _ => {
+            computed = expr.get_type(schema)?;
+            &computed
+        }
+    };
+    if this_type == data_type {
+        return Ok(expr);
+    }
+    let can_cast = match (this_type, data_type) {
+        // Always allow struct-to-struct casts; field matching happens at runtime
+        (DataType::Struct(_), DataType::Struct(_)) => true,
+        _ => can_cast_types(this_type, data_type),
+    };
+    if !can_cast {
+        return plan_err!("Cannot automatically convert {this_type} to {data_type}");
+    }
+    match expr {
+        Expr::ScalarSubquery(subquery) => Ok(Expr::ScalarSubquery(cast_subquery(
+            funding, subquery, data_type,
+        )?)),
+        expr => nullable_cast(funding, expr, data_type),
+    }
+}
+
+/// `subquery` with its one column cast to `data_type`, as
+/// [`datafusion_expr::expr_schema::cast_subquery`] casts it: its projection's expression
+/// copied and cast under a projection over the same input, or a cast column projected over
+/// any other plan; the projection and its block charged first, the plan it replaces given
+/// back.
+pub(crate) fn cast_subquery(
+    funding: &Funding,
+    subquery: Subquery,
+    data_type: &DataType,
+) -> Result<Subquery> {
+    if subquery.subquery.schema().field(0).data_type() == data_type {
+        return Ok(subquery);
+    }
+    let Subquery {
+        subquery: plan,
+        outer_ref_columns,
+        spans,
+    } = subquery;
+    let projection = if let LogicalPlan::Projection(projection) = plan.as_ref() {
+        let expr = cast_to(
+            funding,
+            funding.cloned(&projection.expr[0])?,
+            data_type,
+            projection.input.schema(),
+        )?;
+        let projection = Projection::try_new(
+            funding.vec_of([expr])?,
+            Arc::clone(&projection.input),
+            funding,
+        )?;
+        freed(funding, plan);
+        projection
+    } else {
+        let (qualifier, field) = plan.schema().qualified_field(0);
+        let expr = cast_to(
+            funding,
+            column_expr(funding, qualifier, field.name())?,
+            data_type,
+            plan.schema(),
+        )?;
+        Projection::try_new(funding.vec_of([expr])?, plan, funding)?
+    };
+    freed(funding, spans);
+    Ok(Subquery {
+        subquery: funding.arc(LogicalPlan::Projection(projection))?,
+        outer_ref_columns,
+        spans: Spans::new(),
+    })
+}
+
+/// `exprs`, over `source`, cast in place to the types of `target`'s fields as
+/// [`datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema`] casts a projection's:
+/// an alias's expression cast in its box (its qualifier and metadata dropped), a column's
+/// cast aliased to its name, a wildcard left as it is.
+fn coerce_exprs_in_place(
+    funding: &Funding,
+    exprs: &mut [Expr],
+    source: &DFSchema,
+    target: &DFSchema,
+) -> Result<()> {
+    for (idx, slot) in exprs.iter_mut().enumerate() {
+        let new_type = target.field(idx).data_type();
+        if has_type(slot, source, new_type)? {
+            continue;
+        }
+        *slot = match std::mem::replace(slot, vacated()) {
+            Expr::Alias(mut alias) => {
+                let inner = std::mem::replace(alias.expr.as_mut(), vacated());
+                *alias.expr = cast_to(funding, inner, new_type, source)?;
+                alias.relation = None;
+                alias.metadata = None;
+                Expr::Alias(alias)
+            }
+            #[expect(deprecated)]
+            wildcard @ Expr::Wildcard { .. } => wildcard,
+            Expr::Column(column) => {
+                // The original name is kept, to avoid the table name being added to it
+                // when not explicitly set by the query.
+                let name = funding.string(column.name())?;
+                let cast = cast_to(funding, Expr::Column(column), new_type, source)?;
+                Expr::Alias(Alias {
+                    expr: funding.boxed(cast)?,
+                    relation: None,
+                    name,
+                    metadata: None,
+                })
+            }
+            other => cast_to(funding, other, new_type, source)?,
+        };
+    }
+    Ok(())
+}
+
+/// `plan` with its output cast to `schema`'s types as
+/// [`datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema`] casts it: a
+/// projection's expressions cast in place, any other plan projected with its mismatched
+/// columns cast, or left as it is when none are; what is made charged first.
+pub(crate) fn coerced_for_schema(
+    funding: &Funding,
+    plan: LogicalPlan,
+    schema: &DFSchema,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::Projection(Projection {
+            mut expr, input, ..
+        }) => {
+            coerce_exprs_in_place(funding, &mut expr, input.schema(), schema)?;
+            Ok(LogicalPlan::Projection(Projection::try_new(
+                expr, input, funding,
+            )?))
+        }
+        plan => {
+            let source = plan.schema();
+            let mismatched = |idx: usize| {
+                source.field(idx).data_type() != schema.field(idx).data_type()
+            };
+            if !(0..source.fields().len()).any(mismatched) {
+                return Ok(plan);
+            }
+            let mut exprs = funding.vec_with_capacity(source.fields().len())?;
+            for (idx, (qualifier, field)) in source.iter().enumerate() {
+                let column = column_expr(funding, qualifier, field.name())?;
+                // Room for each is charged: pushing allocates nothing.
+                exprs.push(if mismatched(idx) {
+                    let cast =
+                        cast_to(funding, column, schema.field(idx).data_type(), source)?;
+                    aliased(funding, cast, None, field.name())?
+                } else {
+                    column
+                });
+            }
+            let input = funding.arc(plan)?;
+            Ok(LogicalPlan::Projection(Projection::try_new(
+                exprs, input, funding,
+            )?))
+        }
+    }
 }
 
 /// `expr` named `name` under `relation`, its box and name charged first.
