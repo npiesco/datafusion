@@ -1096,7 +1096,7 @@ pub(crate) fn deduplicated<T: Hash + Eq + Freed>(
     Ok(())
 }
 
-fn hash_of<T: Hash + ?Sized>(item: &T) -> u64 {
+pub(crate) fn hash_of<T: Hash + ?Sized>(item: &T) -> u64 {
     BuildHasherDefault::<DefaultHasher>::default().hash_one(item)
 }
 

@@ -20,12 +20,40 @@ use crate::optimizer::Optimizer;
 use crate::{OptimizerContext, OptimizerRule};
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::{Funding, PlanningFunding};
 use datafusion_common::{Result, assert_contains};
 use datafusion_expr::{LogicalPlan, LogicalPlanBuilder, logical_plan::table_scan};
 use std::sync::Arc;
 
 pub mod udfs;
 pub mod user_defined;
+
+/// Funding that grants every charge (`true`) or refuses every charge (`false`).
+struct Granting(bool);
+
+impl PlanningFunding for Granting {
+    fn charge(&self, _bytes: usize) -> bool {
+        self.0
+    }
+
+    fn discharge(&self, _bytes: usize) {}
+}
+
+/// A context whose funding refuses every charge.
+pub fn refusing_context() -> OptimizerContext {
+    funded_context(false)
+}
+
+/// A context whose funding grants every charge, counting what is outstanding.
+pub fn unlimited_context() -> OptimizerContext {
+    funded_context(true)
+}
+
+fn funded_context(grants: bool) -> OptimizerContext {
+    let mut options = ConfigOptions::default();
+    options.funding = Funding::new(Arc::new(Granting(grants)));
+    OptimizerContext::new_with_config_options(Arc::new(options))
+}
 
 pub fn test_table_scan_fields() -> Vec<Field> {
     vec![
