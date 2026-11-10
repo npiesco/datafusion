@@ -17,16 +17,20 @@
 
 //! [`ReplaceDistinctWithAggregate`] replaces `DISTINCT ...` with `GROUP BY ...`
 
+use crate::funded::{
+    aliased, column_expr, freed, normalize_in_place, unwrapped, wildcard_columns,
+};
 use crate::optimizer::{ApplyOrder, ApplyOrder::BottomUp};
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
+use datafusion_common::funding::Held;
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{Column, Dependency, Result};
-use datafusion_expr::expr_rewriter::normalize_cols;
-use datafusion_expr::utils::expand_wildcard;
+use datafusion_common::{Dependency, Result, ScalarValue};
+use datafusion_expr::expr::AggregateFunction;
+use datafusion_expr::logical_plan::builder::project;
 use datafusion_expr::{Aggregate, Distinct, DistinctOn, Expr, LogicalPlan};
-use datafusion_expr::{ExprFunctionExt, Limit, LogicalPlanBuilder, col, lit};
+use datafusion_expr::{Limit, LogicalPlanBuilder, lit};
 
 /// Optimizer that replaces logical [[Distinct]] with a logical [[Aggregate]]
 ///
@@ -87,14 +91,15 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Distinct(Distinct::All(input)) => {
-                let group_expr = expand_wildcard(input.schema(), &input, None)?;
+                let funding = config.funding();
+                let group_expr = wildcard_columns(&funding, &input)?;
 
                 if group_expr.is_empty() {
                     // Special case: there are no columns to group by, so we can't replace it by a group by
                     // however, we can replace it by LIMIT 1 because there is either no output or a single empty row
                     return Ok(Transformed::yes(LogicalPlan::Limit(Limit {
                         skip: None,
-                        fetch: Some(Box::new(lit(1i64))),
+                        fetch: Some(funding.boxed(lit(1i64))?),
                         input,
                     })));
                 }
@@ -114,7 +119,8 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
                             .enumerate()
                             .all(|(idx, f_idx)| idx == *f_idx)
                     {
-                        return Ok(Transformed::yes(Arc::unwrap_or_clone(input)));
+                        freed(&funding, group_expr);
+                        return Ok(Transformed::yes(unwrapped(&funding, input)?));
                     }
                 }
 
@@ -127,40 +133,49 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
                 Ok(Transformed::yes(aggr_plan))
             }
             LogicalPlan::Distinct(Distinct::On(DistinctOn {
-                select_expr,
-                on_expr,
+                mut select_expr,
+                mut on_expr,
                 sort_expr,
                 input,
                 schema,
             })) => {
+                let funding = config.funding();
                 let expr_cnt = on_expr.len();
 
-                // Construct the aggregation expression to be used to fetch the selected expressions.
+                // Construct the aggregation expression to be used to fetch the selected
+                // expressions, each in place of the selection it is made of.
                 let first_value_udaf: Arc<datafusion_expr::AggregateUDF> =
                     config.function_registry().unwrap().udaf("first_value")?;
-                let aggr_expr = select_expr.into_iter().map(|e| {
-                    if let Some(order_by) = &sort_expr {
-                        first_value_udaf
-                            .call(vec![e])
-                            .order_by(order_by.clone())
-                            .build()
-                            // guaranteed to be `Expr::AggregateFunction`
-                            .unwrap()
-                    } else {
-                        first_value_udaf.call(vec![e])
-                    }
-                });
-
-                let aggr_expr = normalize_cols(aggr_expr, input.as_ref())?;
-                let group_expr = normalize_cols(on_expr, input.as_ref())?;
+                for e in &mut select_expr {
+                    let selected =
+                        std::mem::replace(e, Expr::Literal(ScalarValue::Null, None));
+                    let order_by = match &sort_expr {
+                        Some(order_by) => funding.to_vec(order_by)?,
+                        None => vec![],
+                    };
+                    *e = Expr::AggregateFunction(AggregateFunction::new_udf(
+                        Arc::clone(&first_value_udaf),
+                        funding.vec_of([selected])?,
+                        false,
+                        None,
+                        order_by,
+                        None,
+                    ));
+                    normalize_in_place(&funding, &input, e)?;
+                }
+                for e in &mut on_expr {
+                    normalize_in_place(&funding, &input, e)?;
+                }
 
                 // Build the aggregation plan
                 let plan = LogicalPlan::Aggregate(Aggregate::try_new(
-                    input, group_expr, aggr_expr,
+                    input,
+                    on_expr,
+                    select_expr,
                 )?);
                 // TODO use LogicalPlanBuilder directly rather than recreating the Aggregate
                 // when https://github.com/apache/datafusion/issues/10485 is available
-                let lpb = LogicalPlanBuilder::from(plan);
+                let lpb = LogicalPlanBuilder::new_from_arc(funding.arc(plan)?, &funding);
 
                 let plan = if let Some(mut sort_expr) = sort_expr {
                     // While sort expressions were used in the `FIRST_VALUE` aggregation itself above,
@@ -168,7 +183,9 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
                     // (`ON`) expression, so we need to sort those as well.
 
                     // truncate the sort_expr to the length of on_expr
-                    sort_expr.truncate(expr_cnt);
+                    for dropped in sort_expr.drain(expr_cnt.min(sort_expr.len())..) {
+                        freed(&funding, dropped);
+                    }
 
                     lpb.sort(sort_expr)?.build()?
                 } else {
@@ -177,21 +194,20 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
 
                 // Whereas the aggregation plan by default outputs both the grouping and the aggregation
                 // expressions, for `DISTINCT ON` we only need to emit the original selection expressions.
+                let mut project_exprs: Held<Vec<Expr>> = funding.held();
+                project_exprs.reserve_exact(schema.fields().len())?;
+                for ((new_qualifier, new_field), (old_qualifier, old_field)) in
+                    plan.schema().iter().skip(expr_cnt).zip(schema.iter())
+                {
+                    project_exprs.push(aliased(
+                        &funding,
+                        column_expr(&funding, new_qualifier, new_field.name())?,
+                        old_qualifier,
+                        old_field.name(),
+                    )?)?;
+                }
 
-                let project_exprs = plan
-                    .schema()
-                    .iter()
-                    .skip(expr_cnt)
-                    .zip(schema.iter())
-                    .map(|((new_qualifier, new_field), (old_qualifier, old_field))| {
-                        col(Column::from((new_qualifier, new_field)))
-                            .alias_qualified(old_qualifier.cloned(), old_field.name())
-                    })
-                    .collect::<Vec<Expr>>();
-
-                let plan = LogicalPlanBuilder::from(plan)
-                    .project(project_exprs)?
-                    .build()?;
+                let plan = project(plan, project_exprs.drain(..), &funding)?;
 
                 Ok(Transformed::yes(plan))
             }
@@ -216,10 +232,14 @@ mod tests {
     use arrow::datatypes::{Fields, Schema};
     use std::sync::Arc;
 
-    use crate::OptimizerContext;
-    use datafusion_common::Result;
+    use crate::funded::Freed;
+    use crate::{OptimizerConfig, OptimizerContext, OptimizerRule};
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::{Funding, PlanningFunding};
+    use datafusion_common::{Column, Result};
     use datafusion_expr::{
-        Expr, col, logical_plan::builder::LogicalPlanBuilder, table_scan,
+        Expr, JoinType, LogicalPlan, col, logical_plan::builder::LogicalPlanBuilder,
+        table_scan,
     };
     use datafusion_functions_aggregate::sum::sum;
 
@@ -313,5 +333,88 @@ mod tests {
         Limit: skip=0, fetch=1
           TableScan: test
         ")
+    }
+
+    #[test]
+    fn distinct_over_using_join_groups_each_key_once() -> Result<()> {
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .join_using(
+                test_table_scan_with_name("test1")?,
+                JoinType::Inner,
+                vec![Column::from_name("a")],
+            )?
+            .distinct()?
+            .build()?;
+
+        assert_optimized_plan_equal!(plan, @r"
+        Aggregate: groupBy=[[test.a, test.b, test.c, test1.b, test1.c]], aggr=[[]]
+          Inner Join: Using test.a = test1.a
+            TableScan: test
+            TableScan: test1
+        ")
+    }
+
+    struct Refusing;
+
+    impl PlanningFunding for Refusing {
+        fn charge(&self, _bytes: usize) -> bool {
+            false
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    struct Unlimited;
+
+    impl PlanningFunding for Unlimited {
+        fn charge(&self, _bytes: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    fn context(funding: Funding) -> OptimizerContext {
+        let mut options = ConfigOptions::default();
+        options.funding = funding;
+        OptimizerContext::new_with_config_options(Arc::new(options))
+    }
+
+    #[test]
+    fn grouping_a_distinct_is_refused_unfunded() -> Result<()> {
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .project(vec![col("a"), col("b")])?
+            .distinct()?
+            .build()?;
+        let config = context(Funding::new(Arc::new(Refusing)));
+
+        let refused = ReplaceDistinctWithAggregate::new()
+            .rewrite(plan, &config)
+            .unwrap_err();
+
+        assert!(refused.refused().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn eliminated_distinct_gives_back_what_it_held() -> Result<()> {
+        let plan: LogicalPlan = LogicalPlanBuilder::from(test_table_scan()?)
+            .aggregate(vec![col("c")], Vec::<Expr>::new())?
+            .project(vec![col("c")])?
+            .distinct()?
+            .build()?;
+        let config = context(Funding::new(Arc::new(Unlimited)));
+        // Planned through the same funding.
+        config.options().funding.charge(plan.freed_bytes())?;
+
+        let replaced = ReplaceDistinctWithAggregate::new().rewrite(plan, &config)?;
+
+        assert!(replaced.transformed);
+        // The group list made to compare is given back, and the distinct's input block.
+        assert_eq!(
+            config.options().funding.outstanding(),
+            replaced.data.freed_bytes()
+        );
+        Ok(())
     }
 }

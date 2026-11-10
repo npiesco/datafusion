@@ -56,12 +56,13 @@ use datafusion_expr::expr::{
     Like, Placeholder, ScalarFunction, SetComparison, Sort, TryCast,
     Unnest as UnnestExpr, WindowFunction, WindowFunctionParams,
 };
+use datafusion_expr::expr_rewriter::normalize_col;
 use datafusion_expr::logical_plan::{
     Aggregate, Analyze, ColumnUnnestList, CreateMemoryTable, CreateView, DdlStatement,
     Distinct, DistinctOn, DmlStatement, EmptyRelation, Execute, Explain, Extension,
-    Filter, Join, Limit, LogicalPlan, MergeIntoAction, Partitioning, Prepare, Projection,
-    RecursiveQuery, Repartition, Sort as SortPlan, Statement, Subquery, SubqueryAlias,
-    TableScan, Union, Unnest, Values, Window,
+    Filter, Join, JoinConstraint, Limit, LogicalPlan, MergeIntoAction, Partitioning,
+    Prepare, Projection, RecursiveQuery, Repartition, Sort as SortPlan, Statement,
+    Subquery, SubqueryAlias, TableScan, Union, Unnest, Values, Window,
 };
 use datafusion_expr::utils::can_hash;
 use datafusion_expr::{
@@ -490,6 +491,152 @@ pub(crate) fn schema_columns(funding: &Funding, schema: &DFSchema) -> Result<Vec
         exprs.push(column_expr(funding, qualifier, field.name())?);
     }
     Ok(exprs)
+}
+
+/// Whether `schema` has a field `name` under exactly `qualifier`.
+fn has_column(schema: &DFSchema, qualifier: Option<&TableReference>, name: &str) -> bool {
+    schema.iter().any(|(field_qualifier, field)| {
+        field_qualifier == qualifier && field.name() == name
+    })
+}
+
+/// The columns of a USING join's keys.
+fn using_keys(on: &[(Expr, Expr)]) -> impl Iterator<Item = &Column> + Clone {
+    on.iter()
+        .flat_map(|(left, right)| [left, right])
+        .filter_map(Expr::get_as_join_column)
+}
+
+/// Whether `f` is true of the keys of any USING join in `plan`, as
+/// [`LogicalPlan::using_columns`] finds them (subqueries included), without collecting
+/// them; a key that is not a column is the error it reports.
+fn any_using_join(
+    funding: &Funding,
+    plan: &LogicalPlan,
+    f: &mut dyn FnMut(&[(Expr, Expr)]) -> bool,
+) -> Result<bool> {
+    let mut found = false;
+    apply_plan(funding, plan, true, &mut |node| {
+        if let LogicalPlan::Join(Join {
+            join_constraint: JoinConstraint::Using,
+            on,
+            ..
+        }) = node
+        {
+            for key in on.iter().flat_map(|(left, right)| [left, right]) {
+                if key.get_as_join_column().is_none() {
+                    return internal_err!(
+                        "Invalid join key. Expected column, found {key:?}"
+                    );
+                }
+            }
+            found |= f(on);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(found)
+}
+
+/// The columns `expand_wildcard(plan.schema(), plan, None)` expands to: each of `plan`'s
+/// output columns but the USING join keys it skips as duplicates (another output key of
+/// the same join and name sorting before it), in a list of the output's width, the list
+/// and each name charged before they are made.
+pub(crate) fn wildcard_columns(
+    funding: &Funding,
+    plan: &LogicalPlan,
+) -> Result<Vec<Expr>> {
+    let schema = plan.schema();
+    let has_using = any_using_join(funding, plan, &mut |_| true)?;
+    let mut exprs = funding.vec_with_capacity(schema.fields().len())?;
+    for (qualifier, field) in schema.iter() {
+        let name = field.name();
+        let skipped = has_using
+            && any_using_join(funding, plan, &mut |on| {
+                let mut keys = using_keys(on).filter(|key| key.name == *name);
+                keys.clone().any(|key| key.relation.as_ref() == qualifier)
+                    && keys.any(|key| {
+                        key.relation.as_ref() < qualifier
+                            && has_column(schema, key.relation.as_ref(), name)
+                    })
+            })?;
+        if !skipped {
+            // Room for each is charged: pushing allocates nothing.
+            exprs.push(column_expr(funding, qualifier, name)?);
+        }
+    }
+    Ok(exprs)
+}
+
+/// `expr` with its unqualified columns qualified as [`normalize_col`] qualifies them over
+/// `plan`, in place: each qualifier charged before it is copied.
+pub(crate) fn normalize_in_place(
+    funding: &Funding,
+    plan: &LogicalPlan,
+    expr: &mut Expr,
+) -> Result<()> {
+    if let Expr::Column(column) = expr {
+        return normalize_column(funding, plan, column);
+    }
+    for_each_child_expr_mut(expr, &mut |child| normalize_in_place(funding, plan, child))
+}
+
+/// `column` qualified as [`Column::normalize_with_schemas_and_ambiguity_check`] qualifies
+/// it over `plan`'s schema, then over the schemas of the inputs it falls back to
+/// ([`LogicalPlan::fallback_normalize_schemas`], listed charged); its spans dropped as
+/// that makes it anew. A column it cannot qualify is reported as [`normalize_col`]
+/// reports it.
+fn normalize_column(
+    funding: &Funding,
+    plan: &LogicalPlan,
+    column: &mut Column,
+) -> Result<()> {
+    if column.relation.is_some() {
+        return Ok(());
+    }
+    let mut fallback: Held<Vec<&DFSchema>> = funding.held();
+    if matches!(
+        plan,
+        LogicalPlan::Window(_)
+            | LogicalPlan::Projection(_)
+            | LogicalPlan::Aggregate(_)
+            | LogicalPlan::Unnest(_)
+            | LogicalPlan::Join(_)
+    ) {
+        apply_inputs(plan, &mut |input| {
+            fallback.push(input.schema().as_ref())?;
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    let schema: &DFSchema = plan.schema();
+    let name = column.name.as_str();
+    for level in [std::slice::from_ref(&schema), &fallback[..]] {
+        let named = || {
+            level
+                .iter()
+                .flat_map(|schema| schema.iter())
+                .filter(|(_, field)| field.name() == name)
+        };
+        let mut matches = named();
+        let Some((qualifier, _)) = matches.next() else {
+            continue;
+        };
+        if matches.next().is_some()
+            && !any_using_join(funding, plan, &mut |on| {
+                named().all(|(qualifier, _)| {
+                    using_keys(on)
+                        .any(|key| key.relation.as_ref() == qualifier && key.name == name)
+                })
+            })?
+        {
+            break;
+        }
+        funding.charge(qualifier.map_or(0, CloneBytes::clone_bytes))?;
+        column.relation = qualifier.cloned();
+        freed(funding, std::mem::take(&mut column.spans));
+        return Ok(());
+    }
+    normalize_col(Expr::Column(column.clone()), plan)?;
+    internal_err!("{column} is qualified over the plan's schemas by normalize_col alone")
 }
 
 /// A projection of `schema`'s columns over `input`, its list charged before it is made.
