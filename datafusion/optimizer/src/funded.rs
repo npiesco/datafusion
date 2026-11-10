@@ -23,7 +23,7 @@
 //! `Arc` children are each held once allocates nothing (an `Expr` child list is collected in
 //! place, into its own block). Only a shared `Arc` is copied, so before such a traversal
 //! the plan is [`unshare`]d: each shared child copied, its copy charged first
-//! ([`plan_clone_bytes`], built on [`CloneBytes`]). What a freed plan or expression gives
+//! ([`LogicalPlan`]'s [`CloneBytes`]). What a freed plan or expression gives
 //! back is counted by [`Freed`]: the blocks dropping it frees (its lists, boxes and texts,
 //! and each plan it held alone).
 //!
@@ -417,111 +417,10 @@ impl Freed for LogicalPlan {
     }
 }
 
-/// The bytes a copy of `plan`'s node allocates (its inputs are shared, not copied), every
-/// block exactly as `Clone::clone` sizes it; `usize::MAX`, refused, for a node whose copy
-/// cannot be counted.
-pub(crate) fn plan_clone_bytes(plan: &LogicalPlan) -> usize {
-    match plan {
-        LogicalPlan::Projection(Projection { expr, .. }) => expr.clone_bytes(),
-        LogicalPlan::Filter(Filter { predicate, .. }) => predicate.clone_bytes(),
-        LogicalPlan::Window(Window { window_expr, .. }) => window_expr.clone_bytes(),
-        LogicalPlan::Aggregate(Aggregate {
-            group_expr,
-            aggr_expr,
-            ..
-        }) => sum([group_expr.clone_bytes(), aggr_expr.clone_bytes()]),
-        LogicalPlan::Sort(SortPlan { expr, .. }) => expr.clone_bytes(),
-        LogicalPlan::Join(Join { on, filter, .. }) => {
-            sum([on.clone_bytes(), filter.clone_bytes()])
-        }
-        LogicalPlan::Repartition(Repartition {
-            partitioning_scheme,
-            ..
-        }) => match partitioning_scheme {
-            Partitioning::Hash(exprs, _) | Partitioning::DistributeBy(exprs) => {
-                exprs.clone_bytes()
-            }
-            Partitioning::RoundRobinBatch(_) => 0,
-            // Its split points are not counted.
-            Partitioning::Range(_) => usize::MAX,
-        },
-        LogicalPlan::Union(Union { inputs, .. }) => inputs.clone_bytes(),
-        LogicalPlan::TableScan(TableScan {
-            projection,
-            filters,
-            statistics_requests,
-            ..
-        }) => {
-            if statistics_requests.is_empty() {
-                sum([projection.clone_bytes(), filters.clone_bytes()])
-            } else {
-                // A tree's nodes are not counted.
-                usize::MAX
-            }
-        }
-        LogicalPlan::EmptyRelation(_)
-        | LogicalPlan::SubqueryAlias(_)
-        | LogicalPlan::Extension(_)
-        | LogicalPlan::DescribeTable(_)
-        | LogicalPlan::Distinct(Distinct::All(_)) => 0,
-        LogicalPlan::Subquery(subquery) => subquery.clone_bytes(),
-        LogicalPlan::Limit(Limit { skip, fetch, .. }) => {
-            sum([skip.clone_bytes(), fetch.clone_bytes()])
-        }
-        LogicalPlan::Values(Values { values, .. }) => values.clone_bytes(),
-        LogicalPlan::Distinct(Distinct::On(DistinctOn {
-            on_expr,
-            select_expr,
-            sort_expr,
-            ..
-        })) => sum([
-            on_expr.clone_bytes(),
-            select_expr.clone_bytes(),
-            sort_expr.clone_bytes(),
-        ]),
-        LogicalPlan::Unnest(Unnest {
-            exec_columns,
-            list_type_columns,
-            struct_type_columns,
-            dependency_indices,
-            options,
-            ..
-        }) => sum([
-            exec_columns.clone_bytes(),
-            list_type_columns.iter().fold(
-                size_of::<(usize, ColumnUnnestList)>()
-                    .saturating_mul(list_type_columns.len()),
-                |bytes, (_, list)| bytes.saturating_add(list.output_column.clone_bytes()),
-            ),
-            struct_type_columns.clone_bytes(),
-            dependency_indices.clone_bytes(),
-            options.recursions.iter().fold(
-                size_of::<RecursionUnnestOption>()
-                    .saturating_mul(options.recursions.len()),
-                |bytes, recursion| {
-                    sum([
-                        bytes,
-                        recursion.input_column.clone_bytes(),
-                        recursion.output_column.clone_bytes(),
-                    ])
-                },
-            ),
-        ]),
-        LogicalPlan::RecursiveQuery(RecursiveQuery { name, .. }) => name.clone_bytes(),
-        // What these hold is not all counted: they are not copied.
-        LogicalPlan::Statement(_)
-        | LogicalPlan::Explain(_)
-        | LogicalPlan::Analyze(_)
-        | LogicalPlan::Dml(_)
-        | LogicalPlan::Ddl(_)
-        | LogicalPlan::Copy(_) => usize::MAX,
-    }
-}
-
 /// A copy of `plan`'s node (its inputs shared), what the copy allocates charged before it
 /// is made.
 pub(crate) fn cloned_plan(funding: &Funding, plan: &LogicalPlan) -> Result<LogicalPlan> {
-    funding.charge(plan_clone_bytes(plan))?;
+    funding.charge(plan.clone_bytes())?;
     Ok(plan.clone())
 }
 
@@ -599,7 +498,7 @@ pub(crate) fn plan_mut<'a>(
     arc: &'a mut Arc<LogicalPlan>,
 ) -> Result<&'a mut LogicalPlan> {
     if Arc::get_mut(arc).is_none() {
-        funding.charge(sum([plan_clone_bytes(arc), arc_bytes::<LogicalPlan>()]))?;
+        funding.charge(sum([arc.clone_bytes(), arc_bytes::<LogicalPlan>()]))?;
     }
     Ok(Arc::make_mut(arc))
 }
