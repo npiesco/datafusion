@@ -29,6 +29,7 @@ use sqlparser::ast::{
 };
 use sqlparser::ast::{Query, Visit, Visitor};
 
+use datafusion_common::funding::Held;
 use datafusion_common::{
     DFSchema, Diagnostic, Result, ScalarValue, Span, internal_datafusion_err,
     internal_err, not_impl_err, plan_err,
@@ -157,7 +158,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
         enum StackEntry {
-            SQLExpr(Box<SQLExpr>),
+            SQLExpr(SQLExpr),
             Operator(BinaryOperator),
         }
 
@@ -165,35 +166,33 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // This allows visiting the expr tree in a depth-first manner which
         // produces expressions in postfix notations, i.e. `a + b` => `a b +`.
         // See https://github.com/apache/datafusion/issues/1444
-        let mut stack = vec![StackEntry::SQLExpr(Box::new(sql))];
-        let mut eval_stack = vec![];
+        let funding = self.funding();
+        let mut stack: Held<Vec<StackEntry>> = funding.held();
+        stack.push(StackEntry::SQLExpr(sql))?;
+        let mut eval_stack: Held<Vec<Expr>> = funding.held();
 
         while let Some(entry) = stack.pop() {
             match entry {
+                StackEntry::SQLExpr(SQLExpr::BinaryOp { left, op, right }) => {
+                    // Note the order that we push the entries to the stack
+                    // is important. We want to visit the left node first.
+                    stack.push(StackEntry::Operator(op))?;
+                    stack.push(StackEntry::SQLExpr(*right))?;
+                    stack.push(StackEntry::SQLExpr(*left))?;
+                }
                 StackEntry::SQLExpr(sql_expr) => {
-                    match *sql_expr {
-                        SQLExpr::BinaryOp { left, op, right } => {
-                            // Note the order that we push the entries to the stack
-                            // is important. We want to visit the left node first.
-                            stack.push(StackEntry::Operator(op));
-                            stack.push(StackEntry::SQLExpr(right));
-                            stack.push(StackEntry::SQLExpr(left));
-                        }
-                        _ => {
-                            let expr = self.sql_expr_to_logical_expr_internal(
-                                *sql_expr,
-                                schema,
-                                planner_context,
-                            )?;
-                            eval_stack.push(expr);
-                        }
-                    }
+                    let expr = self.sql_expr_to_logical_expr_internal(
+                        sql_expr,
+                        schema,
+                        planner_context,
+                    )?;
+                    eval_stack.push(expr)?;
                 }
                 StackEntry::Operator(op) => {
                     let right = eval_stack.pop().unwrap();
                     let left = eval_stack.pop().unwrap();
                     let expr = self.build_logical_expr(op, left, right, schema)?;
-                    eval_stack.push(expr);
+                    eval_stack.push(expr)?;
                 }
             }
         }

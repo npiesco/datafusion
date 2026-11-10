@@ -24,7 +24,8 @@ use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
 
 use crate::error::{_plan_err, _schema_err, DataFusionError, Result};
-use crate::funding::Funding;
+use crate::cloned::CloneBytes;
+use crate::funding::{Funding, arc_bytes, arc_slice_bytes};
 use crate::{
     Column, FunctionalDependencies, SchemaError, TableReference, field_not_found,
     unqualified_field_not_found,
@@ -376,6 +377,29 @@ impl DFSchema {
             field_qualifiers: qualifiers,
             functional_dependencies: funding.cloned(&self.functional_dependencies)?,
         })
+    }
+
+    /// `self`, a schema [`DFSchema::merge`] made through `funding`, freed: what merging
+    /// allocated for it is given back. Its qualifier list and dependencies are its own; its
+    /// Arrow schema and field list are freed, and given back, only if no other handle to the
+    /// Arrow schema remains: one taken from the schema it was merged from (merging an empty
+    /// schema) or from the merged schema itself keeps them.
+    pub fn released(self, funding: &Funding) {
+        let DFSchema {
+            inner,
+            field_qualifiers,
+            functional_dependencies,
+        } = self;
+        let mut freed = functional_dependencies.clone_bytes();
+        drop(functional_dependencies);
+        funding.released(field_qualifiers);
+        if let Ok(schema) = Arc::try_unwrap(inner) {
+            freed += arc_bytes::<Schema>();
+            if let Ok(fields) = arc_slice_bytes::<FieldRef>(schema.fields().len()) {
+                freed += fields;
+            }
+        }
+        funding.discharge(freed);
     }
 
     /// Get a list of fields for this schema
