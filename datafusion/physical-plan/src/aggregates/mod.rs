@@ -901,7 +901,7 @@ impl AggregateExec {
             // clone the rest of the fields
             required_input_ordering: self.required_input_ordering.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
-            input_order_mode: self.input_order_mode.clone(),
+            input_order_mode: self.input_order_mode.funded_clone(&self.funding)?,
             cache: Arc::clone(&self.cache),
             mode: self.mode,
             group_by: Arc::clone(&self.group_by),
@@ -927,7 +927,7 @@ impl AggregateExec {
             // clone the rest of the fields
             required_input_ordering: self.required_input_ordering.clone(),
             metrics: ExecutionPlanMetricsSet::new(),
-            input_order_mode: self.input_order_mode.clone(),
+            input_order_mode: self.input_order_mode.funded_clone(&self.funding)?,
             cache: Arc::clone(&self.cache),
             mode: self.mode,
             group_by: Arc::clone(&self.group_by),
@@ -2109,12 +2109,9 @@ impl ExecutionPlan for AggregateExec {
         validate_child_count!(self, children);
         match options.children_properties {
             ChildrenPropertiesMode::Keep => {
-                self.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
-                Ok(self.funding.arc(Self {
-                    input: children.swap_remove(0),
-                    metrics: ExecutionPlanMetricsSet::new(),
-                    ..Self::clone(&*self)
-                })? as _)
+                let mut me = self.with_new_limit_options(self.limit_options)?;
+                me.input = children.swap_remove(0);
+                Ok(self.funding.arc(me)? as _)
             }
             ChildrenPropertiesMode::Recompute => {
                 let funding = &self.funding;

@@ -17,6 +17,7 @@
 
 //! Stream and channel implementations for window function expressions.
 
+use datafusion_common::funding::Funding;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -73,30 +74,46 @@ pub struct WindowAggExec {
     cache: Arc<PlanProperties>,
     /// If `can_partition` is false, partition_keys is always empty.
     can_repartition: bool,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl WindowAggExec {
-    /// Create a new execution plan for window aggregates
+    /// Create a new execution plan for window aggregates, charging what it allocates to
+    /// `funding`.
     pub fn try_new(
         window_expr: Vec<Arc<dyn WindowExpr>>,
         input: Arc<dyn ExecutionPlan>,
         can_repartition: bool,
+        funding: &Funding,
     ) -> Result<Self> {
-        let schema = create_schema(&input.schema(), &window_expr)?;
-        let schema = Arc::new(schema);
+        let schema =
+            funding.arc(create_schema(&input.schema(), &window_expr, funding)?)?;
 
         let ordered_partition_by_indices =
             get_ordered_partition_by_indices(window_expr[0].partition_by(), &input)?;
-        let cache = Self::compute_properties(&schema, &input, &window_expr)?;
+        let cache = funding.arc(Self::compute_properties(
+            &schema,
+            &input,
+            &window_expr,
+            funding,
+        )?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(Self {
             input,
             window_expr,
             schema,
             metrics: ExecutionPlanMetricsSet::new(),
             ordered_partition_by_indices,
-            cache: Arc::new(cache),
+            cache,
             can_repartition,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Window expressions
@@ -128,6 +145,7 @@ impl WindowAggExec {
         schema: &SchemaRef,
         input: &Arc<dyn ExecutionPlan>,
         window_exprs: &[Arc<dyn WindowExpr>],
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let eq_properties = window_equivalence_properties(schema, input, window_exprs)?;
@@ -135,7 +153,7 @@ impl WindowAggExec {
         // Get output partitioning:
         // Because we can have repartitioning using the partition keys this
         // would be either 1 or more than 1 depending on the presence of repartitioning.
-        let output_partitioning = input.output_partitioning().clone();
+        let output_partitioning = input.output_partitioning().funded_clone(funding)?;
 
         // Construct properties cache:
         Ok(PlanProperties::new(
@@ -147,20 +165,17 @@ impl WindowAggExec {
         ))
     }
 
-    pub fn partition_keys(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+    /// The shortest PARTITION BY of the window expressions, or none if this node may
+    /// not be repartitioned.
+    pub fn partition_keys(&self) -> &[Arc<dyn PhysicalExpr>] {
         if !self.can_repartition {
-            vec![]
+            &[]
         } else {
-            let all_partition_keys = self
-                .window_expr()
+            self.window_expr()
                 .iter()
-                .map(|expr| expr.partition_by().to_vec())
-                .collect::<Vec<_>>();
-
-            all_partition_keys
-                .into_iter()
-                .min_by_key(|s| s.len())
-                .unwrap_or_else(Vec::new)
+                .map(|expr| expr.partition_by())
+                .min_by_key(|keys| keys.len())
+                .unwrap_or_default()
         }
     }
 }
@@ -257,7 +272,7 @@ impl ExecutionPlan for WindowAggExec {
             InputDistributionRequirements::new(vec![Distribution::SinglePartition])
         } else {
             InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
-                self.partition_keys(),
+                self.partition_keys().to_vec(),
             )])
         }
     }
@@ -269,16 +284,32 @@ impl ExecutionPlan for WindowAggExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
-            ChildrenPropertiesMode::Recompute => Ok(Arc::new(WindowAggExec::try_new(
-                self.window_expr.clone(),
-                children.swap_remove(0),
-                true,
-            )?)),
+            ChildrenPropertiesMode::Keep => {
+                let funding = &self.funding;
+                let window_expr = funding.vec_from_slice(&self.window_expr)?;
+                let ordered_partition_by_indices =
+                    funding.vec_from_slice(&self.ordered_partition_by_indices)?;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(funding.arc(Self {
+                    input: children.swap_remove(0),
+                    window_expr,
+                    schema: Arc::clone(&self.schema),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    ordered_partition_by_indices,
+                    cache: Arc::clone(&self.cache),
+                    can_repartition: self.can_repartition,
+                    funding: funding.clone(),
+                })?)
+            }
+            ChildrenPropertiesMode::Recompute => {
+                let funding = &self.funding;
+                Ok(funding.arc(WindowAggExec::try_new(
+                    funding.vec_from_slice(&self.window_expr)?,
+                    children.swap_remove(0),
+                    true,
+                    funding,
+                )?)?)
+            }
         }
     }
 
@@ -379,6 +410,8 @@ impl ExecutionPlan for WindowAggExec {
             // below, since `partition_keys()` returns an empty vec when this is
             // false and the decoder recovers it as `!partition_keys.is_empty()`.
             can_repartition: _,
+            // The planning handle; not part of the wire format.
+            funding: _,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -469,6 +502,7 @@ impl WindowAggExec {
                 // `can_repartition` has no wire field: the encoder writes an
                 // empty `partition_keys` when it is false.
                 !partition_keys.is_empty(),
+                &Funding::default(),
             )?))
         } else {
             Ok(Arc::new(WindowAggExec::try_new(
@@ -476,6 +510,7 @@ impl WindowAggExec {
                 input,
                 // See above: `can_repartition` is recovered from `partition_keys`.
                 !partition_keys.is_empty(),
+                &Funding::default(),
             )?))
         }
     }
@@ -668,7 +703,8 @@ mod tests {
             None,
         )?;
 
-        let window = WindowAggExec::try_new(vec![window_expr], input, true)?;
+        let window =
+            WindowAggExec::try_new(vec![window_expr], input, true, &Funding::default())?;
         assert!(matches!(
             window.cardinality_effect(),
             CardinalityEffect::Equal

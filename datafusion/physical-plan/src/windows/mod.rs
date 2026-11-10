@@ -23,6 +23,7 @@ mod proto;
 mod utils;
 mod window_agg_exec;
 
+use datafusion_common::funding::Funding;
 use std::borrow::Borrow;
 use std::sync::Arc;
 
@@ -602,6 +603,7 @@ pub fn get_best_fitting_window(
     // [`WindowAggExec`], which does not carry an observer. `None` when the
     // source is a [`WindowAggExec`] or has no observer installed.
     state_observer: Option<Arc<dyn WindowStateObserver>>,
+    funding: &Funding,
 ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
     // Contains at least one window expr and all of the partition by and order by sections
     // of the window_exprs are same.
@@ -623,45 +625,50 @@ pub fn get_best_fitting_window(
     };
 
     let window_expr = if should_reverse {
-        if let Some(reversed_window_expr) = window_exprs
-            .iter()
-            .map(|e| e.get_reverse_expr())
-            .collect::<Option<Vec<_>>>()
-        {
-            reversed_window_expr
-        } else {
-            // Cannot take reverse of any of the window expr
-            // In this case, with existing ordering window cannot be run
-            return Ok(None);
+        let mut reversed_window_expr = funding.held::<Vec<_>>();
+        reversed_window_expr.reserve_exact(window_exprs.len())?;
+        for expr in window_exprs {
+            let Some(reversed) = expr.get_reverse_expr() else {
+                // Cannot take reverse of any of the window expr
+                // In this case, with existing ordering window cannot be run
+                return Ok(None);
+            };
+            reversed_window_expr.push(reversed)?;
         }
+        reversed_window_expr.keep()
     } else {
-        window_exprs.to_vec()
+        funding.vec_from_slice(window_exprs)?
     };
 
     // If all window expressions can run with bounded memory, choose the
     // bounded window variant:
     if window_expr.iter().all(|e| e.uses_bounded_memory()) {
-        Ok(Some(Arc::new(
-            BoundedWindowAggExec::try_new(
-                window_expr,
-                Arc::clone(input),
-                input_order_mode,
-                !physical_partition_keys.is_empty(),
-            )?
-            .with_state_observer(state_observer)?,
-        ) as _))
+        Ok(Some(
+            funding.arc(
+                BoundedWindowAggExec::try_new(
+                    window_expr,
+                    Arc::clone(input),
+                    input_order_mode,
+                    !physical_partition_keys.is_empty(),
+                    funding,
+                )?
+                .with_state_observer(state_observer)?,
+            )? as _,
+        ))
     } else if input_order_mode != InputOrderMode::Sorted {
         // For `WindowAggExec` to work correctly PARTITION BY columns should be sorted.
         // Hence, if `input_order_mode` is not `Sorted` we should convert
         // input ordering such that it can work with `Sorted` (add `SortExec`).
         // Effectively `WindowAggExec` works only in `Sorted` mode.
+        funding.released(window_expr);
         Ok(None)
     } else {
-        Ok(Some(Arc::new(WindowAggExec::try_new(
+        Ok(Some(funding.arc(WindowAggExec::try_new(
             window_expr,
             Arc::clone(input),
             !physical_partition_keys.is_empty(),
-        )?) as _))
+            funding,
+        )?)? as _))
     }
 }
 
@@ -936,6 +943,7 @@ mod tests {
             )?],
             blocking_exec,
             false,
+            &Funding::default(),
         )?);
 
         let fut = collect(window_agg_exec, task_ctx);
@@ -998,6 +1006,7 @@ mod tests {
             Arc::clone(&source),
             Sorted,
             false,
+            &Funding::default(),
         )?
         .with_state_observer(Some(Arc::clone(&observer)))?;
 
@@ -1006,6 +1015,7 @@ mod tests {
             bounded.input(),
             &bounded.partition_keys(),
             bounded.state_observer().cloned(),
+            &Funding::default(),
         )?
         .expect("rebuild should produce a plan");
         let bwag = rebuilt

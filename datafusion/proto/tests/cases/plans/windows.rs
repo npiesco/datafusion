@@ -71,6 +71,7 @@ fn roundtrip_udwf() -> Result<()> {
         input,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?))
 }
 
@@ -149,6 +150,7 @@ fn roundtrip_window() -> Result<()> {
         vec![plain_aggr_window_expr, sliding_aggr_window_expr, udwf_expr],
         input,
         false,
+        &Funding::default(),
     )?))
 }
 
@@ -202,6 +204,7 @@ fn roundtrip_window_distinct() -> Result<()> {
         vec![distinct_count_expr, distinct_sum_expr],
         input,
         false,
+        &Funding::default(),
     )?))
 }
 
@@ -257,6 +260,7 @@ fn test_distinct_window_serialization_end_to_end() -> Result<()> {
         vec![distinct_count_ignore_nulls, distinct_sum],
         input,
         false,
+        &Funding::default(),
     )?);
 
     // Perform the roundtrip test
@@ -305,5 +309,6 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
         input,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?))
 }

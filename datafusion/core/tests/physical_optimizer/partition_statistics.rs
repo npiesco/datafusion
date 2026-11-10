@@ -1426,8 +1426,12 @@ mod test {
             None,
         )?;
 
-        let window_agg: Arc<dyn ExecutionPlan> =
-            Arc::new(WindowAggExec::try_new(vec![window_expr], scan, true)?);
+        let window_agg: Arc<dyn ExecutionPlan> = Arc::new(WindowAggExec::try_new(
+            vec![window_expr],
+            scan,
+            true,
+            &Funding::default(),
+        )?);
 
         // Verify partition statistics are properly propagated (not unknown)
         let statistics = (0..window_agg.output_partitioning().partition_count())

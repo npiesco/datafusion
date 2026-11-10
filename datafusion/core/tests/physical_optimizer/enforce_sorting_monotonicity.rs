@@ -23,6 +23,7 @@ use arrow_schema::SortOptions;
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::WindowFrameBound;
 use datafusion::logical_expr::WindowFrameUnits;
+use datafusion_common::funding::Funding;
 use datafusion_expr::{WindowFrame, WindowFunctionDefinition};
 use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::count::count_udaf;
@@ -179,6 +180,7 @@ impl TestWindowCase {
                     Arc::clone(&source),
                     InputOrderMode::Sorted,
                     partition_by,
+                    &Funding::default(),
                 )
                 .unwrap(),
             ) as Arc<dyn ExecutionPlan>
@@ -188,6 +190,7 @@ impl TestWindowCase {
                     vec![window_expr],
                     Arc::clone(&source),
                     partition_by,
+                    &Funding::default(),
                 )
                 .unwrap(),
             ) as Arc<dyn ExecutionPlan>

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::Result;
+use datafusion_common::funding::Funding;
+
 /// Specifies how the input to an aggregation or window operator is ordered
 /// relative to their `GROUP BY` or  `PARTITION BY` expressions.
 ///
@@ -51,4 +54,17 @@ pub enum InputOrderMode {
     /// There is a (full) permutation of the expressions satisfying the
     /// existing ordering.
     Sorted,
+}
+
+impl InputOrderMode {
+    /// A copy of this mode, the indices it copies charged to `funding` first.
+    pub fn funded_clone(&self, funding: &Funding) -> Result<Self> {
+        Ok(match self {
+            Self::Linear => Self::Linear,
+            Self::PartiallySorted(indices) => {
+                Self::PartiallySorted(funding.vec_from_slice(indices)?)
+            }
+            Self::Sorted => Self::Sorted,
+        })
+    }
 }

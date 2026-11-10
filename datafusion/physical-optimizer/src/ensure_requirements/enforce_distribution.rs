@@ -1188,8 +1188,9 @@ pub fn ensure_distribution(
         if let Some(updated_window) = get_best_fitting_window(
             exec.window_expr(),
             exec.input(),
-            &exec.partition_keys(),
+            exec.partition_keys(),
             None,
+            funding,
         )? {
             plan = updated_window;
         }
@@ -1197,8 +1198,9 @@ pub fn ensure_distribution(
         && let Some(updated_window) = get_best_fitting_window(
             exec.window_expr(),
             exec.input(),
-            &exec.partition_keys(),
+            exec.partition_keys(),
             exec.state_observer().cloned(),
+            funding,
         )?
     {
         plan = updated_window;

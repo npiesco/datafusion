@@ -294,6 +294,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
         ))],
         filter,
         true,
+        &Funding::default(),
     )?);
 
     let aggregate = Arc::new(AggregateExec::try_new(
@@ -446,6 +447,7 @@ fn roundtrip_udwf_extension_codec() -> Result<()> {
         input,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     let ctx = SessionContext::new();
@@ -503,6 +505,7 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
         ))],
         filter,
         true,
+        &Funding::default(),
     )?);
 
     let aggr_expr = AggregateExprBuilder::new(udaf, aggr_args.clone())

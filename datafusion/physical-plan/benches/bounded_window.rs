@@ -37,6 +37,7 @@
 //! - `sorted N partitions`: control; input sorted by partition key, so
 //!   finished partitions are pruned eagerly and the state maps stay small.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use arrow::array::UInt64Array;
@@ -175,8 +176,14 @@ fn window_exec(
         })
         .collect::<Vec<_>>();
     Arc::new(
-        BoundedWindowAggExec::try_new(window_expr, input, mode, true)
-            .expect("bounded window exec"),
+        BoundedWindowAggExec::try_new(
+            window_expr,
+            input,
+            mode,
+            true,
+            &Funding::default(),
+        )
+        .expect("bounded window exec"),
     )
 }
 

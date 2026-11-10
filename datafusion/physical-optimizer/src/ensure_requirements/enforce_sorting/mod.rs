@@ -595,8 +595,9 @@ fn adjust_window_sort_removal(
         let new_window = get_best_fitting_window(
             window_expr,
             child_plan,
-            &exec.partition_keys(),
+            exec.partition_keys(),
             None,
+            funding,
         )?;
         (window_expr, new_window)
     } else if let Some(exec) = window_tree.plan.downcast_ref::<BoundedWindowAggExec>() {
@@ -604,8 +605,9 @@ fn adjust_window_sort_removal(
         let new_window = get_best_fitting_window(
             window_expr,
             child_plan,
-            &exec.partition_keys(),
+            exec.partition_keys(),
             state_observer.clone(),
+            funding,
         )?;
         (window_expr, new_window)
     } else {
@@ -629,21 +631,23 @@ fn adjust_window_sort_removal(
         window_tree.children.push(child_node);
 
         if window_expr.iter().all(|e| e.uses_bounded_memory()) {
-            Arc::new(
+            funding.arc(
                 BoundedWindowAggExec::try_new(
-                    window_expr.to_vec(),
+                    funding.vec_from_slice(window_expr)?,
                     child_plan,
                     InputOrderMode::Sorted,
                     !window_expr[0].partition_by().is_empty(),
+                    funding,
                 )?
                 .with_state_observer(state_observer)?,
-            ) as _
+            )? as _
         } else {
-            Arc::new(WindowAggExec::try_new(
-                window_expr.to_vec(),
+            funding.arc(WindowAggExec::try_new(
+                funding.vec_from_slice(window_expr)?,
                 child_plan,
                 !window_expr[0].partition_by().is_empty(),
-            )?) as _
+                funding,
+            )?)? as _
         }
     };
 

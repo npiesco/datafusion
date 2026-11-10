@@ -317,6 +317,7 @@ pub fn bounded_window_exec_with_can_repartition(
             Arc::clone(&input),
             InputOrderMode::Sorted,
             can_repartition,
+            &Funding::default(),
         )
         .unwrap(),
     )

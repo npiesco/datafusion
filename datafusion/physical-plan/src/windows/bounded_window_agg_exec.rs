@@ -20,6 +20,7 @@
 //! the input data seen so far), which makes it appropriate when processing
 //! infinite inputs.
 
+use datafusion_common::funding::Funding;
 use std::cmp::{Ordering, min};
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -144,6 +145,8 @@ pub struct BoundedWindowAggExec {
     /// state. Storage and multi-group handling are the caller's; the exec is
     /// a pure event source.
     state_observer: Option<Arc<dyn WindowStateObserver>>,
+    /// The handle this node and the nodes rebuilt from it are charged to
+    funding: Funding,
 }
 
 impl std::fmt::Debug for BoundedWindowAggExec {
@@ -169,15 +172,17 @@ impl std::fmt::Debug for BoundedWindowAggExec {
 }
 
 impl BoundedWindowAggExec {
-    /// Create a new execution plan for window aggregates
+    /// Create a new execution plan for window aggregates, charging what it allocates to
+    /// `funding`.
     pub fn try_new(
         window_expr: Vec<Arc<dyn WindowExpr>>,
         input: Arc<dyn ExecutionPlan>,
         input_order_mode: InputOrderMode,
         can_repartition: bool,
+        funding: &Funding,
     ) -> Result<Self> {
-        let schema = create_schema(&input.schema(), &window_expr)?;
-        let schema = Arc::new(schema);
+        let schema =
+            funding.arc(create_schema(&input.schema(), &window_expr, funding)?)?;
         let partition_by_exprs = window_expr[0].partition_by();
         let ordered_partition_by_indices = match &input_order_mode {
             InputOrderMode::Sorted => {
@@ -188,15 +193,27 @@ impl BoundedWindowAggExec {
                 if indices.len() == partition_by_exprs.len() {
                     indices
                 } else {
-                    (0..partition_by_exprs.len()).collect::<Vec<_>>()
+                    drop(indices);
+                    let mut indices =
+                        funding.vec_with_capacity(partition_by_exprs.len())?;
+                    indices.extend(0..partition_by_exprs.len());
+                    indices
                 }
             }
-            InputOrderMode::PartiallySorted(ordered_indices) => ordered_indices.clone(),
+            InputOrderMode::PartiallySorted(ordered_indices) => {
+                funding.vec_from_slice(ordered_indices)?
+            }
             InputOrderMode::Linear => {
                 vec![]
             }
         };
-        let cache = Self::compute_properties(&input, &schema, &window_expr)?;
+        let cache = funding.arc(Self::compute_properties(
+            &input,
+            &schema,
+            &window_expr,
+            funding,
+        )?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(Self {
             input,
             window_expr,
@@ -204,10 +221,16 @@ impl BoundedWindowAggExec {
             metrics: ExecutionPlanMetricsSet::new(),
             input_order_mode,
             ordered_partition_by_indices,
-            cache: Arc::new(cache),
+            cache,
             can_repartition,
             state_observer: None,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Install (or clear) a [`WindowStateObserver`] that receives each
@@ -307,6 +330,7 @@ impl BoundedWindowAggExec {
         input: &Arc<dyn ExecutionPlan>,
         schema: &SchemaRef,
         window_exprs: &[Arc<dyn WindowExpr>],
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let eq_properties = window_equivalence_properties(schema, input, window_exprs)?;
@@ -314,7 +338,7 @@ impl BoundedWindowAggExec {
         // As we can have repartitioning using the partition keys, this can
         // be either one or more than one, depending on the presence of
         // repartitioning.
-        let output_partitioning = input.output_partitioning().clone();
+        let output_partitioning = input.output_partitioning().funded_clone(funding)?;
 
         // Construct properties cache
         Ok(PlanProperties::new(
@@ -326,20 +350,17 @@ impl BoundedWindowAggExec {
         ))
     }
 
-    pub fn partition_keys(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+    /// The shortest PARTITION BY of the window expressions, or none if this node may
+    /// not be repartitioned.
+    pub fn partition_keys(&self) -> &[Arc<dyn PhysicalExpr>] {
         if !self.can_repartition {
-            vec![]
+            &[]
         } else {
-            let all_partition_keys = self
-                .window_expr()
+            self.window_expr()
                 .iter()
-                .map(|expr| expr.partition_by().to_vec())
-                .collect::<Vec<_>>();
-
-            all_partition_keys
-                .into_iter()
-                .min_by_key(|s| s.len())
-                .unwrap_or_else(Vec::new)
+                .map(|expr| expr.partition_by())
+                .min_by_key(|keys| keys.len())
+                .unwrap_or_default()
         }
     }
 
@@ -454,7 +475,7 @@ impl ExecutionPlan for BoundedWindowAggExec {
             InputDistributionRequirements::new(vec![Distribution::SinglePartition])
         } else {
             InputDistributionRequirements::new(vec![Distribution::KeyPartitioned(
-                self.partition_keys(),
+                self.partition_keys().to_vec(),
             )])
         }
     }
@@ -470,20 +491,37 @@ impl ExecutionPlan for BoundedWindowAggExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         validate_child_count!(self, children);
         match options.children_properties {
-            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
-                input: children.swap_remove(0),
-                metrics: ExecutionPlanMetricsSet::new(),
-                ..Self::clone(&*self)
-            })),
+            ChildrenPropertiesMode::Keep => {
+                let funding = &self.funding;
+                let window_expr = funding.vec_from_slice(&self.window_expr)?;
+                let input_order_mode = self.input_order_mode.funded_clone(funding)?;
+                let ordered_partition_by_indices =
+                    funding.vec_from_slice(&self.ordered_partition_by_indices)?;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(funding.arc(Self {
+                    input: children.swap_remove(0),
+                    window_expr,
+                    schema: Arc::clone(&self.schema),
+                    metrics: ExecutionPlanMetricsSet::new(),
+                    input_order_mode,
+                    ordered_partition_by_indices,
+                    cache: Arc::clone(&self.cache),
+                    can_repartition: self.can_repartition,
+                    state_observer: self.state_observer.clone(),
+                    funding: funding.clone(),
+                })?)
+            }
             ChildrenPropertiesMode::Recompute => {
+                let funding = &self.funding;
                 let new = BoundedWindowAggExec::try_new(
-                    self.window_expr.clone(),
+                    funding.vec_from_slice(&self.window_expr)?,
                     Arc::clone(&children[0]),
-                    self.input_order_mode.clone(),
+                    self.input_order_mode.funded_clone(funding)?,
                     self.can_repartition,
+                    funding,
                 )?
                 .with_state_observer(self.state_observer.clone())?;
-                Ok(Arc::new(new))
+                Ok(funding.arc(new)?)
             }
         }
     }
@@ -583,6 +621,8 @@ impl ExecutionPlan for BoundedWindowAggExec {
             // format. Any decoder that needs it must reinstall via
             // `with_state_observer`.
             state_observer: _,
+            // The planning handle; not part of the wire format.
+            funding: _,
         } = self;
 
         let input = ctx.encode_child(input)?;
@@ -1779,6 +1819,7 @@ mod tests {
             input,
             input_order_mode,
             true,
+            &Funding::default(),
         )?))
     }
 
@@ -2063,6 +2104,7 @@ mod tests {
             memory_exec,
             InputOrderMode::Sorted,
             true,
+            &Funding::default(),
         )
         .map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)?;
 
@@ -2172,6 +2214,7 @@ mod tests {
             memory_exec,
             InputOrderMode::Linear,
             true,
+            &Funding::default(),
         )
         .map(|e| Arc::new(e) as Arc<dyn ExecutionPlan>)?;
 
@@ -2389,7 +2432,13 @@ mod tests {
             None,
         )?;
 
-        BoundedWindowAggExec::try_new(vec![expr], source, InputOrderMode::Sorted, false)
+        BoundedWindowAggExec::try_new(
+            vec![expr],
+            source,
+            InputOrderMode::Sorted,
+            false,
+            &Funding::default(),
+        )
     }
 
     // Two PARTITION BY groups: hash=1 [sn=1,2,3] then hash=2 [sn=4,5,6].
@@ -2562,6 +2611,7 @@ mod tests {
             source,
             InputOrderMode::Sorted,
             false,
+            &Funding::default(),
         )?
         .with_state_observer(Some(observer))?;
 
@@ -2683,6 +2733,7 @@ mod tests {
             source,
             InputOrderMode::Sorted,
             false,
+            &Funding::default(),
         )?
         .with_state_observer(Some(observer))?;
         let batches = collect(Arc::new(plan).execute(0, task_ctx)?).await?;
@@ -2794,6 +2845,7 @@ mod tests {
             source,
             InputOrderMode::Sorted,
             false,
+            &Funding::default(),
         )?
         .with_state_observer(Some(observer))?;
         let _ = collect(Arc::new(plan).execute(0, task_ctx)?).await?;

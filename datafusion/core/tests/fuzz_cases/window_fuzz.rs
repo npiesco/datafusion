@@ -297,6 +297,7 @@ async fn bounded_window_causal_non_causal() -> Result<()> {
                     memory_exec.clone(),
                     Linear,
                     false,
+                    &Funding::default(),
                 )?);
                 let task_ctx = ctx.task_ctx();
                 let collected_results = collect(running_window_exec, task_ctx).await?;
@@ -668,6 +669,7 @@ async fn run_window_test(
         )?],
         exec1,
         false,
+        &Funding::default(),
     )?) as _;
     let exec2 = DataSourceExec::from_data_source(
         MemorySourceConfig::try_new(&[input1], schema, None)?
@@ -689,6 +691,7 @@ async fn run_window_test(
         exec2,
         search_mode.clone(),
         false,
+        &Funding::default(),
     )?) as _;
     let task_ctx = ctx.task_ctx();
     let collected_usual = collect(usual_window_exec, task_ctx.clone()).await?;

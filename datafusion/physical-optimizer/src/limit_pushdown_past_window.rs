@@ -328,6 +328,7 @@ mod tests {
             sort,
             InputOrderMode::Sorted,
             true,
+            &Funding::default(),
         )?);
 
         let limit: Arc<dyn ExecutionPlan> = if use_local_limit {

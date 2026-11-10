@@ -102,6 +102,7 @@ fn build_window_topn_plan(
         input,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     // FilterExec: rn op limit_value
@@ -158,6 +159,7 @@ fn build_window_topn_no_partition(limit_value: i64) -> Result<Arc<dyn ExecutionP
         sort,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     let rn_col = Arc::new(Column::new("row_number", 2));
@@ -213,6 +215,7 @@ fn build_non_window_filter_plan() -> Result<Arc<dyn ExecutionPlan>> {
         sort,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     // Filter on data column val (index 1), NOT on window output
@@ -282,6 +285,7 @@ fn flipped_3_gteq_rn() -> Result<()> {
             input,
             InputOrderMode::Sorted,
             true,
+            &Funding::default(),
         )?);
 
         // Flipped: 3 >= rn  (Literal GtEq Column)
@@ -374,6 +378,7 @@ fn with_projection_between() -> Result<()> {
         input,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     // Add a ProjectionExec between Filter and Window
@@ -459,6 +464,7 @@ fn build_ranking_topn_plan(
         input,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     let rk_col = Arc::new(Column::new(udwf_name, 2));
@@ -510,6 +516,7 @@ fn build_rank_no_order_by_plan(limit_value: i64) -> Result<Arc<dyn ExecutionPlan
         sort,
         InputOrderMode::Sorted,
         true,
+        &Funding::default(),
     )?);
 
     let rk_col = Arc::new(Column::new("rank", 2));

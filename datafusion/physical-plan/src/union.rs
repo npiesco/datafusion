@@ -359,7 +359,8 @@ impl ExecutionPlan for UnionExec {
                 Ok(self.funding.arc(Self {
                     inputs: children,
                     metrics: ExecutionPlanMetricsSet::new(),
-                    ..Self::clone(&*self)
+                    cache: Arc::clone(&self.cache),
+                    funding: self.funding.clone(),
                 })?)
             }
             ChildrenPropertiesMode::Recompute => {
@@ -775,7 +776,8 @@ impl ExecutionPlan for InterleaveExec {
                 Ok(self.funding.arc(Self {
                     inputs: children,
                     metrics: ExecutionPlanMetricsSet::new(),
-                    ..Self::clone(&*self)
+                    cache: Arc::clone(&self.cache),
+                    funding: self.funding.clone(),
                 })?)
             }
             ChildrenPropertiesMode::Recompute => {

@@ -20,6 +20,7 @@ mod test {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion_common::Result;
+    use datafusion_common::funding::Funding;
     use datafusion_datasource::memory::MemorySourceConfig;
     use datafusion_datasource::source::DataSourceExec;
     use datafusion_execution::TaskContext;
@@ -57,6 +58,7 @@ mod test {
             source,
             InputOrderMode::Linear,
             true,
+            &Funding::default(),
         )?;
         let task_ctx = Arc::new(TaskContext::default());
         common::collect(bounded_agg_exec.execute(0, task_ctx)?).await?;
