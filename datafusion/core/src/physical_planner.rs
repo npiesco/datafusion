@@ -3041,7 +3041,15 @@ impl DefaultPhysicalPlanner {
             new_plan = optimizer
                 .optimize_with_context(new_plan, &optimizer_context)
                 .map_err(|e| {
-                    DataFusionError::Context(optimizer.name().to_string(), Box::new(e))
+                    // A refusal is passed on as made: naming the rule would allocate.
+                    if e.refused().is_some() {
+                        e
+                    } else {
+                        DataFusionError::Context(
+                            optimizer.name().to_string(),
+                            Box::new(e),
+                        )
+                    }
                 })?;
 
             // This only checks the schema in release build, and performs additional checks in debug mode.
@@ -5926,5 +5934,75 @@ digraph {
 
         assert_eq!(plan.schema(), schema);
         assert!(plan.is::<EmptyExec>());
+    }
+
+    /// Funding of `limit` bytes, recording what it holds and what it refused at.
+    struct Limited {
+        limit: usize,
+        held: std::sync::Mutex<usize>,
+        refused_at: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl datafusion_common::funding::PlanningFunding for Limited {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if *held + bytes > self.limit {
+                *self.refused_at.lock().unwrap() = Some(*held + bytes);
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    /// An empty relation (`SELECT 1 WHERE false` once optimized) planned and optimized
+    /// physically within every funding short of what it needs is refused with all charged
+    /// for it given back; within enough, the plan keeps exactly what was charged for it.
+    #[tokio::test]
+    async fn empty_relation_planned_within_funding() -> Result<()> {
+        let logical_plan = LogicalPlanBuilder::empty(false).build()?;
+        let planner = DefaultPhysicalPlanner::default();
+        let mut state = make_session_state();
+        let mut limit = 0;
+        let mut refusals = 0;
+        loop {
+            let source = Arc::new(Limited {
+                limit,
+                held: std::sync::Mutex::new(0),
+                refused_at: std::sync::Mutex::new(None),
+            });
+            let funding = Funding::new(Arc::clone(&source) as _);
+            state.config_mut().options_mut().funding = funding.clone();
+            let planned = match planner.create_physical_plan(&logical_plan, &state) {
+                Ok(planning) => planning.await,
+                Err(e) => Err(e),
+            };
+            match planned {
+                Ok(plan) => {
+                    assert!(plan.is::<EmptyExec>());
+                    assert!(funding.outstanding() > 0);
+                    assert_eq!(*source.held.lock().unwrap(), funding.outstanding());
+                    drop(plan);
+                    funding.unwound(0);
+                    assert_eq!(*source.held.lock().unwrap(), 0);
+                    break;
+                }
+                Err(e) => {
+                    assert!(e.refused().is_some(), "{e}");
+                    assert_eq!(funding.outstanding(), 0);
+                    assert_eq!(*source.held.lock().unwrap(), 0);
+                    refusals += 1;
+                    let next = source.refused_at.lock().unwrap().take().unwrap();
+                    assert!(next > limit);
+                    limit = next;
+                }
+            }
+        }
+        assert!(refusals > 1);
+        Ok(())
     }
 }
