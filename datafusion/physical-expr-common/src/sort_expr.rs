@@ -512,7 +512,8 @@ impl LexOrdering {
     /// Creates a new [`LexOrdering`] from the given vector of sort expressions.
     /// If the vector is empty, returns `None`.
     pub fn new(exprs: impl IntoIterator<Item = PhysicalSortExpr>) -> Option<Self> {
-        Self::try_new(exprs, &Funding::default()).expect("unfunded planning never refuses")
+        Self::try_new(exprs, &Funding::default())
+            .expect("unfunded planning never refuses")
     }
 
     /// Creates a new [`LexOrdering`] from the given sort expressions, its storage charged
@@ -534,6 +535,15 @@ impl LexOrdering {
     /// The funding its storage is charged to.
     pub fn funding(&self) -> &Funding {
         self.exprs.funding()
+    }
+
+    /// A copy whose storage is charged to `funding` before it is allocated. On refusal,
+    /// nothing stays charged.
+    pub fn clone_funded(&self, funding: &Funding) -> Result<Self> {
+        Ok(Self {
+            exprs: self.exprs.clone_funded(funding)?,
+            set: self.set.clone_funded(funding)?,
+        })
     }
 
     /// Its storage charged to `funding` instead.

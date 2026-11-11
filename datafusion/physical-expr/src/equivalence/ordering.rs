@@ -124,6 +124,17 @@ impl OrderingEquivalenceClass {
         self.orderings.funding()
     }
 
+    /// A copy whose storage, and that of each ordering, is charged to `funding` before it
+    /// is allocated. On refusal, nothing stays charged.
+    pub fn clone_funded(&self, funding: &Funding) -> Result<Self> {
+        let mut orderings = funding.held::<Vec<_>>();
+        orderings.reserve_exact(self.orderings.len())?;
+        for ordering in self.orderings.iter() {
+            orderings.push(ordering.clone_funded(funding)?)?;
+        }
+        Ok(Self { orderings })
+    }
+
     /// Its own storage given back to its funding: it is unfunded from here on. The
     /// orderings it holds keep their own funding.
     fn unfund(&mut self) {
@@ -1160,10 +1171,29 @@ mod tests {
         let copy = class.clone();
         assert_eq!(copy, class);
         assert_eq!(funding.outstanding(), needed, "clones are unfunded");
+        let funded_copy = class.clone_funded(&funding)?;
+        assert_eq!(funded_copy, class);
+        assert_eq!(
+            funding.outstanding(),
+            2 * needed,
+            "funded clones are charged"
+        );
+        drop(funded_copy);
+        assert_eq!(funding.outstanding(), needed);
         drop(class);
         assert_eq!(funding.outstanding(), 0);
         assert_eq!(held(&source), 0);
         drop(copy);
+        assert_eq!(held(&source), 0);
+
+        let (source, funding) = ceiling(needed);
+        let class = OrderingEquivalenceClass::try_new(funded_orderings(), &funding)?;
+        assert!(matches!(
+            class.clone_funded(&funding),
+            Err(DataFusionError::Refused { .. })
+        ));
+        assert_eq!(funding.outstanding(), needed, "refused clone unwound");
+        drop(class);
         assert_eq!(held(&source), 0);
 
         for available in 0..needed {
