@@ -1061,7 +1061,8 @@ impl AsLogicalPlan for LogicalPlanNode {
                     datafusion_expr::JoinType::from(join_type),
                     JoinConstraint::from(join_constraint),
                     NullEquality::from(null_equality),
-                    join.null_aware, &datafusion_common::funding::Funding::default(),
+                    join.null_aware,
+                    &datafusion_common::funding::Funding::default(),
                 )?))
             }
             LogicalPlanType::Union(union) => {

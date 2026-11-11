@@ -764,18 +764,23 @@ fn extension_node_does_not_block_projection_pruning() -> Result<()> {
         None,
     );
 
-    let plan = LogicalPlanBuilder::scan("t", table_source, None, &datafusion_common::funding::Funding::default())?
-        .project(vec![col("t.a"), ts_cast.alias_qualified(Some("t"), "ts")])?
-        .filter(
-            col("t.ts")
-                .gt(ts_millis_1000)
-                .and(col("t.ts").lt(ts_millis_2000)),
-        )?
-        .sort(vec![
-            SortExpr::new(col("t.a"), true, true),
-            SortExpr::new(col("t.ts"), true, true),
-        ])?
-        .build()?;
+    let plan = LogicalPlanBuilder::scan(
+        "t",
+        table_source,
+        None,
+        &datafusion_common::funding::Funding::default(),
+    )?
+    .project(vec![col("t.a"), ts_cast.alias_qualified(Some("t"), "ts")])?
+    .filter(
+        col("t.ts")
+            .gt(ts_millis_1000)
+            .and(col("t.ts").lt(ts_millis_2000)),
+    )?
+    .sort(vec![
+        SortExpr::new(col("t.a"), true, true),
+        SortExpr::new(col("t.ts"), true, true),
+    ])?
+    .build()?;
 
     let df_schema = schema.to_dfschema_ref()?;
     let plan = LogicalPlan::Extension(Extension {

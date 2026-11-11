@@ -1587,9 +1587,7 @@ impl TreeNodeRewriter for Simplifier<'_> {
                     }
                 }
                 // The pairs skipped after WHEN true, and the old list's block, given back.
-                let rest = pairs.as_slice().iter().fold(pairs_bytes, |bytes, pair| {
-                    bytes.saturating_add(pair.freed_bytes())
-                });
+                let rest = pairs_bytes.saturating_add(pairs.as_slice().freed_bytes());
                 drop(pairs);
                 f.discharge(rest);
 

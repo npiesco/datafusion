@@ -17,7 +17,9 @@
 
 //! [`ReplaceDistinctWithAggregate`] replaces `DISTINCT ...` with `GROUP BY ...`
 
-use crate::funded::{aliased, column_expr, freed, normalize_in_place, unwrapped};
+use crate::funded::{
+    aliased, column_expr, freed, normalize_in_place, schema_columns, unwrapped,
+};
 use crate::optimizer::{ApplyOrder, ApplyOrder::BottomUp};
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -27,7 +29,6 @@ use datafusion_common::tree_node::Transformed;
 use datafusion_common::{Dependency, Result, ScalarValue};
 use datafusion_expr::expr::AggregateFunction;
 use datafusion_expr::logical_plan::builder::project;
-use datafusion_expr::utils::expand_wildcard;
 use datafusion_expr::{Aggregate, Distinct, DistinctOn, Expr, LogicalPlan};
 use datafusion_expr::{Limit, LogicalPlanBuilder, lit};
 
@@ -91,7 +92,9 @@ impl OptimizerRule for ReplaceDistinctWithAggregate {
         match plan {
             LogicalPlan::Distinct(Distinct::All(input)) => {
                 let funding = config.funding();
-                let group_expr = expand_wildcard(input.schema(), &input, None, &funding)?;
+                // Every column of the input, a USING join's duplicate keys included: the
+                // aggregate keeps the distinct's schema.
+                let group_expr = schema_columns(&funding, input.schema())?;
 
                 if group_expr.is_empty() {
                     // Special case: there are no columns to group by, so we can't replace it by a group by
@@ -338,7 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn distinct_over_using_join_groups_each_key_once() -> Result<()> {
+    fn distinct_over_using_join_keeps_its_schema() -> Result<()> {
         let plan = LogicalPlanBuilder::from(test_table_scan()?)
             .join_using(
                 test_table_scan_with_name("test1")?,
@@ -349,7 +352,7 @@ mod tests {
             .build()?;
 
         assert_optimized_plan_equal!(plan, @r"
-        Aggregate: groupBy=[[test.a, test.b, test.c, test1.b, test1.c]], aggr=[[]]
+        Aggregate: groupBy=[[test.a, test.b, test.c, test1.a, test1.b, test1.c]], aggr=[[]]
           Inner Join: Using test.a = test1.a
             TableScan: test
             TableScan: test1

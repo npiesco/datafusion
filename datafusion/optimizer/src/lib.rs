@@ -81,8 +81,8 @@ pub use optimizer::{
     ApplyOrder, Optimizer, OptimizerConfig, OptimizerContext, OptimizerRule,
 };
 
-pub(crate) mod join_key_set;
 mod funded;
+pub(crate) mod join_key_set;
 mod plan_signature;
 
 #[cfg(test)]

@@ -38,6 +38,7 @@
 //! handed to the optimizer is charged on the handle it optimizes within.
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash};
 use std::sync::Arc;
@@ -81,13 +82,43 @@ pub(crate) trait Freed {
     /// boxes and texts, and each plan, schema, field and table name it holds alone. Blocks
     /// another owner still holds are not freed with it, and functions are always shared:
     /// they are not counted.
-    fn freed_bytes(&self) -> usize;
+    fn freed_bytes(&self) -> usize {
+        self.freed_into(&mut Owners::default())
+    }
+
+    /// [`Freed::freed_bytes`], each `Arc` it reaches recorded in `owners`: a block held more
+    /// than once within the value is freed with it once all its owners are reached.
+    fn freed_into(&self, owners: &mut Owners) -> usize;
+}
+
+/// How many times each `Arc` block has been reached within a value being freed.
+#[derive(Default)]
+pub(crate) struct Owners(HashMap<usize, usize>);
+
+impl Owners {
+    /// Records one more owner of `arc`'s block: whether every owner of it has now been
+    /// reached, so dropping the value frees the block. True once per block.
+    fn last<T: ?Sized>(&mut self, arc: &Arc<T>) -> bool {
+        if Arc::weak_count(arc) != 0 {
+            return false;
+        }
+        let strong = Arc::strong_count(arc);
+        if strong == 1 {
+            return true;
+        }
+        let reached = self
+            .0
+            .entry(Arc::as_ptr(arc).cast::<()>() as usize)
+            .or_default();
+        *reached += 1;
+        *reached == strong
+    }
 }
 
 macro_rules! frees_nothing {
     ($($t:ty),*) => {$(
         impl Freed for $t {
-            fn freed_bytes(&self) -> usize {
+            fn freed_into(&self, _owners: &mut Owners) -> usize {
                 0
             }
         }
@@ -97,43 +128,49 @@ macro_rules! frees_nothing {
 frees_nothing!(usize, bool);
 
 impl Freed for String {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, _owners: &mut Owners) -> usize {
         self.capacity()
     }
 }
 
+impl<T: Freed> Freed for [T] {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        self.iter()
+            .fold(0, |bytes, item| bytes.saturating_add(item.freed_into(owners)))
+    }
+}
+
 impl<T: Freed> Freed for Vec<T> {
-    fn freed_bytes(&self) -> usize {
-        self.iter().fold(
-            self.capacity().saturating_mul(size_of::<T>()),
-            |bytes, item| bytes.saturating_add(item.freed_bytes()),
-        )
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        self.capacity()
+            .saturating_mul(size_of::<T>())
+            .saturating_add(self.as_slice().freed_into(owners))
     }
 }
 
 impl<T: Freed> Freed for Box<T> {
-    fn freed_bytes(&self) -> usize {
-        size_of::<T>().saturating_add(self.as_ref().freed_bytes())
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        size_of::<T>().saturating_add(self.as_ref().freed_into(owners))
     }
 }
 
 impl<T: Freed> Freed for Option<T> {
-    fn freed_bytes(&self) -> usize {
-        self.as_ref().map_or(0, Freed::freed_bytes)
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        self.as_ref().map_or(0, |value| value.freed_into(owners))
     }
 }
 
 impl<A: Freed, B: Freed> Freed for (A, B) {
-    fn freed_bytes(&self) -> usize {
-        sum([self.0.freed_bytes(), self.1.freed_bytes()])
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        sum([self.0.freed_into(owners), self.1.freed_into(owners)])
     }
 }
 
 impl Freed for Arc<LogicalPlan> {
     /// Held alone, its block and everything its plan holds; shared, nothing is freed.
-    fn freed_bytes(&self) -> usize {
-        if Arc::strong_count(self) == 1 && Arc::weak_count(self) == 0 {
-            sum([arc_bytes::<LogicalPlan>(), self.as_ref().freed_bytes()])
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        if owners.last(self) {
+            sum([arc_bytes::<LogicalPlan>(), self.as_ref().freed_into(owners)])
         } else {
             0
         }
@@ -141,7 +178,7 @@ impl Freed for Arc<LogicalPlan> {
 }
 
 impl Freed for Spans {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, _owners: &mut Owners) -> usize {
         self.0
             .capacity()
             .saturating_mul(size_of::<datafusion_common::Span>())
@@ -150,18 +187,13 @@ impl Freed for Spans {
 
 impl Freed for Column {
     /// Its name and spans, and its table name's texts it holds alone.
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         sum([
-            self.relation.freed_bytes(),
-            self.name.freed_bytes(),
-            self.spans.freed_bytes(),
+            self.relation.freed_into(owners),
+            self.name.freed_into(owners),
+            self.spans.freed_into(owners),
         ])
     }
-}
-
-/// Whether `arc` is its block's last owner: dropping it frees the block.
-fn last_owner<T: ?Sized>(arc: &Arc<T>) -> bool {
-    Arc::strong_count(arc) == 1 && Arc::weak_count(arc) == 0
 }
 
 /// The counted block of `len` items of `T` that a live block of theirs is in: it was
@@ -172,8 +204,8 @@ fn slice_block<T>(len: usize) -> usize {
 
 impl Freed for Arc<str> {
     /// Held alone, its counted block.
-    fn freed_bytes(&self) -> usize {
-        if last_owner(self) {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        if owners.last(self) {
             slice_block::<u8>(self.len())
         } else {
             0
@@ -183,20 +215,20 @@ impl Freed for Arc<str> {
 
 impl Freed for TableReference {
     /// Each of its texts it holds alone.
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         match self {
-            TableReference::Bare { table } => table.freed_bytes(),
+            TableReference::Bare { table } => table.freed_into(owners),
             TableReference::Partial { schema, table } => {
-                sum([schema.freed_bytes(), table.freed_bytes()])
+                sum([schema.freed_into(owners), table.freed_into(owners)])
             }
             TableReference::Full {
                 catalog,
                 schema,
                 table,
             } => sum([
-                catalog.freed_bytes(),
-                schema.freed_bytes(),
-                table.freed_bytes(),
+                catalog.freed_into(owners),
+                schema.freed_into(owners),
+                table.freed_into(owners),
             ]),
         }
     }
@@ -205,12 +237,12 @@ impl Freed for TableReference {
 impl Freed for FieldRef {
     /// Held alone, its block, its name and what its type holds. Its metadata map is copied
     /// uncharged: its table is not counted.
-    fn freed_bytes(&self) -> usize {
-        if last_owner(self) {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        if owners.last(self) {
             sum([
                 arc_bytes::<Field>(),
                 self.name().capacity(),
-                self.data_type().freed_bytes(),
+                self.data_type().freed_into(owners),
             ])
         } else {
             0
@@ -222,14 +254,14 @@ impl Freed for Arc<Schema> {
     /// Held alone, its block, its list of fields (an Arrow schema planning makes has a list
     /// of its own) and each field it holds alone. Its metadata map is copied uncharged: its
     /// table is not counted.
-    fn freed_bytes(&self) -> usize {
-        if last_owner(self) {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        if owners.last(self) {
             self.fields().iter().fold(
                 sum([
                     arc_bytes::<Schema>(),
                     slice_block::<FieldRef>(self.fields().len()),
                 ]),
-                |bytes, field| bytes.saturating_add(field.freed_bytes()),
+                |bytes, field| bytes.saturating_add(field.freed_into(owners)),
             )
         } else {
             0
@@ -240,15 +272,16 @@ impl Freed for Arc<Schema> {
 impl Freed for DFSchema {
     /// Its Arrow schema held alone, its list of qualifiers with each one's texts it holds
     /// alone, and its functional dependencies' lists.
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         self.iter().fold(
             sum([
-                self.inner().freed_bytes(),
+                self.inner().freed_into(owners),
                 size_of::<Option<TableReference>>().saturating_mul(self.fields().len()),
                 self.functional_dependencies().clone_bytes(),
             ]),
             |bytes, (qualifier, _)| {
-                bytes.saturating_add(qualifier.map_or(0, Freed::freed_bytes))
+                bytes
+                    .saturating_add(qualifier.map_or(0, |value| value.freed_into(owners)))
             },
         )
     }
@@ -256,9 +289,9 @@ impl Freed for DFSchema {
 
 impl Freed for DFSchemaRef {
     /// Held alone, its block and what its schema holds.
-    fn freed_bytes(&self) -> usize {
-        if last_owner(self) {
-            sum([arc_bytes::<DFSchema>(), self.as_ref().freed_bytes()])
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        if owners.last(self) {
+            sum([arc_bytes::<DFSchema>(), self.as_ref().freed_into(owners)])
         } else {
             0
         }
@@ -266,10 +299,10 @@ impl Freed for DFSchemaRef {
 }
 
 impl Freed for DataType {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         match self {
             DataType::Dictionary(key, value) => {
-                sum([key.freed_bytes(), value.freed_bytes()])
+                sum([key.freed_into(owners), value.freed_into(owners)])
             }
             // Every other type holds its parts shared, or inline.
             _ => 0,
@@ -278,7 +311,7 @@ impl Freed for DataType {
 }
 
 impl Freed for ScalarValue {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         match self {
             ScalarValue::Utf8(Some(text))
             | ScalarValue::Utf8View(Some(text))
@@ -287,11 +320,11 @@ impl Freed for ScalarValue {
             | ScalarValue::BinaryView(Some(bytes))
             | ScalarValue::LargeBinary(Some(bytes))
             | ScalarValue::FixedSizeBinary(_, Some(bytes)) => bytes.capacity(),
-            ScalarValue::Union(Some((_, value)), _, _) => value.freed_bytes(),
+            ScalarValue::Union(Some((_, value)), _, _) => value.freed_into(owners),
             ScalarValue::Dictionary(key_type, value) => {
-                sum([key_type.freed_bytes(), value.freed_bytes()])
+                sum([key_type.freed_into(owners), value.freed_into(owners)])
             }
-            ScalarValue::RunEndEncoded(_, _, value) => value.freed_bytes(),
+            ScalarValue::RunEndEncoded(_, _, value) => value.freed_into(owners),
             // Every other value is inline, or held in shared blocks.
             _ => 0,
         }
@@ -299,16 +332,16 @@ impl Freed for ScalarValue {
 }
 
 impl Freed for Sort {
-    fn freed_bytes(&self) -> usize {
-        self.expr.freed_bytes()
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        self.expr.freed_into(owners)
     }
 }
 
 impl Freed for WindowFrameBound {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         match self {
             WindowFrameBound::Preceding(value) | WindowFrameBound::Following(value) => {
-                value.freed_bytes()
+                value.freed_into(owners)
             }
             WindowFrameBound::CurrentRow => 0,
         }
@@ -316,23 +349,26 @@ impl Freed for WindowFrameBound {
 }
 
 impl Freed for WindowFrame {
-    fn freed_bytes(&self) -> usize {
-        sum([self.start_bound.freed_bytes(), self.end_bound.freed_bytes()])
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        sum([
+            self.start_bound.freed_into(owners),
+            self.end_bound.freed_into(owners),
+        ])
     }
 }
 
 impl Freed for Subquery {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         sum([
-            self.subquery.freed_bytes(),
-            self.outer_ref_columns.freed_bytes(),
-            self.spans.freed_bytes(),
+            self.subquery.freed_into(owners),
+            self.outer_ref_columns.freed_into(owners),
+            self.spans.freed_into(owners),
         ])
     }
 }
 
 impl Freed for WindowFunction {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         let WindowFunctionParams {
             args,
             partition_by,
@@ -342,17 +378,17 @@ impl Freed for WindowFunction {
             ..
         } = &self.params;
         sum([
-            args.freed_bytes(),
-            partition_by.freed_bytes(),
-            order_by.freed_bytes(),
-            window_frame.freed_bytes(),
-            filter.freed_bytes(),
+            args.freed_into(owners),
+            partition_by.freed_into(owners),
+            order_by.freed_into(owners),
+            window_frame.freed_into(owners),
+            filter.freed_into(owners),
         ])
     }
 }
 
 impl Freed for Expr {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         match self {
             Expr::Alias(Alias {
                 expr,
@@ -360,24 +396,24 @@ impl Freed for Expr {
                 name,
                 ..
             }) => sum([
-                expr.freed_bytes(),
-                relation.freed_bytes(),
-                name.freed_bytes(),
+                expr.freed_into(owners),
+                relation.freed_into(owners),
+                name.freed_into(owners),
             ]),
-            Expr::Column(column) => column.freed_bytes(),
+            Expr::Column(column) => column.freed_into(owners),
             Expr::OuterReferenceColumn(field, column) => {
-                sum([field.freed_bytes(), column.freed_bytes()])
+                sum([field.freed_into(owners), column.freed_into(owners)])
             }
             Expr::ScalarVariable(field, names) => {
-                sum([field.freed_bytes(), names.freed_bytes()])
+                sum([field.freed_into(owners), names.freed_into(owners)])
             }
-            Expr::Literal(value, _) => value.freed_bytes(),
+            Expr::Literal(value, _) => value.freed_into(owners),
             Expr::BinaryExpr(BinaryExpr { left, right, .. }) => {
-                sum([left.freed_bytes(), right.freed_bytes()])
+                sum([left.freed_into(owners), right.freed_into(owners)])
             }
             Expr::Like(Like { expr, pattern, .. })
             | Expr::SimilarTo(Like { expr, pattern, .. }) => {
-                sum([expr.freed_bytes(), pattern.freed_bytes()])
+                sum([expr.freed_into(owners), pattern.freed_into(owners)])
             }
             Expr::Not(expr)
             | Expr::IsNotNull(expr)
@@ -389,25 +425,29 @@ impl Freed for Expr {
             | Expr::IsNotFalse(expr)
             | Expr::IsNotUnknown(expr)
             | Expr::Negative(expr)
-            | Expr::Unnest(UnnestExpr { expr, .. }) => expr.freed_bytes(),
+            | Expr::Unnest(UnnestExpr { expr, .. }) => expr.freed_into(owners),
             Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
-                sum([expr.freed_bytes(), field.freed_bytes()])
+                sum([expr.freed_into(owners), field.freed_into(owners)])
             }
             Expr::Between(Between {
                 expr, low, high, ..
-            }) => sum([expr.freed_bytes(), low.freed_bytes(), high.freed_bytes()]),
+            }) => sum([
+                expr.freed_into(owners),
+                low.freed_into(owners),
+                high.freed_into(owners),
+            ]),
             Expr::Case(Case {
                 expr,
                 when_then_expr,
                 else_expr,
             }) => sum([
-                expr.freed_bytes(),
-                when_then_expr.freed_bytes(),
-                else_expr.freed_bytes(),
+                expr.freed_into(owners),
+                when_then_expr.freed_into(owners),
+                else_expr.freed_into(owners),
             ]),
             Expr::ScalarFunction(ScalarFunction { args, .. })
             | Expr::HigherOrderFunction(HigherOrderFunction { args, .. }) => {
-                args.freed_bytes()
+                args.freed_into(owners)
             }
             Expr::AggregateFunction(AggregateFunction {
                 params:
@@ -419,95 +459,105 @@ impl Freed for Expr {
                     },
                 ..
             }) => sum([
-                args.freed_bytes(),
-                filter.freed_bytes(),
-                order_by.freed_bytes(),
+                args.freed_into(owners),
+                filter.freed_into(owners),
+                order_by.freed_into(owners),
             ]),
-            Expr::WindowFunction(window) => window.freed_bytes(),
+            Expr::WindowFunction(window) => window.freed_into(owners),
             Expr::InList(InList { expr, list, .. }) => {
-                sum([expr.freed_bytes(), list.freed_bytes()])
+                sum([expr.freed_into(owners), list.freed_into(owners)])
             }
             Expr::Exists(Exists { subquery, .. }) | Expr::ScalarSubquery(subquery) => {
-                subquery.freed_bytes()
+                subquery.freed_into(owners)
             }
             Expr::InSubquery(InSubquery { expr, subquery, .. })
             | Expr::SetComparison(SetComparison { expr, subquery, .. }) => {
-                sum([expr.freed_bytes(), subquery.freed_bytes()])
+                sum([expr.freed_into(owners), subquery.freed_into(owners)])
             }
             // Its options' block; what present options hold is parsed SQL, never funded
             // ([`CloneBytes`] refuses copying it).
             #[expect(deprecated)]
             Expr::Wildcard { options, .. } => size_of_val(options.as_ref()),
             Expr::GroupingSet(GroupingSet::Rollup(exprs))
-            | Expr::GroupingSet(GroupingSet::Cube(exprs)) => exprs.freed_bytes(),
-            Expr::GroupingSet(GroupingSet::GroupingSets(lists)) => lists.freed_bytes(),
+            | Expr::GroupingSet(GroupingSet::Cube(exprs)) => exprs.freed_into(owners),
+            Expr::GroupingSet(GroupingSet::GroupingSets(lists)) => {
+                lists.freed_into(owners)
+            }
             Expr::Placeholder(Placeholder { id, field }) => {
-                sum([id.freed_bytes(), field.freed_bytes()])
+                sum([id.freed_into(owners), field.freed_into(owners)])
             }
             Expr::Lambda(Lambda { params, body }) => {
-                sum([params.freed_bytes(), body.freed_bytes()])
+                sum([params.freed_into(owners), body.freed_into(owners)])
             }
             Expr::LambdaVariable(LambdaVariable {
                 name, field, spans, ..
-            }) => sum([name.freed_bytes(), field.freed_bytes(), spans.freed_bytes()]),
+            }) => sum([
+                name.freed_into(owners),
+                field.freed_into(owners),
+                spans.freed_into(owners),
+            ]),
         }
     }
 }
 
 impl Freed for ColumnUnnestList {
-    fn freed_bytes(&self) -> usize {
-        self.output_column.freed_bytes()
+    fn freed_into(&self, owners: &mut Owners) -> usize {
+        self.output_column.freed_into(owners)
     }
 }
 
 impl Freed for RecursionUnnestOption {
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         sum([
-            self.input_column.freed_bytes(),
-            self.output_column.freed_bytes(),
+            self.input_column.freed_into(owners),
+            self.output_column.freed_into(owners),
         ])
     }
 }
 
 impl Freed for LogicalPlan {
     /// What dropping this node frees: what it holds, and each input it holds alone.
-    fn freed_bytes(&self) -> usize {
+    fn freed_into(&self, owners: &mut Owners) -> usize {
         let own = match self {
             LogicalPlan::Projection(Projection { expr, schema, .. }) => {
-                sum([expr.freed_bytes(), schema.freed_bytes()])
+                sum([expr.freed_into(owners), schema.freed_into(owners)])
             }
-            LogicalPlan::Filter(Filter { predicate, .. }) => predicate.freed_bytes(),
+            LogicalPlan::Filter(Filter { predicate, .. }) => predicate.freed_into(owners),
             LogicalPlan::Window(Window {
                 window_expr,
                 schema,
                 ..
-            }) => sum([window_expr.freed_bytes(), schema.freed_bytes()]),
+            }) => sum([window_expr.freed_into(owners), schema.freed_into(owners)]),
             LogicalPlan::Aggregate(Aggregate {
                 group_expr,
                 aggr_expr,
                 schema,
                 ..
             }) => sum([
-                group_expr.freed_bytes(),
-                aggr_expr.freed_bytes(),
-                schema.freed_bytes(),
+                group_expr.freed_into(owners),
+                aggr_expr.freed_into(owners),
+                schema.freed_into(owners),
             ]),
-            LogicalPlan::Sort(SortPlan { expr, .. }) => expr.freed_bytes(),
+            LogicalPlan::Sort(SortPlan { expr, .. }) => expr.freed_into(owners),
             LogicalPlan::Join(Join {
                 on, filter, schema, ..
-            }) => sum([on.freed_bytes(), filter.freed_bytes(), schema.freed_bytes()]),
+            }) => sum([
+                on.freed_into(owners),
+                filter.freed_into(owners),
+                schema.freed_into(owners),
+            ]),
             LogicalPlan::Repartition(Repartition {
                 partitioning_scheme:
                     Partitioning::Hash(exprs, _) | Partitioning::DistributeBy(exprs),
                 ..
-            }) => exprs.freed_bytes(),
+            }) => exprs.freed_into(owners),
             LogicalPlan::Union(Union { inputs, schema }) => {
                 // The inputs themselves are counted below, with every other node's.
                 sum([
                     inputs
                         .capacity()
                         .saturating_mul(size_of::<Arc<LogicalPlan>>()),
-                    schema.freed_bytes(),
+                    schema.freed_into(owners),
                 ])
             }
             LogicalPlan::TableScan(TableScan {
@@ -517,27 +567,30 @@ impl Freed for LogicalPlan {
                 filters,
                 ..
             }) => sum([
-                table_name.freed_bytes(),
-                projection.freed_bytes(),
-                projected_schema.freed_bytes(),
-                filters.freed_bytes(),
+                table_name.freed_into(owners),
+                projection.freed_into(owners),
+                projected_schema.freed_into(owners),
+                filters.freed_into(owners),
             ]),
             LogicalPlan::EmptyRelation(EmptyRelation { schema, .. }) => {
-                schema.freed_bytes()
+                schema.freed_into(owners)
             }
             LogicalPlan::SubqueryAlias(SubqueryAlias { alias, schema, .. }) => {
-                sum([alias.freed_bytes(), schema.freed_bytes()])
+                sum([alias.freed_into(owners), schema.freed_into(owners)])
             }
             LogicalPlan::Subquery(Subquery {
                 outer_ref_columns,
                 spans,
                 ..
-            }) => sum([outer_ref_columns.freed_bytes(), spans.freed_bytes()]),
+            }) => sum([
+                outer_ref_columns.freed_into(owners),
+                spans.freed_into(owners),
+            ]),
             LogicalPlan::Limit(Limit { skip, fetch, .. }) => {
-                sum([skip.freed_bytes(), fetch.freed_bytes()])
+                sum([skip.freed_into(owners), fetch.freed_into(owners)])
             }
             LogicalPlan::Values(Values { values, schema }) => {
-                sum([values.freed_bytes(), schema.freed_bytes()])
+                sum([values.freed_into(owners), schema.freed_into(owners)])
             }
             LogicalPlan::Distinct(Distinct::On(DistinctOn {
                 on_expr,
@@ -546,10 +599,10 @@ impl Freed for LogicalPlan {
                 schema,
                 ..
             })) => sum([
-                on_expr.freed_bytes(),
-                select_expr.freed_bytes(),
-                sort_expr.freed_bytes(),
-                schema.freed_bytes(),
+                on_expr.freed_into(owners),
+                select_expr.freed_into(owners),
+                sort_expr.freed_into(owners),
+                schema.freed_into(owners),
             ]),
             LogicalPlan::Unnest(Unnest {
                 exec_columns,
@@ -560,24 +613,24 @@ impl Freed for LogicalPlan {
                 schema,
                 ..
             }) => sum([
-                exec_columns.freed_bytes(),
-                list_type_columns.freed_bytes(),
-                struct_type_columns.freed_bytes(),
-                dependency_indices.freed_bytes(),
-                options.recursions.freed_bytes(),
-                schema.freed_bytes(),
+                exec_columns.freed_into(owners),
+                list_type_columns.freed_into(owners),
+                struct_type_columns.freed_into(owners),
+                dependency_indices.freed_into(owners),
+                options.recursions.freed_into(owners),
+                schema.freed_into(owners),
             ]),
             LogicalPlan::RecursiveQuery(RecursiveQuery { name, .. }) => {
-                name.freed_bytes()
+                name.freed_into(owners)
             }
             LogicalPlan::Statement(Statement::Execute(Execute {
                 parameters, ..
-            })) => parameters.freed_bytes(),
+            })) => parameters.freed_into(owners),
             _ => 0,
         };
         let mut inputs = 0;
         for_each_input_arc(self, &mut |input| {
-            inputs = sum([inputs, input.freed_bytes()]);
+            inputs = sum([inputs, input.freed_into(owners)]);
         });
         sum([own, inputs])
     }
@@ -597,12 +650,17 @@ pub(crate) fn freed<T: Freed>(funding: &Funding, value: T) {
     funding.discharge(bytes);
 }
 
-/// `plan` with its schema recomputed ([`LogicalPlan::recompute_schema`]): the schema it
-/// replaces freed and given back.
+/// `plan` with its schema recomputed ([`LogicalPlan::recompute_schema`]): the schema it is
+/// given, made on its own, charged once it is made, and the schema it replaces freed and
+/// given back.
 pub(crate) fn recomputed(funding: &Funding, plan: LogicalPlan) -> Result<LogicalPlan> {
     let replaced = Arc::clone(plan.schema());
     let plan = plan.recompute_schema()?;
+    let recomputed = !Arc::ptr_eq(&replaced, plan.schema());
     freed(funding, replaced);
+    if recomputed {
+        funding.charge(plan.schema().freed_bytes())?;
+    }
     Ok(plan)
 }
 
@@ -2352,4 +2410,37 @@ where
 {
     unshare(funding, &mut plan, true)?;
     plan.transform_up_with_subqueries(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_qualifier_shared_by_every_field_is_freed_with_the_schema() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+        let qualified =
+            DFSchema::try_from_qualified_schema("t", &schema, &Funding::default())?;
+        let bare = DFSchema::try_from(schema.clone())?;
+
+        assert_eq!(
+            qualified.freed_bytes() - bare.freed_bytes(),
+            slice_block::<u8>(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_field_listed_twice_is_freed_once() {
+        let field: FieldRef = Arc::new(Field::new("a", DataType::Int32, false));
+        let schema = Arc::new(Schema::new(vec![Arc::clone(&field), field]));
+
+        assert_eq!(
+            schema.freed_bytes(),
+            arc_bytes::<Schema>() + slice_block::<FieldRef>(2) + arc_bytes::<Field>() + 1
+        );
+    }
 }

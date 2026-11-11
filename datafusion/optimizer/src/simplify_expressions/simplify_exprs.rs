@@ -225,6 +225,7 @@ fn rewrite_aggregate_non_aggregate_aggr_expr(
         group_expr,
         aggr_expr,
         schema,
+        ..
     }) = plan
     else {
         return internal_err!("Expected an aggregate");

@@ -75,7 +75,8 @@ pub async fn from_substrait_plan_with_consumer(
                                         p.input.schema(),
                                         renamed_schema.fields(),
                                     )?,
-                                    p.input, &datafusion::common::funding::Funding::default(),
+                                    p.input,
+                                    &datafusion::common::funding::Funding::default(),
                                 )?))
                             }
                             LogicalPlan::Aggregate(a) => {
@@ -108,7 +109,8 @@ pub async fn from_substrait_plan_with_consumer(
                                     plan.schema(),
                                     renamed_schema.fields(),
                                 )?,
-                                Arc::new(plan), &datafusion::common::funding::Funding::default(),
+                                Arc::new(plan),
+                                &datafusion::common::funding::Funding::default(),
                             )?)),
                         }
                     }

@@ -847,7 +847,8 @@ impl DefaultPhysicalPlanner {
                 let input_exec = children.one()?;
                 let target_schema = DFSchema::try_from_qualified_schema(
                     table_name.clone(),
-                    &target.schema(), &datafusion_common::funding::Funding::default(),
+                    &target.schema(),
+                    &datafusion_common::funding::Funding::default(),
                 )?;
                 let merge_schema = Arc::new(target_schema.join(input.schema())?);
                 provider
@@ -1401,7 +1402,8 @@ impl DefaultPhysicalPlanner {
                             .collect::<Vec<_>>();
                         let projection = LogicalPlan::Projection(Projection::try_new(
                             final_join_result,
-                            Arc::new(new_join), &datafusion_common::funding::Funding::default(),
+                            Arc::new(new_join),
+                            &datafusion_common::funding::Funding::default(),
                         )?);
                         // LogicalPlan mutated
                         (Cow::Owned(projection), physical_left, physical_right)
@@ -3637,12 +3639,17 @@ mod tests {
         )])?;
         let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
         let source = Arc::new(DefaultTableSource::new(table));
-        let logical_plan = LogicalPlanBuilder::scan("test", source, None, &datafusion_common::funding::Funding::default())?
-            .repartition(LogicalPartitioning::Range(RangePartitioning::try_new(
-                vec![col("a").sort(true, true)],
-                vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
-            )?))?
-            .build()?;
+        let logical_plan = LogicalPlanBuilder::scan(
+            "test",
+            source,
+            None,
+            &datafusion_common::funding::Funding::default(),
+        )?
+        .repartition(LogicalPartitioning::Range(RangePartitioning::try_new(
+            vec![col("a").sort(true, true)],
+            vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
+        )?))?
+        .build()?;
 
         let planner = DefaultPhysicalPlanner::default();
         let physical_plan = planner
@@ -3717,7 +3724,8 @@ mod tests {
             FieldMetadata::from(HashMap::from([("foo".to_string(), "bar".to_string())]));
         let projection = LogicalPlan::Projection(Projection::try_new(
             vec![col("value").alias_with_metadata("value", Some(metadata))],
-            Arc::new(input), &datafusion_common::funding::Funding::default(),
+            Arc::new(input),
+            &datafusion_common::funding::Funding::default(),
         )?);
         let aggregate = LogicalPlan::Aggregate(Aggregate::try_new(
             Arc::new(projection),
@@ -5444,8 +5452,19 @@ digraph {
         let source = DefaultTableSource::new(table);
         let source = Arc::new(source);
 
-        let left = LogicalPlanBuilder::scan("left", source.clone(), None, &datafusion_common::funding::Funding::default())?;
-        let right = LogicalPlanBuilder::scan("right", source, None, &datafusion_common::funding::Funding::default())?.build()?;
+        let left = LogicalPlanBuilder::scan(
+            "left",
+            source.clone(),
+            None,
+            &datafusion_common::funding::Funding::default(),
+        )?;
+        let right = LogicalPlanBuilder::scan(
+            "right",
+            source,
+            None,
+            &datafusion_common::funding::Funding::default(),
+        )?
+        .build()?;
 
         let join_keys = (
             vec![Column::new(Some("left"), "a")],
@@ -5747,10 +5766,15 @@ digraph {
         let table_source = Arc::new(MockTableSource {
             schema: Arc::clone(&schema),
         });
-        let logical_plan = LogicalPlanBuilder::scan("test", table_source, None, &datafusion_common::funding::Funding::default())
-            .unwrap()
-            .build()
-            .unwrap();
+        let logical_plan = LogicalPlanBuilder::scan(
+            "test",
+            table_source,
+            None,
+            &datafusion_common::funding::Funding::default(),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
 
         let plan = physical_planner
             .create_physical_plan(&logical_plan, &session_state)

@@ -169,7 +169,7 @@ impl JoinKeySet {
 
 impl Drop for JoinKeySet {
     fn drop(&mut self) {
-        let bytes = self.keys.iter().map(Freed::freed_bytes).sum::<usize>();
+        let bytes = self.keys.as_slice().freed_bytes();
         self.keys.clear();
         self.funding.discharge(bytes);
     }
@@ -180,6 +180,39 @@ mod test {
     use crate::join_key_set::JoinKeySet;
     use datafusion_common::funding::Funding;
     use datafusion_expr::{Expr, col};
+
+    #[test]
+    fn a_qualifier_shared_by_every_key_is_freed_with_the_set() {
+        use crate::funded::Freed;
+        use datafusion_common::funding::PlanningFunding;
+        use datafusion_common::{Column, TableReference};
+        use std::sync::Arc;
+
+        struct Unlimited;
+        impl PlanningFunding for Unlimited {
+            fn charge(&self, _bytes: usize) -> bool {
+                true
+            }
+
+            fn discharge(&self, _bytes: usize) {}
+        }
+
+        let funding = Funding::new(Arc::new(Unlimited));
+        let t = TableReference::bare("t");
+        let column = |name: &str| Expr::Column(Column::new(Some(t.clone()), name));
+        let pairs = vec![(column("a"), column("b")), (column("c"), column("d"))];
+        drop(t);
+        let each = pairs.iter().map(Freed::freed_bytes).sum::<usize>();
+        assert!(
+            pairs.as_slice().freed_bytes() > each,
+            "the qualifier is shared"
+        );
+        funding.charge(pairs.as_slice().freed_bytes()).unwrap();
+        let mut set = JoinKeySet::new(&funding);
+        set.insert_all_owned(pairs).unwrap();
+        drop(set);
+        assert_eq!(funding.outstanding(), 0);
+    }
 
     #[test]
     fn test_insert() {

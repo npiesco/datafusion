@@ -20,7 +20,6 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::iter::once;
 use std::sync::Arc;
 
 use crate::dml::CopyTo;
