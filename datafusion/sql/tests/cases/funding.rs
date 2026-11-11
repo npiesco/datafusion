@@ -153,3 +153,22 @@ fn wildcards_are_funded() {
     assert_funded("SELECT * REPLACE (age + 1 AS age) FROM person");
     assert_funded("SELECT * FROM person AS a JOIN person AS b USING (id)");
 }
+
+/// Planning `sql` fails other than refused, giving back all it charged.
+fn assert_failure_freed(sql: &str) {
+    let (plan, held, _) = plan_within(sql, usize::MAX);
+    let err = plan.expect_err("planned a query that does not plan");
+    assert!(err.refused().is_none(), "{sql} was refused: {err}");
+    assert_eq!(held, 0, "{sql} failed leaving {held} held");
+}
+
+#[test]
+fn a_failed_select_list_gives_back_the_items_planned_before() {
+    assert_failure_freed("SELECT * REPLACE (age + 1 AS age), no_such_column FROM person");
+    assert_failure_freed("SELECT * REPLACE (age + 1 AS age, no_such_column AS id) FROM person");
+}
+
+#[test]
+fn pipe_extend_is_funded() {
+    assert_funded("SELECT * FROM person |> EXTEND age + 1 AS older");
+}
