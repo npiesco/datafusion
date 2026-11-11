@@ -2505,8 +2505,10 @@ impl Projection {
         input: Arc<LogicalPlan>,
         funding: &Funding,
     ) -> Result<Self> {
+        let before = funding.outstanding();
         let projection_schema = projection_schema(&input, &expr, funding)?;
         Self::try_new_with_schema(expr, input, projection_schema)
+            .inspect_err(|_| funding.unwound(before))
     }
 
     /// Create a new Projection using the specified output schema
@@ -2567,19 +2569,23 @@ pub fn projection_schema(
     exprs: &[Expr],
     funding: &Funding,
 ) -> Result<Arc<DFSchema>> {
-    // Preserve input schema metadata at the schema level. A non-empty metadata map is
-    // copied uncharged: its table's size is not measured.
-    let metadata = input.schema().metadata().clone();
+    let before = funding.outstanding();
+    (|| {
+        // Preserve input schema metadata at the schema level. A non-empty metadata map is
+        // copied uncharged: its table's size is not measured.
+        let metadata = input.schema().metadata().clone();
 
-    // Convert expressions to fields with Field properties determined by `Expr::to_field`
-    let fields = exprlist_to_fields(exprs, input, funding)?;
-    let schema = DFSchema::new_with_metadata(&fields, metadata, funding)?;
-    funding.released(fields);
-    let schema = schema.with_functional_dependencies(
-        calc_func_dependencies_for_project(exprs, input, funding)?,
-    )?;
+        // Convert expressions to fields with Field properties determined by `Expr::to_field`
+        let fields = exprlist_to_fields(exprs, input, funding)?;
+        let schema = DFSchema::new_with_metadata(&fields, metadata, funding)?;
+        funding.released(fields);
+        let schema = schema.with_functional_dependencies(
+            calc_func_dependencies_for_project(exprs, input, funding)?,
+        )?;
 
-    funding.arc(schema)
+        funding.arc(schema)
+    })()
+    .inspect_err(|_| funding.unwound(before))
 }
 
 /// Aliased subquery
@@ -3160,57 +3166,63 @@ impl TableScanBuilder {
     /// Build the [`TableScan`], deriving its `projected_schema` from the
     /// source schema and projection, all it allocates charged to `funding` before it is made.
     pub fn build(self, funding: &Funding) -> Result<TableScan> {
-        let TableScanBuilder {
-            table_name,
-            source,
-            projection,
-            filters,
-            fetch,
-            statistics_requests,
-        } = self;
+        let before = funding.outstanding();
+        (|| {
+            let TableScanBuilder {
+                table_name,
+                source,
+                projection,
+                filters,
+                fetch,
+                statistics_requests,
+            } = self;
 
-        if table_name.table().is_empty() {
-            return plan_err!("table_name cannot be empty");
-        }
-        let schema = source.schema();
-        let func_dependencies = FunctionalDependencies::new_from_constraints(
-            source.constraints(),
-            schema.fields.len(),
-            funding,
-        )?;
-        let projected_schema = match projection.as_ref() {
-            Some(p) => {
-                let projected_func_dependencies = func_dependencies
-                    .project_functional_dependencies(p, p.len(), funding)?;
-                funding.released_clone(func_dependencies);
-                let mut qualified_fields = funding.vec_with_capacity(p.len())?;
-                qualified_fields.extend(p.iter().map(|i| {
-                    (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
-                }));
-                let df_schema = DFSchema::new_with_metadata(
-                    &qualified_fields,
-                    schema.metadata.clone(),
+            if table_name.table().is_empty() {
+                return plan_err!("table_name cannot be empty");
+            }
+            let schema = source.schema();
+            let func_dependencies = FunctionalDependencies::new_from_constraints(
+                source.constraints(),
+                schema.fields.len(),
+                funding,
+            )?;
+            let projected_schema = match projection.as_ref() {
+                Some(p) => {
+                    let projected_func_dependencies = func_dependencies
+                        .project_functional_dependencies(p, p.len(), funding)?;
+                    funding.released_clone(func_dependencies);
+                    let mut qualified_fields = funding.vec_with_capacity(p.len())?;
+                    qualified_fields.extend(p.iter().map(|i| {
+                        (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
+                    }));
+                    let df_schema = DFSchema::new_with_metadata(
+                        &qualified_fields,
+                        schema.metadata.clone(),
+                        funding,
+                    )?;
+                    funding.released(qualified_fields);
+                    df_schema.with_functional_dependencies(projected_func_dependencies)
+                }
+                None => DFSchema::try_from_qualified_schema(
+                    table_name.clone(),
+                    &schema,
                     funding,
-                )?;
-                funding.released(qualified_fields);
-                df_schema.with_functional_dependencies(projected_func_dependencies)
-            }
-            None => {
-                DFSchema::try_from_qualified_schema(table_name.clone(), &schema, funding)?
-                    .with_functional_dependencies(func_dependencies)
-            }
-        }?;
-        let projected_schema = funding.arc(projected_schema)?;
+                )?
+                .with_functional_dependencies(func_dependencies),
+            }?;
+            let projected_schema = funding.arc(projected_schema)?;
 
-        Ok(TableScan {
-            table_name,
-            source,
-            projection,
-            projected_schema,
-            filters,
-            fetch,
-            statistics_requests,
-        })
+            Ok(TableScan {
+                table_name,
+                source,
+                projection,
+                projected_schema,
+                filters,
+                fetch,
+                statistics_requests,
+            })
+        })()
+        .inspect_err(|_| funding.unwound(before))
     }
 }
 
@@ -4366,8 +4378,12 @@ impl Join {
         null_aware: bool,
         funding: &Funding,
     ) -> Result<Self> {
+        let before = funding.outstanding();
         let join_schema =
             build_join_schema(left.schema(), right.schema(), &join_type, funding)?;
+        let schema = funding
+            .arc(join_schema)
+            .inspect_err(|_| funding.unwound(before))?;
 
         Ok(Join {
             left,
@@ -4376,7 +4392,7 @@ impl Join {
             filter,
             join_type,
             join_constraint,
-            schema: funding.arc(join_schema)?,
+            schema,
             null_equality,
             null_aware,
         })

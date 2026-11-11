@@ -1788,6 +1788,17 @@ pub fn build_join_schema(
     join_type: &JoinType,
     funding: &Funding,
 ) -> Result<DFSchema> {
+    let before = funding.outstanding();
+    build_join_schema_inner(left, right, join_type, funding)
+        .inspect_err(|_| funding.unwound(before))
+}
+
+fn build_join_schema_inner(
+    left: &DFSchema,
+    right: &DFSchema,
+    join_type: &JoinType,
+    funding: &Funding,
+) -> Result<DFSchema> {
     fn push_fields(
         qualified_fields: &mut Vec<(Option<TableReference>, FieldRef)>,
         schema: &DFSchema,
@@ -3341,5 +3352,138 @@ mod tests {
             "Execution error: Types don't match and no valid cast exists, \
          received data of type Boolean for field of type Date32"
         );
+    }
+
+    #[test]
+    fn build_join_schema_unwinds_funding_on_error_and_refusal() -> Result<()> {
+        use datafusion_common::{
+            FunctionalDependence, FunctionalDependencies, funding::PlanningFunding,
+        };
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Limited {
+            limit: usize,
+            held: Mutex<usize>,
+            peak: AtomicUsize,
+        }
+        impl PlanningFunding for Limited {
+            fn charge(&self, bytes: usize) -> bool {
+                let mut held = self.held.lock().unwrap();
+                if *held + bytes > self.limit {
+                    return false;
+                }
+                *held += bytes;
+                self.peak.fetch_max(*held, Ordering::SeqCst);
+                true
+            }
+            fn discharge(&self, bytes: usize) {
+                let mut held = self.held.lock().unwrap();
+                *held = held.checked_sub(bytes).expect("release underflow");
+            }
+        }
+
+        let arrow = Schema::new(vec![
+            Field::new("c0", DataType::Int32, false),
+            Field::new("c1", DataType::Int32, false),
+        ]);
+        let dep = FunctionalDependence::new(vec![0], vec![0, 1], false);
+        let deps = FunctionalDependencies::new(vec![dep]);
+
+        // 1. Duplicate unqualified column name fails check_names() after func_dependencies
+        // and qualified_fields have already been funded.
+        let unqual_left = DFSchema::try_from(arrow.clone())?
+            .with_functional_dependencies(deps.clone())?;
+        let unqual_right = DFSchema::try_from(arrow.clone())?
+            .with_functional_dependencies(deps.clone())?;
+        let err_source = Arc::new(Limited {
+            limit: usize::MAX,
+            held: Mutex::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let err_funding =
+            Funding::new(Arc::clone(&err_source) as Arc<dyn PlanningFunding>);
+        assert!(
+            build_join_schema(&unqual_left, &unqual_right, &JoinType::Full, &err_funding)
+                .is_err()
+        );
+        assert_eq!(err_funding.outstanding(), 0);
+        assert_eq!(*err_source.held.lock().unwrap(), 0);
+
+        // 2. Refusal at any intermediate reservation point in build_join_schema must unwind to 0.
+        let left =
+            DFSchema::try_from_qualified_schema("t1", &arrow, &Funding::default())?
+                .with_functional_dependencies(deps.clone())?;
+        let right =
+            DFSchema::try_from_qualified_schema("t2", &arrow, &Funding::default())?
+                .with_functional_dependencies(deps)?;
+        let probe_source = Arc::new(Limited {
+            limit: usize::MAX,
+            held: Mutex::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let probe_funding =
+            Funding::new(Arc::clone(&probe_source) as Arc<dyn PlanningFunding>);
+        let joined = build_join_schema(&left, &right, &JoinType::Full, &probe_funding)?;
+        let peak = probe_source.peak.load(Ordering::SeqCst);
+        assert!(peak > 0);
+        joined.released(&probe_funding);
+
+        for limit in 0..peak {
+            let source = Arc::new(Limited {
+                limit,
+                held: Mutex::new(0),
+                peak: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+            let err =
+                build_join_schema(&left, &right, &JoinType::Full, &funding).unwrap_err();
+            assert!(matches!(err, DataFusionError::Refused { .. }));
+            assert_eq!(
+                *source.held.lock().unwrap(),
+                0,
+                "build_join_schema refusal at limit {limit} leaked held bytes"
+            );
+            assert_eq!(funding.outstanding(), 0);
+        }
+
+        // 3. merge_schema over 3 inputs releases intermediate merged schemas and unwinds on refusal.
+        let p1 = table_scan(Some("t1"), &arrow, None)?.build()?;
+        let p2 = table_scan(Some("t2"), &arrow, None)?.build()?;
+        let p3 = table_scan(Some("t3"), &arrow, None)?.build()?;
+        let merge_source = Arc::new(Limited {
+            limit: usize::MAX,
+            held: Mutex::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let merge_funding =
+            Funding::new(Arc::clone(&merge_source) as Arc<dyn PlanningFunding>);
+        let merged = crate::utils::merge_schema(&[&p1, &p2, &p3], &merge_funding)?;
+        let merge_peak = merge_source.peak.load(Ordering::SeqCst);
+        assert!(merge_peak > 0);
+        merged.released(&merge_funding);
+        assert_eq!(merge_funding.outstanding(), 0);
+        assert_eq!(*merge_source.held.lock().unwrap(), 0);
+
+        for limit in 0..merge_peak {
+            let source = Arc::new(Limited {
+                limit,
+                held: Mutex::new(0),
+                peak: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+            if let Ok(ok) = crate::utils::merge_schema(&[&p1, &p2, &p3], &funding) {
+                ok.released(&funding);
+            }
+            assert_eq!(
+                *source.held.lock().unwrap(),
+                0,
+                "merge_schema at limit {limit} leaked held bytes"
+            );
+            assert_eq!(funding.outstanding(), 0);
+        }
+
+        Ok(())
     }
 }

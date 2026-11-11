@@ -122,8 +122,10 @@ pub struct DFSchema {
 impl DFSchema {
     /// Creates an empty `DFSchema`
     pub fn empty() -> Self {
+        static EMPTY_SCHEMA: LazyLock<SchemaRef> =
+            LazyLock::new(|| Arc::new(Schema::new([])));
         Self {
-            inner: Arc::new(Schema::new([])),
+            inner: Arc::clone(&EMPTY_SCHEMA),
             field_qualifiers: vec![],
             functional_dependencies: FunctionalDependencies::empty(),
         }
@@ -637,30 +639,36 @@ impl DFSchema {
         &self,
         name: &str,
     ) -> Result<(Option<&TableReference>, &FieldRef)> {
-        let matches = self.qualified_fields_with_unqualified_name(name);
-        match matches.len() {
-            0 => Err(unqualified_field_not_found(name, self)),
-            1 => Ok((matches[0].0, matches[0].1)),
-            _ => {
-                // When `matches` size > 1, it doesn't necessarily mean an `ambiguous name` problem.
-                // Because name may generate from Alias/... . It means that it don't own qualifier.
-                // For example:
-                //             Join on id = b.id
-                // Project a.id as id   TableScan b id
-                // In this case, there isn't `ambiguous name` problem. When `matches` just contains
-                // one field without qualifier, we should return it.
-                let fields_without_qualifier = matches
-                    .iter()
-                    .filter(|(q, _)| q.is_none())
-                    .collect::<Vec<_>>();
-                if fields_without_qualifier.len() == 1 {
-                    Ok((fields_without_qualifier[0].0, fields_without_qualifier[0].1))
-                } else {
-                    _schema_err!(SchemaError::AmbiguousReference {
-                        field: Box::new(Column::new_unqualified(name.to_string()))
-                    })
+        let mut total = 0usize;
+        let mut first = None;
+        let mut unqualified = 0usize;
+        let mut first_unqualified = None;
+        for (qualifier, field) in self.iter().filter(|(_, field)| field.name() == name) {
+            total += 1;
+            if first.is_none() {
+                first = Some((qualifier, field));
+            }
+            if qualifier.is_none() {
+                unqualified += 1;
+                if first_unqualified.is_none() {
+                    first_unqualified = Some((qualifier, field));
                 }
             }
+        }
+        match total {
+            0 => Err(unqualified_field_not_found(name, self)),
+            1 => Ok(first.unwrap()),
+            // When `matches` size > 1, it doesn't necessarily mean an `ambiguous name` problem.
+            // Because name may generate from Alias/... . It means that it don't own qualifier.
+            // For example:
+            //             Join on id = b.id
+            // Project a.id as id   TableScan b id
+            // In this case, there isn't `ambiguous name` problem. When `matches` just contains
+            // one field without qualifier, we should return it.
+            _ if unqualified == 1 => Ok(first_unqualified.unwrap()),
+            _ => _schema_err!(SchemaError::AmbiguousReference {
+                field: Box::new(Column::new_unqualified(name.to_string()))
+            }),
         }
     }
 
@@ -962,22 +970,16 @@ impl DFSchema {
     }
 
     /// Strip all field qualifier in schema
-    pub fn strip_qualifiers(self) -> Self {
-        DFSchema {
-            field_qualifiers: vec![None; self.inner.fields.len()],
-            inner: self.inner,
-            functional_dependencies: self.functional_dependencies,
-        }
+    pub fn strip_qualifiers(mut self) -> Self {
+        self.field_qualifiers.fill(None);
+        self
     }
 
     /// Replace all field qualifier with new value in schema
-    pub fn replace_qualifier(self, qualifier: impl Into<TableReference>) -> Self {
+    pub fn replace_qualifier(mut self, qualifier: impl Into<TableReference>) -> Self {
         let qualifier = qualifier.into();
-        DFSchema {
-            field_qualifiers: vec![Some(qualifier); self.inner.fields.len()],
-            inner: self.inner,
-            functional_dependencies: self.functional_dependencies,
-        }
+        self.field_qualifiers.fill(Some(qualifier));
+        self
     }
 
     /// Get list of fully-qualified field names in this schema
@@ -2148,6 +2150,67 @@ mod tests {
             assert_eq!(funding.outstanding(), 0);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn strip_and_replace_qualifier_mutate_in_place_and_release_cleanly() -> Result<()> {
+        use crate::funding::PlanningFunding;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct Limited {
+            held: Mutex<usize>,
+            peak: AtomicUsize,
+        }
+        impl PlanningFunding for Limited {
+            fn charge(&self, bytes: usize) -> bool {
+                let mut held = self.held.lock().unwrap();
+                *held += bytes;
+                self.peak.fetch_max(*held, Ordering::SeqCst);
+                true
+            }
+            fn discharge(&self, bytes: usize) {
+                let mut held = self.held.lock().unwrap();
+                *held = held.checked_sub(bytes).expect("release underflow");
+            }
+        }
+
+        let source = Arc::new(Limited {
+            held: Mutex::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+
+        let schema = DFSchema::try_from_qualified_schema(
+            TableReference::bare("t1"),
+            &test_schema_1(),
+            &funding,
+        )?;
+        let ptr_before = schema.field_qualifiers.as_ptr();
+        let cap_before = schema.field_qualifiers.capacity();
+        let outstanding_before = funding.outstanding();
+
+        let stripped = schema.strip_qualifiers();
+        assert_eq!(stripped.field_qualifiers.as_ptr(), ptr_before);
+        assert_eq!(stripped.field_qualifiers.capacity(), cap_before);
+        assert!(stripped.field_qualifiers.iter().all(Option::is_none));
+
+        let replaced = stripped.replace_qualifier(TableReference::bare("t2"));
+        assert_eq!(replaced.field_qualifiers.as_ptr(), ptr_before);
+        assert_eq!(replaced.field_qualifiers.capacity(), cap_before);
+        assert!(
+            replaced
+                .field_qualifiers
+                .iter()
+                .all(|q| q.as_ref() == Some(&TableReference::bare("t2")))
+        );
+        assert_eq!(funding.outstanding(), outstanding_before);
+
+        replaced.released_qualified(&funding);
+        assert_eq!(funding.outstanding(), 0);
+        assert_eq!(*source.held.lock().unwrap(), 0);
         Ok(())
     }
 

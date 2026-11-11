@@ -1484,9 +1484,22 @@ pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
 pub fn merge_schema(inputs: &[&LogicalPlan], funding: &Funding) -> Result<DFSchema> {
     match inputs {
         [input] => funding.cloned(input.schema().as_ref()),
-        _ => inputs.iter().try_fold(DFSchema::empty(), |lhs, rhs| {
-            lhs.merge(rhs.schema(), funding)
-        }),
+        _ => {
+            let mut acc = DFSchema::empty();
+            for rhs in inputs {
+                match acc.merge(rhs.schema(), funding) {
+                    Ok(merged) => {
+                        acc.released(funding);
+                        acc = merged;
+                    }
+                    Err(err) => {
+                        acc.released(funding);
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(acc)
+        }
     }
 }
 
