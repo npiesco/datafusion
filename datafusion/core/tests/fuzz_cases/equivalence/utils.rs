@@ -150,7 +150,11 @@ pub fn apply_projection(
         RecordBatch::try_new(Arc::clone(&output_schema), projected_values)?
     };
 
-    let projected_eq = input_eq_properties.project(&projection_mapping, output_schema);
+    let projected_eq = input_eq_properties.try_project(
+        &projection_mapping,
+        output_schema,
+        &Funding::default(),
+    )?;
     Ok((projected_batch, projected_eq))
 }
 

@@ -513,6 +513,14 @@ impl EquivalenceGroup {
     /// expression is replaced with the first (canonical) expression in the
     /// equivalence class it matches with (if any).
     pub fn normalize_expr(&self, expr: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+        self.try_normalize_expr(expr).unwrap()
+    }
+
+    /// Normalizes an expression, returning rebuilding errors to the caller.
+    pub fn try_normalize_expr(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
         expr.transform(|expr| {
             let cls = self.get_equivalence_class(&expr);
             let Some(canonical) = cls.and_then(|cls| cls.canonical_expr()) else {
@@ -521,8 +529,6 @@ impl EquivalenceGroup {
             Ok(Transformed::yes(Arc::clone(canonical)))
         })
         .data()
-        .unwrap()
-        // The unwrap above is safe because the closure always returns `Ok`.
     }
 
     /// Normalizes the given sort expression according to this group. The
@@ -604,10 +610,10 @@ impl EquivalenceGroup {
     fn project_expr_indirect(
         aug_mapping: &AugmentedMapping,
         expr: &Arc<dyn PhysicalExpr>,
-    ) -> Option<Arc<dyn PhysicalExpr>> {
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
         // Literals don't need to be projected
         if expr.downcast_ref::<Literal>().is_some() {
-            return Some(Arc::clone(expr));
+            return Ok(Some(Arc::clone(expr)));
         }
 
         // The given expression is not inside the mapping, so we try to project
@@ -619,14 +625,14 @@ impl EquivalenceGroup {
             // expression `b` projects to `a1`.
             if eq_class.as_ref().is_some_and(|cls| cls.contains(expr)) {
                 let (target, _) = targets.first();
-                return Some(Arc::clone(target));
+                return Ok(Some(Arc::clone(target)));
             }
         }
         // Project a non-leaf expression by projecting its children.
         let children = expr.children();
         if children.is_empty() {
             // A leaf expression should be inside the mapping.
-            return None;
+            return Ok(None);
         }
         children
             .into_iter()
@@ -636,13 +642,14 @@ impl EquivalenceGroup {
                 if let Some((targets, _)) = aug_mapping.get(child) {
                     // If we match the source, we can project directly:
                     let (target, _) = targets.first();
-                    Some(Arc::clone(target))
+                    Ok(Some(Arc::clone(target)))
                 } else {
                     Self::project_expr_indirect(aug_mapping, child)
                 }
             })
-            .collect::<Option<Vec<_>>>()
-            .map(|children| Arc::clone(expr).with_new_children(children).unwrap())
+            .collect::<Result<Option<Vec<_>>>>()?
+            .map(|children| Arc::clone(expr).with_new_children(children))
+            .transpose()
     }
 
     fn augment_projection_mapping<'a>(
@@ -665,10 +672,19 @@ impl EquivalenceGroup {
         mapping: &ProjectionMapping,
         expr: &Arc<dyn PhysicalExpr>,
     ) -> Option<Arc<dyn PhysicalExpr>> {
+        self.try_project_expr(mapping, expr).unwrap()
+    }
+
+    /// Projects an expression, returning rebuilding errors to the caller.
+    pub fn try_project_expr(
+        &self,
+        mapping: &ProjectionMapping,
+        expr: &Arc<dyn PhysicalExpr>,
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
         if let Some(targets) = mapping.get(expr) {
             // If we match the source, we can project directly:
             let (target, _) = targets.first();
-            Some(Arc::clone(target))
+            Ok(Some(Arc::clone(target)))
         } else {
             let aug_mapping = self.augment_projection_mapping(mapping);
             Self::project_expr_indirect(&aug_mapping, expr)
@@ -684,12 +700,22 @@ impl EquivalenceGroup {
         mapping: &'a ProjectionMapping,
         expressions: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>> + 'a,
     ) -> impl Iterator<Item = Option<Arc<dyn PhysicalExpr>>> + 'a {
+        self.try_project_expressions(mapping, expressions)
+            .map(Result::unwrap)
+    }
+
+    /// Projects expressions, returning rebuilding errors to the caller.
+    pub fn try_project_expressions<'a>(
+        &'a self,
+        mapping: &'a ProjectionMapping,
+        expressions: impl IntoIterator<Item = &'a Arc<dyn PhysicalExpr>> + 'a,
+    ) -> impl Iterator<Item = Result<Option<Arc<dyn PhysicalExpr>>>> + 'a {
         let mut aug_mapping = None;
         expressions.into_iter().map(move |expr| {
             if let Some(targets) = mapping.get(expr) {
                 // If we match the source, we can project directly:
                 let (target, _) = targets.first();
-                Some(Arc::clone(target))
+                Ok(Some(Arc::clone(target)))
             } else {
                 let aug_mapping = aug_mapping
                     .get_or_insert_with(|| self.augment_projection_mapping(mapping));
@@ -700,9 +726,19 @@ impl EquivalenceGroup {
 
     /// Projects this equivalence group according to the given projection mapping.
     pub fn project(&self, mapping: &ProjectionMapping) -> Self {
+        self.try_project(mapping).unwrap()
+    }
+
+    /// Projects this group, returning rebuilding errors to the caller.
+    pub fn try_project(&self, mapping: &ProjectionMapping) -> Result<Self> {
         let projected_classes = self.iter().map(|cls| {
-            let new_exprs = self.project_expressions(mapping, cls.iter());
-            EquivalenceClass::new(new_exprs.flatten())
+            let mut projected = EquivalenceClass::default();
+            for expr in self.try_project_expressions(mapping, cls.iter()) {
+                if let Some(expr) = expr? {
+                    projected.push(expr);
+                }
+            }
+            Ok(projected)
         });
 
         // The key is the source expression, and the value is the equivalence
@@ -715,7 +751,7 @@ impl EquivalenceGroup {
             // projection `[a + c, b + c]`. To conclude that `a + c == b + c`,
             // we first normalize all source expressions in the mapping, then
             // merge all equivalent expressions into the classes.
-            let normalized_expr = self.normalize_expr(Arc::clone(source));
+            let normalized_expr = self.try_normalize_expr(Arc::clone(source))?;
             let cls = new_classes.entry(normalized_expr).or_default();
             for (target, _) in targets.iter() {
                 cls.push(Arc::clone(target));
@@ -731,14 +767,18 @@ impl EquivalenceGroup {
 
         // Union projected classes with new classes to make up the result:
         let classes = projected_classes
-            .chain(new_classes.into_values())
-            .filter(|cls| !cls.is_trivial());
+            .chain(new_classes.into_values().map(Ok))
+            .filter_map(|cls| match cls {
+                Ok(cls) => (!cls.is_trivial()).then_some(Ok(cls)),
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut result = Self::new(classes);
         // Add new constants arising from the projection to the equivalence group:
         for constant in new_constants {
             result.add_constant(constant);
         }
-        result
+        Ok(result)
     }
 
     /// Returns a `Some` value if the expression is constant according to

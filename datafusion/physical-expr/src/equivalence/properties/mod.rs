@@ -213,16 +213,24 @@ impl EquivalenceProperties {
         r_expr: Arc<dyn PhysicalExpr>,
         sort_expr: &PhysicalSortExpr,
         schema: &SchemaRef,
-    ) -> Option<PhysicalSortExpr> {
+    ) -> Result<Option<PhysicalSortExpr>> {
         if r_expr.eq(&sort_expr.expr) {
             // No point in substituting an expression with itself.
-            return None;
+            return Ok(None);
         }
         let dependencies = Dependencies::new(std::iter::once(sort_expr.clone()));
-        let properties = get_expr_properties(&r_expr, &dependencies, schema).ok()?;
-        (properties.strictly_order_preserving
+        let properties = match get_expr_properties(&r_expr, &dependencies, schema) {
+            Ok(properties) => properties,
+            Err(error)
+                if matches!(error.find_root(), DataFusionError::Refused { .. }) =>
+            {
+                return Err(error);
+            }
+            Err(_) => return Ok(None),
+        };
+        Ok((properties.strictly_order_preserving
             && properties.sort_properties == SortProperties::Ordered(sort_expr.options))
-        .then(|| PhysicalSortExpr::new(r_expr, sort_expr.options))
+        .then(|| PhysicalSortExpr::new(r_expr, sort_expr.options)))
     }
 
     /// Creates an empty `EquivalenceProperties` object.
@@ -625,10 +633,23 @@ impl EquivalenceProperties {
                 sort_properties, ..
             } = eq_properties.get_expr_properties(Arc::clone(&element.expr))?;
             let satisfy = match sort_properties {
-                SortProperties::Ordered(options) => element.options.is_none_or(|opts| {
-                    let nullable = element.expr.nullable(schema).unwrap_or(true);
-                    options_compatible(&options, &opts, nullable)
-                }),
+                SortProperties::Ordered(options) => match element.options {
+                    Some(opts) => {
+                        let nullable =
+                            element.expr.nullable(schema).or_else(|error| {
+                                if matches!(
+                                    error.find_root(),
+                                    DataFusionError::Refused { .. }
+                                ) {
+                                    Err(error)
+                                } else {
+                                    Ok(true)
+                                }
+                            })?;
+                        options_compatible(&options, &opts, nullable)
+                    }
+                    None => true,
+                },
                 // Singleton expressions satisfy any requirement.
                 SortProperties::Singleton => true,
                 SortProperties::Unordered => false,
@@ -703,11 +724,16 @@ impl EquivalenceProperties {
                 sort_properties, ..
             } = eq_properties.get_expr_properties(Arc::clone(&element.expr))?;
             let satisfy = match sort_properties {
-                SortProperties::Ordered(options) => options_compatible(
-                    &options,
-                    &element.options,
-                    element.expr.nullable(schema).unwrap_or(true),
-                ),
+                SortProperties::Ordered(options) => {
+                    let nullable = element.expr.nullable(schema).or_else(|error| {
+                        if matches!(error.find_root(), DataFusionError::Refused { .. }) {
+                            Err(error)
+                        } else {
+                            Ok(true)
+                        }
+                    })?;
+                    options_compatible(&options, &element.options, nullable)
+                }
                 // Singleton expressions satisfy any ordering.
                 SortProperties::Singleton => true,
                 SortProperties::Unordered => false,
@@ -878,33 +904,33 @@ impl EquivalenceProperties {
         schema: &SchemaRef,
         mapping: &ProjectionMapping,
         oeq_class: OrderingEquivalenceClass,
-    ) -> OrderingEquivalenceClass {
-        let new_orderings = oeq_class.into_iter().flat_map(|order| {
+    ) -> Result<OrderingEquivalenceClass> {
+        let mut new_orderings = vec![];
+        for order in oeq_class {
             // Modify/expand existing orderings by substituting sort
             // expressions with appropriate targets from the mapping:
-            order
-                .into_iter()
-                .map(|sort_expr| {
-                    let original_sort_expr = sort_expr.clone();
-                    mapping
-                        .iter()
-                        .map(|(source, _target)| source)
-                        .filter(|source| expr_refers(source, &original_sort_expr.expr))
-                        .cloned()
-                        .filter_map(|r_expr| {
+            let mut substituted = vec![];
+            for sort_expr in order {
+                let mut alternatives = vec![];
+                for (source, _) in mapping.iter() {
+                    if expr_refers(source, &sort_expr.expr)
+                        && let Some(replacement) =
                             Self::substitute_order_preserving_ordering(
-                                r_expr,
-                                &original_sort_expr,
+                                Arc::clone(source),
+                                &sort_expr,
                                 schema,
-                            )
-                        })
-                        .chain(std::iter::once(sort_expr))
-                        .collect::<Vec<_>>()
-                })
-                // Generate all valid orderings given substituted expressions:
-                .multi_cartesian_product()
-        });
-        OrderingEquivalenceClass::new(new_orderings)
+                            )?
+                    {
+                        alternatives.push(replacement);
+                    }
+                }
+                alternatives.push(sort_expr);
+                substituted.push(alternatives);
+            }
+            // Generate all valid orderings given substituted expressions:
+            new_orderings.extend(substituted.into_iter().multi_cartesian_product());
+        }
+        Ok(OrderingEquivalenceClass::new(new_orderings))
     }
 
     /// Projects argument `expr` according to the projection described by
@@ -1013,7 +1039,8 @@ impl EquivalenceProperties {
         map: &mut DependencyMap,
     ) -> bool {
         let target_sort_expr = self
-            .project_expr(&sort_expr.expr, mapping)
+            .eq_group
+            .try_project_expr(mapping, &sort_expr.expr)?
             .map(|expr| PhysicalSortExpr::new(expr, sort_expr.options));
         let projectable = target_sort_expr.is_some();
         if projectable
@@ -1040,12 +1067,16 @@ impl EquivalenceProperties {
     /// # Returns
     ///
     /// A new `ProjectionMapping` with source expressions in normal form.
-    fn normalize_mapping(&self, mapping: &ProjectionMapping) -> ProjectionMapping {
+    fn normalize_mapping(
+        &self,
+        mapping: &ProjectionMapping,
+    ) -> Result<ProjectionMapping> {
         mapping
             .iter()
             .map(|(source, target)| {
-                let normal_source = self.eq_group.normalize_expr(Arc::clone(source));
-                (normal_source, target.clone())
+                let normal_source =
+                    self.eq_group.try_normalize_expr(Arc::clone(source))?;
+                Ok((normal_source, target.clone()))
             })
             .collect()
     }
@@ -1071,54 +1102,55 @@ impl EquivalenceProperties {
         &self,
         mapping: &ProjectionMapping,
         mut oeq_class: OrderingEquivalenceClass,
-    ) -> Vec<LexOrdering> {
+    ) -> Result<Vec<LexOrdering>> {
         // Normalize source expressions in the mapping:
-        let mapping = self.normalize_mapping(mapping);
+        let mapping = self.normalize_mapping(mapping)?;
         // Get dependency map for existing orderings:
-        oeq_class = Self::substitute_oeq_class(&self.schema, &mapping, oeq_class);
+        oeq_class = Self::substitute_oeq_class(&self.schema, &mapping, oeq_class)?;
         let dependency_map = self.construct_dependency_map(oeq_class, &mapping);
-        let orderings = mapping.iter().flat_map(|(source, targets)| {
-            referred_dependencies(&dependency_map, source)
-                .into_iter()
-                .filter_map(|deps| {
-                    let ep = get_expr_properties(source, &deps, &self.schema);
-                    let sort_properties = ep.map(|prop| prop.sort_properties);
-                    if let Ok(SortProperties::Ordered(options)) = sort_properties {
-                        Some((options, deps))
-                    } else {
-                        // Do not consider unordered cases.
-                        None
-                    }
-                })
-                .flat_map(|(options, relevant_deps)| {
-                    // Generate dependent orderings (i.e. prefixes for targets):
-                    let dependency_orderings =
-                        generate_dependency_orderings(&relevant_deps, &dependency_map);
-                    let sort_exprs = targets.iter().map(|(target, _)| {
-                        PhysicalSortExpr::new(Arc::clone(target), options)
-                    });
+        let mut orderings = vec![];
+        for (source, targets) in mapping.iter() {
+            for relevant_deps in referred_dependencies(&dependency_map, source) {
+                let options =
+                    match get_expr_properties(source, &relevant_deps, &self.schema) {
+                        Ok(ExprProperties {
+                            sort_properties: SortProperties::Ordered(options),
+                            ..
+                        }) => options,
+                        Err(error)
+                            if matches!(
+                                error.find_root(),
+                                DataFusionError::Refused { .. }
+                            ) =>
+                        {
+                            return Err(error);
+                        }
+                        // Do not consider unordered or unsupported cases.
+                        _ => continue,
+                    };
+                let dependency_orderings =
+                    generate_dependency_orderings(&relevant_deps, &dependency_map);
+                for (target, _) in targets.iter() {
+                    let sort_expr = PhysicalSortExpr::new(Arc::clone(target), options);
                     if dependency_orderings.is_empty() {
-                        sort_exprs.map(|sort_expr| [sort_expr].into()).collect()
+                        orderings.push([sort_expr].into());
                     } else {
-                        sort_exprs
-                            .flat_map(|sort_expr| {
-                                let mut result = dependency_orderings.clone();
-                                for ordering in result.iter_mut() {
-                                    ordering.push(sort_expr.clone());
-                                }
-                                result
-                            })
-                            .collect::<Vec<_>>()
+                        let mut result = dependency_orderings.clone();
+                        for ordering in &mut result {
+                            ordering.push(sort_expr.clone());
+                        }
+                        orderings.extend(result);
                     }
-                })
-        });
+                }
+            }
+        }
 
         // Add valid projected orderings. For example, if existing ordering is
         // `a + b` and projection is `[a -> a_new, b -> b_new]`, we need to
         // preserve `a_new + b_new` as ordered. Please note that `a_new` and
         // `b_new` themselves need not be ordered. Such dependencies cannot be
         // deduced via the pass above.
-        let projected_orderings = dependency_map.iter().flat_map(|(sort_expr, node)| {
+        for (sort_expr, node) in dependency_map.iter() {
             let mut prefixes = construct_prefix_orderings(sort_expr, &dependency_map);
             if prefixes.is_empty() {
                 // If prefix is empty, there is no dependency. Insert
@@ -1134,11 +1166,11 @@ impl EquivalenceProperties {
                     }
                 }
             }
-            prefixes
-        });
+            orderings.extend(prefixes);
+        }
 
         // Simplify each ordering by removing redundant sections:
-        orderings.chain(projected_orderings).collect()
+        Ok(orderings)
     }
 
     /// Projects constraints according to the given projection mapping.
@@ -1169,22 +1201,41 @@ impl EquivalenceProperties {
     }
 
     /// Projects the equivalences within according to `mapping` and
-    /// `output_schema`.
+    /// `output_schema`, using conservative unknown properties if planning refuses.
+    /// Fallible plan construction should use [`Self::try_project`] instead.
     pub fn project(&self, mapping: &ProjectionMapping, output_schema: SchemaRef) -> Self {
-        let eq_group = self.eq_group.project(mapping);
-        let orderings =
-            self.projected_orderings(mapping, self.oeq_cache.normal_cls.clone());
-        let normal_orderings = orderings
-            .iter()
-            .cloned()
-            .map(|o| eq_group.normalize_sort_exprs(o));
-        Self {
-            oeq_cache: OrderingEquivalenceCache::new(normal_orderings),
-            oeq_class: OrderingEquivalenceClass::new(orderings),
-            constraints: self.projected_constraints(mapping).unwrap_or_default(),
-            schema: output_schema,
-            eq_group,
+        self.try_project(mapping, Arc::clone(&output_schema), &Funding::default())
+            .unwrap_or_else(|_| Self::new(output_schema))
+    }
+
+    /// Projects equivalence properties, propagating planning refusal.
+    pub fn try_project(
+        &self,
+        mapping: &ProjectionMapping,
+        output_schema: SchemaRef,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let before = funding.outstanding();
+        let result = (|| {
+            let eq_group = self.eq_group.try_project(mapping)?;
+            let orderings =
+                self.projected_orderings(mapping, self.oeq_cache.normal_cls.clone())?;
+            let normal_orderings = orderings
+                .iter()
+                .cloned()
+                .map(|o| eq_group.normalize_sort_exprs(o));
+            Ok(Self {
+                oeq_cache: OrderingEquivalenceCache::new(normal_orderings),
+                oeq_class: OrderingEquivalenceClass::new(orderings),
+                constraints: self.projected_constraints(mapping).unwrap_or_default(),
+                schema: output_schema,
+                eq_group,
+            })
+        })();
+        if result.is_err() {
+            funding.unwound(before);
         }
+        result
     }
 
     /// Returns the longest (potentially partial) permutation satisfying the
@@ -1603,6 +1654,11 @@ mod funding_tests {
         Refused,
         ContextualRefusal,
         Unsupported,
+        NullableRefusal,
+        ContextualNullableRefusal,
+        UnsupportedNullable,
+        RebuildRefusal,
+        ContextualRebuildRefusal,
     }
 
     #[derive(Debug)]
@@ -1638,6 +1694,17 @@ mod funding_tests {
         }
 
         fn nullable(&self, schema: &Schema) -> Result<bool> {
+            match self.failure {
+                PropertyFailure::NullableRefusal => self.funding.charge(1)?,
+                PropertyFailure::ContextualNullableRefusal => self
+                    .funding
+                    .charge(1)
+                    .map_err(|error| error.context("Budgeted nullability lookup"))?,
+                PropertyFailure::UnsupportedNullable => {
+                    return plan_err!("Nullability lookup is unsupported");
+                }
+                _ => {}
+            }
             self.child.nullable(schema)
         }
 
@@ -1656,6 +1723,14 @@ mod funding_tests {
             self: Arc<Self>,
             children: Vec<Arc<dyn PhysicalExpr>>,
         ) -> Result<Arc<dyn PhysicalExpr>> {
+            match self.failure {
+                PropertyFailure::RebuildRefusal => self.funding.charge(1)?,
+                PropertyFailure::ContextualRebuildRefusal => self
+                    .funding
+                    .charge(1)
+                    .map_err(|error| error.context("Budgeted expression rebuild"))?,
+                _ => {}
+            }
             Ok(Arc::new(Self {
                 child: Arc::clone(&children[0]),
                 funding: self.funding.clone(),
@@ -1663,7 +1738,7 @@ mod funding_tests {
             }))
         }
 
-        fn get_properties(&self, _children: &[ExprProperties]) -> Result<ExprProperties> {
+        fn get_properties(&self, children: &[ExprProperties]) -> Result<ExprProperties> {
             match self.failure {
                 PropertyFailure::Refused => self.funding.charge(1)?,
                 PropertyFailure::ContextualRefusal => self
@@ -1672,6 +1747,13 @@ mod funding_tests {
                     .map_err(|error| error.context("Budgeted property lookup"))?,
                 PropertyFailure::Unsupported => {
                     return plan_err!("Property lookup is unsupported");
+                }
+                PropertyFailure::NullableRefusal
+                | PropertyFailure::ContextualNullableRefusal
+                | PropertyFailure::UnsupportedNullable
+                | PropertyFailure::RebuildRefusal
+                | PropertyFailure::ContextualRebuildRefusal => {
+                    return Ok(children[0].clone());
                 }
             }
             Ok(ExprProperties::new_unknown())
@@ -1729,6 +1811,181 @@ mod funding_tests {
         let (ordering, indices) = properties.find_longest_permutation(&[expr])?;
         assert!(ordering.is_empty());
         assert!(indices.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_nullable_refusal_reaches_ordering_callers() {
+        for failure in [
+            PropertyFailure::NullableRefusal,
+            PropertyFailure::ContextualNullableRefusal,
+        ] {
+            let expr: Arc<dyn PhysicalExpr> = Arc::new(BudgetedProperties {
+                child: Arc::new(Column::new("a", 0)),
+                funding: Funding::new(Arc::new(Ceiling {
+                    limit: 0,
+                    held: AtomicUsize::new(0),
+                })),
+                failure,
+            });
+            let properties = rewrite_fixture(false, true);
+            let error = properties
+                .ordering_satisfy([PhysicalSortExpr::new_default(Arc::clone(&expr))])
+                .expect_err("ordering check swallowed nullability refusal");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+            let error = properties
+                .ordering_satisfy_requirement([PhysicalSortRequirement::new(
+                    expr,
+                    Some(Default::default()),
+                )])
+                .expect_err("ordering requirement swallowed nullability refusal");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        }
+    }
+
+    #[test]
+    fn remaining_unsupported_nullable_keeps_conservative_fallback() -> Result<()> {
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BudgetedProperties {
+            child: Arc::new(Column::new("a", 0)),
+            funding: Funding::default(),
+            failure: PropertyFailure::UnsupportedNullable,
+        });
+        let properties = rewrite_fixture(false, true);
+        assert!(
+            properties
+                .ordering_satisfy([PhysicalSortExpr::new_default(Arc::clone(&expr)),])?
+        );
+        assert!(properties.ordering_satisfy_requirement([
+            PhysicalSortRequirement::new(expr, Some(Default::default())),
+        ])?);
+        Ok(())
+    }
+
+    fn rebuild_projection(
+        failure: PropertyFailure,
+    ) -> Result<(EquivalenceGroup, ProjectionMapping, Arc<dyn PhysicalExpr>)> {
+        let properties = rewrite_fixture(false, false);
+        let child: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BudgetedProperties {
+            child: Arc::clone(&child),
+            funding: Funding::new(Arc::new(Ceiling {
+                limit: 0,
+                held: AtomicUsize::new(0),
+            })),
+            failure,
+        });
+        let group = EquivalenceGroup::new([EquivalenceClass::new([
+            Arc::clone(&expr),
+            Arc::new(Column::new("b", 1)),
+        ])]);
+        let mapping = ProjectionMapping::try_new(
+            [(child, "projected")],
+            properties.schema(),
+            &Funding::default(),
+        )?;
+        Ok((group, mapping, expr))
+    }
+
+    #[test]
+    fn remaining_indirect_projection_propagates_rebuild_refusal() -> Result<()> {
+        for failure in [
+            PropertyFailure::RebuildRefusal,
+            PropertyFailure::ContextualRebuildRefusal,
+        ] {
+            let (group, mapping, expr) = rebuild_projection(failure)?;
+            let error = group
+                .try_project_expr(&mapping, &expr)
+                .expect_err("indirect projection swallowed rebuilding refusal");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_group_projection_propagates_rebuild_refusal() -> Result<()> {
+        for failure in [
+            PropertyFailure::RebuildRefusal,
+            PropertyFailure::ContextualRebuildRefusal,
+        ] {
+            let (group, mapping, _) = rebuild_projection(failure)?;
+            let error = group
+                .try_project(&mapping)
+                .expect_err("group projection swallowed rebuilding refusal");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_normalization_propagates_rebuild_refusal() -> Result<()> {
+        for failure in [
+            PropertyFailure::RebuildRefusal,
+            PropertyFailure::ContextualRebuildRefusal,
+        ] {
+            let (_, _, expr) = rebuild_projection(failure)?;
+            let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+            let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+            let group = EquivalenceGroup::new([EquivalenceClass::new([b, a])]);
+            let error = group
+                .try_normalize_expr(expr)
+                .expect_err("normalization swallowed rebuilding refusal");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        }
+        Ok(())
+    }
+
+    fn property_projection(
+        failure: PropertyFailure,
+        orderings: bool,
+    ) -> Result<(EquivalenceProperties, ProjectionMapping, SchemaRef, Funding)> {
+        let funding = Funding::new(Arc::new(Ceiling {
+            limit: 0,
+            held: AtomicUsize::new(0),
+        }));
+        let properties = rewrite_fixture(false, orderings);
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BudgetedProperties {
+            child: Arc::new(Column::new("a", 0)),
+            funding: funding.clone(),
+            failure,
+        });
+        let mapping = ProjectionMapping::try_new(
+            [(expr, "projected")],
+            properties.schema(),
+            &Funding::default(),
+        )?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "projected",
+            DataType::Int64,
+            true,
+        )]));
+        Ok((properties, mapping, schema, funding))
+    }
+
+    #[test]
+    fn remaining_projection_propagates_refused_properties() -> Result<()> {
+        for orderings in [false, true] {
+            for failure in [PropertyFailure::Refused, PropertyFailure::ContextualRefusal]
+            {
+                let (properties, mapping, schema, funding) =
+                    property_projection(failure, orderings)?;
+                let error = properties
+                    .try_project(&mapping, schema, &funding)
+                    .expect_err("projection swallowed property refusal");
+                assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+                assert_eq!(funding.outstanding(), 0);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_projection_skips_unsupported_properties() -> Result<()> {
+        for orderings in [false, true] {
+            let (properties, mapping, schema, funding) =
+                property_projection(PropertyFailure::Unsupported, orderings)?;
+            let projected = properties.try_project(&mapping, schema, &funding)?;
+            assert!(projected.oeq_class().is_empty());
+        }
         Ok(())
     }
 

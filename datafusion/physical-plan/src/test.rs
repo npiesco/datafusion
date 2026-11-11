@@ -356,8 +356,11 @@ impl TestMemoryExec {
                 Arc::clone(&base_schema),
                 sort_information,
             );
-            let proj_eqp =
-                base_eqp.project(&projection_mapping, Arc::clone(&self.projected_schema));
+            let proj_eqp = base_eqp.try_project(
+                &projection_mapping,
+                Arc::clone(&self.projected_schema),
+                &Funding::default(),
+            )?;
             let oeq_class: OrderingEquivalenceClass = proj_eqp.into();
             sort_information = oeq_class.into();
         }

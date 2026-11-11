@@ -1395,9 +1395,11 @@ impl AggregateExec {
         funding: &Funding,
     ) -> Result<PlanProperties> {
         // Construct equivalence properties:
-        let mut eq_properties = input
-            .equivalence_properties()
-            .project(group_expr_mapping, schema);
+        let mut eq_properties = input.equivalence_properties().try_project(
+            group_expr_mapping,
+            schema,
+            funding,
+        )?;
 
         // True no-group aggregates produce only one row in each output
         // partition, so aggregate outputs are constants within the partition.
