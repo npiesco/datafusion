@@ -2454,7 +2454,6 @@ dependencies = [
  "datafusion-expr-common",
  "datafusion-proto-models",
  "hashbrown 0.17.1",
- "indexmap 2.14.0",
  "itertools 0.15.0",
  "parking_lot",
  "pin-project",
