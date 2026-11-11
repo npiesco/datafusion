@@ -412,12 +412,14 @@ impl HashJoinExecBuilder {
         Ok(self)
     }
 
-    /// Reset runtime state.
-    pub fn reset_state(mut self) -> Self {
-        self.exec.left_fut = Default::default();
+    /// Reset runtime state: a fresh build-side future and metrics set, charged like the
+    /// ones the node was made with.
+    pub fn reset_state(mut self) -> Result<Self> {
+        self.exec.left_fut = self.exec.funding.arc(OnceAsync::default())?;
+        self.exec.funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         self.exec.dynamic_filter = None;
         self.exec.metrics = ExecutionPlanMetricsSet::new();
-        self
+        Ok(self)
     }
 
     /// Build result as a dyn execution plan.
@@ -1462,7 +1464,7 @@ impl ExecutionPlan for HashJoinExec {
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
-        self.builder()?.reset_state().build_exec()
+        self.builder()?.reset_state()?.build_exec()
     }
 
     fn execute(
@@ -2717,6 +2719,57 @@ mod tests {
             false,
             &Funding::default(),
         )
+    }
+
+    struct Unlimited;
+
+    impl datafusion_common::funding::PlanningFunding for Unlimited {
+        fn charge(&self, _bytes: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    /// Resetting runtime state makes a fresh metrics set and build-side future, both
+    /// charged like the ones the node was made with.
+    #[test]
+    fn reset_state_charges_its_fresh_metrics_and_build_future() -> Result<()> {
+        let funding = Funding::new(Arc::new(Unlimited));
+        let left = build_table(("a1", &vec![1]), ("b1", &vec![4]), ("c1", &vec![7]));
+        let right = build_table(("a2", &vec![1]), ("b1", &vec![4]), ("c2", &vec![7]));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+            &funding,
+        )?;
+
+        let before = funding.outstanding();
+        let rebuilt = join.builder()?.build_exec()?;
+        let kept = funding.outstanding() - before;
+
+        let before = funding.outstanding();
+        let reset = join.builder()?.reset_state()?.build_exec()?;
+        let fresh = funding.outstanding() - before;
+
+        assert_eq!(
+            fresh - kept,
+            ExecutionPlanMetricsSet::BLOCK
+                + datafusion_common::funding::arc_bytes::<OnceAsync<JoinLeftData>>()
+        );
+        drop((rebuilt, reset));
+        Ok(())
     }
 
     fn join_with_filter(

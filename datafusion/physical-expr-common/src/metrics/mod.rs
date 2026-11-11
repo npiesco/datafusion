@@ -25,8 +25,8 @@ mod expression;
 mod value;
 
 use datafusion_common::HashMap;
-use datafusion_common::funding::arc_bytes;
 pub use datafusion_common::format::{MetricCategory, MetricType};
+use datafusion_common::funding::arc_bytes;
 use parking_lot::Mutex;
 use std::{
     borrow::Cow,
