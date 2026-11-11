@@ -353,15 +353,18 @@ impl HashJoinExecBuilder {
         self
     }
 
-    /// Set optional filter.
+    /// Set optional filter: the one it replaces given back.
     pub fn with_filter(mut self, filter: Option<JoinFilter>) -> Self {
-        self.exec.filter = filter;
+        if let Some(replaced) = std::mem::replace(&mut self.exec.filter, filter) {
+            replaced.released(&self.exec.funding);
+        }
         self
     }
 
-    /// Set expressions to join on.
+    /// Set expressions to join on: the list they replace given back.
     pub fn with_on(mut self, on: Vec<(PhysicalExprRef, PhysicalExprRef)>) -> Self {
-        self.exec.on = on;
+        let replaced = std::mem::replace(&mut self.exec.on, on);
+        self.exec.funding.released(replaced);
         self.preserve_properties = false;
         self
     }
@@ -2769,6 +2772,58 @@ mod tests {
                 + datafusion_common::funding::arc_bytes::<OnceAsync<JoinLeftData>>()
         );
         drop((rebuilt, reset));
+        Ok(())
+    }
+
+    /// Rebuilding with a new join key list and filter gives back the copies of the old
+    /// ones the builder made: it holds what a rebuild recomputing its properties does.
+    #[test]
+    fn rebuilding_with_new_keys_and_filter_gives_back_the_copied_ones() -> Result<()> {
+        let funding = Funding::new(Arc::new(Unlimited));
+        let left = build_table(("a1", &vec![1]), ("b1", &vec![4]), ("c1", &vec![7]));
+        let right = build_table(("a2", &vec![1]), ("b1", &vec![4]), ("c2", &vec![7]));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+        let filter = JoinFilter::new(
+            Arc::new(Column::new("x", 0)) as _,
+            vec![ColumnIndex {
+                index: 0,
+                side: JoinSide::Right,
+            }],
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)])),
+        );
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            Some(filter),
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+            &funding,
+        )?;
+
+        let before = funding.outstanding();
+        let rebuilt = join.builder()?.recompute_properties().build_exec()?;
+        let kept = funding.outstanding() - before;
+
+        let before = funding.outstanding();
+        let on = funding.vec_from_slice(join.on())?;
+        let filter = join
+            .filter()
+            .map(|filter| filter.funded_clone(&funding))
+            .transpose()?;
+        let replaced = join
+            .builder()?
+            .with_on(on)
+            .with_filter(filter)
+            .build_exec()?;
+        assert_eq!(funding.outstanding() - before, kept);
+        drop((rebuilt, replaced));
         Ok(())
     }
 

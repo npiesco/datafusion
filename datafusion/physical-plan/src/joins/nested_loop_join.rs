@@ -273,9 +273,11 @@ impl NestedLoopJoinExecBuilder {
         self
     }
 
-    /// Set optional filter.
+    /// Set optional filter: the one it replaces given back.
     pub fn with_filter(mut self, filter: Option<JoinFilter>) -> Self {
-        self.filter = filter;
+        if let Some(replaced) = std::mem::replace(&mut self.filter, filter) {
+            replaced.released(&self.funding);
+        }
         self
     }
 

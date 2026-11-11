@@ -88,6 +88,12 @@ impl JoinFilter {
         ))
     }
 
+    /// This filter freed: the block of its column indices, made through `funding`, given
+    /// back.
+    pub fn released(self, funding: &Funding) {
+        funding.released(self.column_indices);
+    }
+
     /// Filter expression
     pub fn expression(&self) -> &Arc<dyn PhysicalExpr> {
         &self.expression
