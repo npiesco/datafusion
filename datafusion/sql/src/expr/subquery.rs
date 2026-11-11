@@ -16,14 +16,22 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{DFSchema, Diagnostic, Result, Span, Spans, plan_err};
+use datafusion_common::{
+    DFSchema, DFSchemaRef, Diagnostic, Result, Span, Spans, plan_err,
+};
 use datafusion_expr::expr::{Exists, InSubquery, SetComparison, SetQuantifier};
 use datafusion_expr::{Expr, LogicalPlan, Subquery};
 use sqlparser::ast::Expr as SQLExpr;
 use sqlparser::ast::{BinaryOperator, Query, SelectItem, SetExpr};
-use std::sync::Arc;
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
+    /// The schema a subquery sees as its outer query's, a copy of `input_schema` charged to
+    /// the planning's funding
+    fn outer_schema(&self, input_schema: &DFSchema) -> Result<DFSchemaRef> {
+        let funding = self.funding();
+        funding.arc(funding.cloned(input_schema)?)
+    }
+
     pub(super) fn parse_exists_subquery(
         &self,
         subquery: Query,
@@ -31,13 +39,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         input_schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
-        planner_context.append_outer_query_schema(input_schema.clone().into());
+        planner_context.append_outer_query_schema(
+            self.outer_schema(input_schema)?,
+            self.funding(),
+        )?;
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
         planner_context.pop_outer_query_schema();
         Ok(Expr::Exists(Exists {
             subquery: Subquery {
-                subquery: Arc::new(sub_plan),
+                subquery: self.funding().arc(sub_plan)?,
                 outer_ref_columns,
                 spans: Spans::new(),
             },
@@ -53,7 +64,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         input_schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
-        planner_context.append_outer_query_schema(Arc::new(input_schema.clone()));
+        planner_context.append_outer_query_schema(
+            self.outer_schema(input_schema)?,
+            self.funding(),
+        )?;
 
         let mut spans = Spans::new();
         if let SetExpr::Select(select) = &subquery.body.as_ref() {
@@ -80,9 +94,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let expr_obj = self.sql_to_expr(expr, input_schema, planner_context)?;
 
         Ok(Expr::InSubquery(InSubquery::new(
-            Box::new(expr_obj),
+            self.funding().boxed(expr_obj)?,
             Subquery {
-                subquery: Arc::new(sub_plan),
+                subquery: self.funding().arc(sub_plan)?,
                 outer_ref_columns,
                 spans,
             },
@@ -96,7 +110,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         input_schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
-        planner_context.append_outer_query_schema(Arc::new(input_schema.clone()));
+        planner_context.append_outer_query_schema(
+            self.outer_schema(input_schema)?,
+            self.funding(),
+        )?;
         let mut spans = Spans::new();
         if let SetExpr::Select(select) = subquery.body.as_ref() {
             for item in &select.projection {
@@ -119,7 +136,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         )?;
 
         Ok(Expr::ScalarSubquery(Subquery {
-            subquery: Arc::new(sub_plan),
+            subquery: self.funding().arc(sub_plan)?,
             outer_ref_columns,
             spans,
         }))
@@ -169,7 +186,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         input_schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
-        planner_context.append_outer_query_schema(Arc::new(input_schema.clone()));
+        planner_context.append_outer_query_schema(
+            self.outer_schema(input_schema)?,
+            self.funding(),
+        )?;
 
         let mut spans = Spans::new();
         if let SetExpr::Select(select) = subquery.body.as_ref() {
@@ -195,9 +215,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         let expr_obj = self.sql_to_expr(left_expr, input_schema, planner_context)?;
         Ok(Expr::SetComparison(SetComparison::new(
-            Box::new(expr_obj),
+            self.funding().boxed(expr_obj)?,
             Subquery {
-                subquery: Arc::new(sub_plan),
+                subquery: self.funding().arc(sub_plan)?,
                 outer_ref_columns,
                 spans,
             },

@@ -175,6 +175,7 @@ impl SimpleCsvTable {
                 &plan,
             )?],
             Arc::new(plan),
+            &datafusion::common::funding::Funding::default(),
         )
         .map(LogicalPlan::Projection)?;
         let rbs = collect(

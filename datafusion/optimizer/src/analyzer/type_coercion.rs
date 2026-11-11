@@ -20,15 +20,24 @@
 use arrow::compute::can_cast_types;
 use datafusion_expr::binary::BinaryTypeCoercer;
 use itertools::{Itertools as _, izip};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use crate::analyzer::AnalyzerRule;
+use crate::funded::{
+    Freed, Released, aliased, freed, freed_bytes_outside_subqueries, map_plan_exprs_mut,
+    merged_input_schema, merged_with, plan_mut, qualified_schema, rebalanced, recomputed,
+    transform_up_plan_with_subqueries, unwrapped,
+};
 use crate::utils::NamePreserver;
 
-use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, IntervalUnit, Schema, TimeUnit};
 use arrow::temporal_conversions::SECONDS_IN_DAY;
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
+use datafusion_common::funding::Funding;
+use datafusion_common::tree_node::{
+    Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, TableReference,
     exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_datafusion_err,
@@ -55,12 +64,11 @@ use datafusion_expr::type_coercion::other::{
 use datafusion_expr::type_coercion::{
     is_datetime, is_interval, is_signed_numeric, is_timestamp,
 };
-use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
-    Cast, DmlStatement, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator,
-    Projection, Union, ValueOrLambda, WindowFrame, WindowFrameBound, WindowFrameUnits,
-    WriteOp, is_false, is_not_false, is_not_true, is_not_unknown, is_true, is_unknown,
-    lit, not,
+    Cast, DmlStatement, EmptyRelation, Expr, ExprSchemable, Join, Limit, LogicalPlan,
+    Operator, Projection, Union, ValueOrLambda, WindowFrame, WindowFrameBound,
+    WindowFrameUnits, WriteOp, is_false, is_not_false, is_not_true, is_not_unknown,
+    is_true, is_unknown, lit, not,
 };
 
 /// Performs type coercion by determining the schema
@@ -80,13 +88,22 @@ fn coerce_output(plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPla
         return Ok(plan);
     }
 
-    let outer_refs = plan.expressions();
-    if outer_refs.is_empty() {
+    let mut has_exprs = false;
+    plan.apply_expressions(|_| {
+        has_exprs = true;
+        Ok(TreeNodeRecursion::Stop)
+    })?;
+    if !has_exprs {
         return Ok(plan);
     }
 
     if let Some(dfschema) = transform_schema_to_nonview(plan.schema()) {
-        coerce_plan_expr_for_schema(plan, &dfschema?)
+        // The projection coercing the output is made on its own: what it changes is
+        // charged once it is made.
+        let before = plan.freed_bytes();
+        let plan = coerce_plan_expr_for_schema(plan, &dfschema?)?;
+        rebalanced(&config.funding, before, plan.freed_bytes())?;
+        Ok(plan)
     } else {
         Ok(plan)
     }
@@ -98,11 +115,12 @@ impl AnalyzerRule for TypeCoercion {
     }
 
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
-        static EMPTY_SCHEMA: LazyLock<DFSchema> = LazyLock::new(DFSchema::empty);
-
+        let funding = &config.funding;
         // recurse
-        let transformed_plan = plan
-            .transform_up_with_subqueries(|plan| analyze_internal(&EMPTY_SCHEMA, plan))?
+        let transformed_plan =
+            transform_up_plan_with_subqueries(funding, plan, |plan| {
+                analyze_internal(DFSchema::empty_ref(), plan, funding)
+            })?
             .data;
 
         // finish
@@ -116,17 +134,19 @@ impl AnalyzerRule for TypeCoercion {
 fn analyze_internal(
     external_schema: &DFSchema,
     plan: LogicalPlan,
+    funding: &Funding,
 ) -> Result<Transformed<LogicalPlan>> {
+    let f = funding;
     // get schema representing all available input fields. This is used for data type
     // resolution only, so order does not matter here
-    let mut schema = merge_schema(&plan.inputs());
+    let mut schema = merged_input_schema(f, &plan)?;
 
     if let LogicalPlan::TableScan(ts) = &plan {
-        let source_schema = DFSchema::try_from_qualified_schema(
-            ts.table_name.clone(),
-            &ts.source.schema(),
-        )?;
-        schema.merge(&source_schema);
+        let (source_schema, bytes) =
+            qualified_schema(f, &ts.table_name, &ts.source.schema())?;
+        // Given back once merged.
+        let source_schema = Released::new(f, source_schema, bytes);
+        schema = merged_with(f, schema, &source_schema)?;
     }
 
     // MERGE expressions (ON / WHEN clauses) reference the target table, which
@@ -139,49 +159,91 @@ fn analyze_internal(
         ..
     }) = &plan
     {
-        let target_schema =
-            DFSchema::try_from_qualified_schema(table_name.clone(), &target.schema())?;
-        schema.merge(&target_schema);
+        let (target_schema, bytes) = qualified_schema(f, table_name, &target.schema())?;
+        // Given back once merged.
+        let target_schema = Released::new(f, target_schema, bytes);
+        schema = merged_with(f, schema, &target_schema)?;
     }
 
     // merge the outer schema for correlated subqueries
     // like case:
     // select t2.c2 from t1 where t1.c1 in (select t2.c1 from t2 where t2.c2=t1.c3)
-    schema.merge(external_schema);
+    let (schema, bytes) = merged_with(f, schema, external_schema)?;
+    // Freed once the plan's expressions are coerced.
+    let schema = Released::new(f, schema, bytes);
 
+    let mut expr_rewrite = TypeCoercionRewriter::new(&schema, f);
+
+    let mut plan = plan;
     // Coerce filter predicates to boolean (handles `WHERE NULL`)
-    let plan = if let LogicalPlan::Filter(mut filter) = plan {
-        filter.predicate = filter.predicate.cast_to(&DataType::Boolean, &schema)?;
-        LogicalPlan::Filter(filter)
-    } else {
-        plan
-    };
-
-    let mut expr_rewrite = TypeCoercionRewriter::new(&schema);
+    if let LogicalPlan::Filter(filter) = &mut plan {
+        expr_rewrite.coerced_in_place(&mut filter.predicate, |predicate| {
+            predicate.cast_to(&DataType::Boolean, &*schema)
+        })?;
+    }
 
     let name_preserver = NamePreserver::new(&plan);
     // apply coercion rewrite all expressions in the plan individually
-    plan.map_expressions(|expr| {
-        let original_name = name_preserver.save(&expr);
-        expr.rewrite(&mut expr_rewrite)
-            .map(|transformed| transformed.update_data(|e| original_name.restore(e)))
-    })?
+    let changed = map_plan_exprs_mut(&mut plan, &mut |expr| {
+        let original_name = name_preserver.save(expr, f)?;
+        let transformed = std::mem::take(expr).rewrite(&mut expr_rewrite)?;
+        *expr = original_name.restore(transformed.data, f)?;
+        Ok(transformed.transformed)
+    })?;
     // some plans need extra coercion after their expressions are coerced
-    .map_data(|plan| expr_rewrite.coerce_plan(plan))?
+    let plan = expr_rewrite.coerce_plan(plan)?;
     // recompute the schema after the expressions have been rewritten as the types may have changed
-    .map_data(|plan| plan.recompute_schema())
+    Ok(Transformed::new_transformed(recomputed(f, plan)?, changed))
 }
 
 /// Rewrite expressions to apply type coercion.
 pub struct TypeCoercionRewriter<'a> {
     pub(crate) schema: &'a DFSchema,
+    /// Charged for what coercing allocates.
+    funding: &'a Funding,
+    /// How deep the rewrite is in the expression it rewrites.
+    depth: usize,
+    /// What that expression held before it was rewritten.
+    before: usize,
 }
 
 impl<'a> TypeCoercionRewriter<'a> {
     /// Create a new [`TypeCoercionRewriter`] with a provided schema
     /// representing both the inputs and output of the [`LogicalPlan`] node.
-    pub fn new(schema: &'a DFSchema) -> Self {
-        Self { schema }
+    ///
+    /// What a rewrite with it allocates is charged to `funding` once each rewritten
+    /// expression is made: the coercions allocate on their own.
+    pub fn new(schema: &'a DFSchema, funding: &'a Funding) -> Self {
+        Self {
+            schema,
+            funding,
+            depth: 0,
+            before: 0,
+        }
+    }
+
+    /// `subquery` cast to `cast_to_type`, what casting it adds charged once it is made.
+    fn cast_subquery(
+        &self,
+        subquery: Subquery,
+        cast_to_type: &DataType,
+    ) -> Result<Subquery> {
+        let before = subquery.freed_bytes();
+        let subquery = cast_subquery(subquery, cast_to_type)?;
+        rebalanced(self.funding, before, subquery.freed_bytes())?;
+        Ok(subquery)
+    }
+
+    /// `expr` replaced in place by what `coerce` makes of it, what that changes charged
+    /// once it is made.
+    fn coerced_in_place(
+        &self,
+        expr: &mut Expr,
+        coerce: impl FnOnce(Expr) -> Result<Expr>,
+    ) -> Result<()> {
+        let before = freed_bytes_outside_subqueries(expr);
+        *expr = coerce(std::mem::take(expr))?;
+        rebalanced(self.funding, before, freed_bytes_outside_subqueries(expr))
     }
 
     /// Coerce the [`LogicalPlan`].
@@ -191,36 +253,41 @@ impl<'a> TypeCoercionRewriter<'a> {
     pub fn coerce_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Join(join) => self.coerce_join(join),
-            LogicalPlan::Union(union) => Self::coerce_union(union),
-            LogicalPlan::Limit(limit) => Self::coerce_limit(limit),
+            LogicalPlan::Union(union) => Self::coerce_union(union, self.funding),
+            LogicalPlan::Limit(limit) => self.coerce_limit(limit),
             LogicalPlan::Dml(dml) => self.coerce_dml(dml),
             _ => Ok(plan),
         }
     }
 
     fn coerce_dml(&self, mut dml: DmlStatement) -> Result<LogicalPlan> {
-        let WriteOp::MergeInto(merge_op) = &dml.op else {
+        if !matches!(dml.op, WriteOp::MergeInto(_)) {
+            return Ok(LogicalPlan::Dml(dml));
+        }
+        let (target_schema, bytes) =
+            qualified_schema(self.funding, &dml.table_name, &dml.target.schema())?;
+        // Given back once the merge's expressions are coerced.
+        let target_schema = Released::new(self.funding, target_schema, bytes);
+        let WriteOp::MergeInto(merge_op) = &mut dml.op else {
             return Ok(LogicalPlan::Dml(dml));
         };
-
-        let target_schema = DFSchema::try_from_qualified_schema(
-            dml.table_name.clone(),
-            &dml.target.schema(),
-        )?;
-        let mut merge_op = (**merge_op).clone();
-        merge_op.on = self.coerce_predicate(merge_op.on, "MERGE ON condition")?;
+        self.coerced_in_place(&mut merge_op.on, |on| {
+            self.coerce_predicate(on, "MERGE ON condition")
+        })?;
         for clause in &mut merge_op.clauses {
-            clause.predicate = clause
-                .predicate
-                .take()
-                .map(|expr| self.coerce_predicate(expr, "MERGE WHEN condition"))
-                .transpose()?;
+            if let Some(predicate) = &mut clause.predicate {
+                self.coerced_in_place(predicate, |predicate| {
+                    self.coerce_predicate(predicate, "MERGE WHEN condition")
+                })?;
+            }
 
             match &mut clause.action {
                 datafusion_expr::dml::MergeIntoAction::Update(assignments) => {
                     for (column, value) in assignments {
                         let field = target_schema.field_with_unqualified_name(column)?;
-                        *value = value.clone().cast_to(field.data_type(), self.schema)?;
+                        self.coerced_in_place(value, |value| {
+                            value.cast_to(field.data_type(), self.schema)
+                        })?;
                     }
                 }
                 datafusion_expr::dml::MergeIntoAction::Insert { columns, values } => {
@@ -228,22 +295,23 @@ impl<'a> TypeCoercionRewriter<'a> {
                         for (value, field) in
                             values.iter_mut().zip(target_schema.fields())
                         {
-                            *value =
-                                value.clone().cast_to(field.data_type(), self.schema)?;
+                            self.coerced_in_place(value, |value| {
+                                value.cast_to(field.data_type(), self.schema)
+                            })?;
                         }
                     } else {
                         for (column, value) in columns.iter().zip(values) {
                             let field =
                                 target_schema.field_with_unqualified_name(column)?;
-                            *value =
-                                value.clone().cast_to(field.data_type(), self.schema)?;
+                            self.coerced_in_place(value, |value| {
+                                value.cast_to(field.data_type(), self.schema)
+                            })?;
                         }
                     }
                 }
                 datafusion_expr::dml::MergeIntoAction::Delete => {}
             }
         }
-        dml.op = WriteOp::MergeInto(Box::new(merge_op));
         Ok(LogicalPlan::Dml(dml))
     }
 
@@ -256,67 +324,87 @@ impl<'a> TypeCoercionRewriter<'a> {
     /// For example, on_exprs like `t1.a = t2.b AND t1.x = t2.y` will be stored
     /// as a list of `(t1.a, t2.b), (t1.x, t2.y)`
     pub fn coerce_join(&mut self, mut join: Join) -> Result<LogicalPlan> {
-        join.on = join
-            .on
-            .into_iter()
-            .map(|(lhs, rhs)| {
-                // coerce the arguments as though they were a single binary equality
-                // expression
-                let left_schema = join.left.schema();
-                let right_schema = join.right.schema();
-                let (lhs, rhs) = self.coerce_binary_op(
-                    lhs,
-                    left_schema,
-                    Operator::Eq,
-                    rhs,
-                    right_schema,
-                )?;
-                Ok((lhs, rhs))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let left_schema = join.left.schema();
+        let right_schema = join.right.schema();
+        for (lhs, rhs) in &mut join.on {
+            // coerce the arguments as though they were a single binary equality
+            // expression
+            let pair_bytes = |lhs: &Expr, rhs: &Expr| {
+                freed_bytes_outside_subqueries(lhs)
+                    .saturating_add(freed_bytes_outside_subqueries(rhs))
+            };
+            let before = pair_bytes(lhs, rhs);
+            let (left, right) = self.coerce_binary_op(
+                std::mem::take(lhs),
+                left_schema,
+                Operator::Eq,
+                std::mem::take(rhs),
+                right_schema,
+            )?;
+            *lhs = left;
+            *rhs = right;
+            rebalanced(self.funding, before, pair_bytes(lhs, rhs))?;
+        }
 
         // Join filter must be boolean
-        join.filter = join
-            .filter
-            .map(|expr| self.coerce_predicate(expr, "Join condition"))
-            .transpose()?;
+        if let Some(filter) = &mut join.filter {
+            self.coerced_in_place(filter, |filter| {
+                self.coerce_predicate(filter, "Join condition")
+            })?;
+        }
 
         Ok(LogicalPlan::Join(join))
     }
 
     /// Coerce the union’s inputs to a common schema compatible with all inputs.
     /// This occurs after wildcard expansion and the coercion of the input expressions.
-    pub fn coerce_union(union_plan: Union) -> Result<LogicalPlan> {
-        let union_schema = Arc::new(coerce_union_schema_with_schema(
+    ///
+    /// What coercing allocates is charged to `funding` before it is made, or, for the
+    /// projections coercing each input, once they are made.
+    pub fn coerce_union(union_plan: Union, funding: &Funding) -> Result<LogicalPlan> {
+        let union_schema = funding.arc(coerce_union_schema_with_schema(
             &union_plan.inputs,
             &union_plan.schema,
-        )?);
-        let new_inputs = union_plan
-            .inputs
-            .into_iter()
-            .map(|p| {
-                let plan =
-                    coerce_plan_expr_for_schema(Arc::unwrap_or_clone(p), &union_schema)?;
-                match plan {
-                    LogicalPlan::Projection(Projection { expr, input, .. }) => {
-                        Ok(Arc::new(project_with_column_index(
-                            expr,
-                            input,
-                            Arc::clone(&union_schema),
-                        )?))
-                    }
-                    other_plan => Ok(Arc::new(other_plan)),
+            funding,
+        )?)?;
+        let Union {
+            mut inputs,
+            schema: replaced,
+        } = union_plan;
+        freed(funding, replaced);
+        for input in &mut inputs {
+            // Each input coerced in its own block: a shared one is copied first.
+            let p = std::mem::replace(
+                plan_mut(funding, input)?,
+                LogicalPlan::EmptyRelation(EmptyRelation {
+                    produce_one_row: false,
+                    schema: Arc::clone(DFSchema::empty_ref()),
+                }),
+            );
+            let before = p.freed_bytes();
+            let plan = coerce_plan_expr_for_schema(p, &union_schema)?;
+            let plan = match plan {
+                LogicalPlan::Projection(Projection { expr, input, .. }) => {
+                    project_with_column_index(
+                        funding,
+                        expr,
+                        input,
+                        Arc::clone(&union_schema),
+                    )?
                 }
-            })
-            .collect::<Result<Vec<_>>>()?;
+                other_plan => other_plan,
+            };
+            rebalanced(funding, before, plan.freed_bytes())?;
+            *plan_mut(funding, input)? = plan;
+        }
         Ok(LogicalPlan::Union(Union {
-            inputs: new_inputs,
+            inputs,
             schema: union_schema,
         }))
     }
 
     /// Coerce the fetch and skip expression to Int64 type.
-    fn coerce_limit(limit: Limit) -> Result<LogicalPlan> {
+    fn coerce_limit(&self, mut limit: Limit) -> Result<LogicalPlan> {
         fn coerce_limit_expr(
             expr: Expr,
             schema: &DFSchema,
@@ -330,20 +418,18 @@ impl<'a> TypeCoercionRewriter<'a> {
             }
         }
 
-        let empty_schema = DFSchema::empty();
-        let new_fetch = limit
-            .fetch
-            .map(|expr| coerce_limit_expr(*expr, &empty_schema, "LIMIT"))
-            .transpose()?;
-        let new_skip = limit
-            .skip
-            .map(|expr| coerce_limit_expr(*expr, &empty_schema, "OFFSET"))
-            .transpose()?;
-        Ok(LogicalPlan::Limit(Limit {
-            input: limit.input,
-            fetch: new_fetch.map(Box::new),
-            skip: new_skip.map(Box::new),
-        }))
+        let empty_schema = DFSchema::empty_ref();
+        if let Some(fetch) = &mut limit.fetch {
+            self.coerced_in_place(fetch, |expr| {
+                coerce_limit_expr(expr, empty_schema, "LIMIT")
+            })?;
+        }
+        if let Some(skip) = &mut limit.skip {
+            self.coerced_in_place(skip, |expr| {
+                coerce_limit_expr(expr, empty_schema, "OFFSET")
+            })?;
+        }
+        Ok(LogicalPlan::Limit(limit))
     }
 
     fn coerce_predicate(&self, expr: Expr, description: &str) -> Result<Expr> {
@@ -544,10 +630,9 @@ impl<'a> TypeCoercionRewriter<'a> {
     }
 }
 
-impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
-    type Node = Expr;
-
-    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+impl TypeCoercionRewriter<'_> {
+    /// `expr`, its children already coerced, coerced.
+    fn coerced_node(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match expr {
             Expr::Unnest(_) => not_impl_err!(
                 "Unnest should be rewritten to LogicalPlan::Unnest before type coercion"
@@ -557,10 +642,14 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 outer_ref_columns,
                 spans,
             }) => {
-                let new_plan =
-                    analyze_internal(self.schema, Arc::unwrap_or_clone(subquery))?.data;
+                let new_plan = analyze_internal(
+                    self.schema,
+                    unwrapped(self.funding, subquery)?,
+                    self.funding,
+                )?
+                .data;
                 Ok(Transformed::yes(Expr::ScalarSubquery(Subquery {
-                    subquery: Arc::new(new_plan),
+                    subquery: self.funding.arc(new_plan)?,
                     outer_ref_columns,
                     spans,
                 })))
@@ -568,12 +657,13 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             Expr::Exists(Exists { subquery, negated }) => {
                 let new_plan = analyze_internal(
                     self.schema,
-                    Arc::unwrap_or_clone(subquery.subquery),
+                    unwrapped(self.funding, subquery.subquery)?,
+                    self.funding,
                 )?
                 .data;
                 Ok(Transformed::yes(Expr::Exists(Exists {
                     subquery: Subquery {
-                        subquery: Arc::new(new_plan),
+                        subquery: self.funding.arc(new_plan)?,
                         outer_ref_columns: subquery.outer_ref_columns,
                         spans: subquery.spans,
                     },
@@ -587,7 +677,8 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             }) => {
                 let new_plan = analyze_internal(
                     self.schema,
-                    Arc::unwrap_or_clone(subquery.subquery),
+                    unwrapped(self.funding, subquery.subquery)?,
+                    self.funding,
                 )?
                 .data;
                 let expr_type = expr.get_type(self.schema)?;
@@ -598,13 +689,13 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 ),
                 )?;
                 let new_subquery = Subquery {
-                    subquery: Arc::new(new_plan),
+                    subquery: self.funding.arc(new_plan)?,
                     outer_ref_columns: subquery.outer_ref_columns,
                     spans: subquery.spans,
                 };
                 Ok(Transformed::yes(Expr::InSubquery(InSubquery::new(
                     Box::new(expr.cast_to(&common_type, self.schema)?),
-                    cast_subquery(new_subquery, &common_type)?,
+                    self.cast_subquery(new_subquery, &common_type)?,
                     negated,
                 ))))
             }
@@ -616,7 +707,8 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             }) => {
                 let new_plan = analyze_internal(
                     self.schema,
-                    Arc::unwrap_or_clone(subquery.subquery),
+                    unwrapped(self.funding, subquery.subquery)?,
+                    self.funding,
                 )?
                 .data;
                 let expr_type = expr.get_type(self.schema)?;
@@ -634,13 +726,13 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                     ),
                 )?;
                 let new_subquery = Subquery {
-                    subquery: Arc::new(new_plan),
+                    subquery: self.funding.arc(new_plan)?,
                     outer_ref_columns: subquery.outer_ref_columns,
                     spans: subquery.spans,
                 };
                 Ok(Transformed::yes(Expr::SetComparison(SetComparison::new(
                     Box::new(expr.cast_to(&common_type, self.schema)?),
-                    cast_subquery(new_subquery, &common_type)?,
+                    self.cast_subquery(new_subquery, &common_type)?,
                     op,
                     quantifier,
                 ))))
@@ -813,8 +905,12 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 Ok(Transformed::yes(Expr::Case(case)))
             }
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                let new_expr =
-                    coerce_arguments_for_signature(args, self.schema, func.as_ref())?;
+                let new_expr = coerce_arguments_for_signature(
+                    args,
+                    self.schema,
+                    func.as_ref(),
+                    self.funding,
+                )?;
                 Ok(Transformed::yes(Expr::ScalarFunction(
                     ScalarFunction::new_udf(func, new_expr),
                 )))
@@ -830,8 +926,12 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                         null_treatment,
                     },
             }) => {
-                let new_expr =
-                    coerce_arguments_for_signature(args, self.schema, func.as_ref())?;
+                let new_expr = coerce_arguments_for_signature(
+                    args,
+                    self.schema,
+                    func.as_ref(),
+                    self.funding,
+                )?;
 
                 let filter = filter
                     .map(|filter| filter.cast_to(&DataType::Boolean, self.schema))
@@ -868,10 +968,20 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
 
                 let args = match &fun {
                     expr::WindowFunctionDefinition::AggregateUDF(udf) => {
-                        coerce_arguments_for_signature(args, self.schema, udf.as_ref())?
+                        coerce_arguments_for_signature(
+                            args,
+                            self.schema,
+                            udf.as_ref(),
+                            self.funding,
+                        )?
                     }
                     expr::WindowFunctionDefinition::WindowUDF(udf) => {
-                        coerce_arguments_for_signature(args, self.schema, udf.as_ref())?
+                        coerce_arguments_for_signature(
+                            args,
+                            self.schema,
+                            udf.as_ref(),
+                            self.funding,
+                        )?
                     }
                 };
 
@@ -895,20 +1005,33 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 Ok(Transformed::yes(new_expr))
             }
             Expr::HigherOrderFunction(HigherOrderFunction { func, args }) => {
-                let current_fields = args
-                    .iter()
-                    .map(|arg| match arg {
-                        Expr::Lambda(lambda) => Ok(ValueOrLambda::Lambda(
-                            lambda.body.to_field(self.schema)?.1,
-                        )),
-                        _ => Ok(ValueOrLambda::Value(arg.to_field(self.schema)?.1)),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                // The arguments' fields, freed once their types are found.
+                let mut current_fields = self
+                    .funding
+                    .held::<Vec<ValueOrLambda<FieldRef, FieldRef>>>();
+                current_fields.reserve_exact(args.len())?;
+                let before = self.funding.outstanding();
+                for arg in &args {
+                    current_fields.push(match arg {
+                        Expr::Lambda(lambda) => ValueOrLambda::Lambda(
+                            lambda.body.to_field(self.schema, self.funding)?.1,
+                        ),
+                        _ => ValueOrLambda::Value(
+                            arg.to_field(self.schema, self.funding)?.1,
+                        ),
+                    })?;
+                }
+                let current_fields = Released::new(
+                    self.funding,
+                    current_fields,
+                    self.funding.outstanding().saturating_sub(before),
+                );
 
                 let new_fields = value_fields_with_higher_order_udf_and_lambdas(
                     &current_fields,
                     func.as_ref(),
                 )?;
+                drop(current_fields);
 
                 let new_args = std::iter::zip(args, new_fields)
                     .map(|(arg, new_field)| match (&arg, new_field) {
@@ -940,6 +1063,30 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             | Expr::Lambda(_)
             | Expr::LambdaVariable(_) => Ok(Transformed::no(expr)),
         }
+    }
+}
+
+impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
+    type Node = Expr;
+
+    fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+        if self.depth == 0 {
+            self.before = freed_bytes_outside_subqueries(&expr);
+        }
+        self.depth += 1;
+        Ok(Transformed::no(expr))
+    }
+
+    fn f_up(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
+        self.depth -= 1;
+        let coerced = self.coerced_node(expr)?;
+        // The coercions allocate on their own: what the whole expression changed is
+        // charged once it is made.
+        if self.depth == 0 {
+            let after = freed_bytes_outside_subqueries(&coerced.data);
+            rebalanced(self.funding, self.before, after)?;
+        }
+        Ok(coerced)
     }
 }
 
@@ -1129,25 +1276,31 @@ fn get_casted_expr_for_bool_op(expr: Expr, schema: &DFSchema) -> Result<Expr> {
 ///
 /// See the module level documentation for more detail on coercion.
 fn coerce_arguments_for_signature<F: UDFCoercionExt>(
-    expressions: Vec<Expr>,
+    mut expressions: Vec<Expr>,
     schema: &DFSchema,
     func: &F,
+    funding: &Funding,
 ) -> Result<Vec<Expr>> {
-    let current_fields = expressions
-        .iter()
-        .map(|e| e.to_field(schema).map(|(_, f)| f))
-        .collect::<Result<Vec<_>>>()?;
+    // The arguments' fields, freed once their types are found.
+    let mut current_fields = funding.held::<Vec<FieldRef>>();
+    current_fields.reserve_exact(expressions.len())?;
+    let before = funding.outstanding();
+    for e in &expressions {
+        current_fields.push(e.to_field(schema, funding)?.1)?;
+    }
+    let fields = Released::new(
+        funding,
+        current_fields,
+        funding.outstanding().saturating_sub(before),
+    );
 
-    let coerced_types = fields_with_udf(&current_fields, func)?
-        .into_iter()
-        .map(|f| f.data_type().clone())
-        .collect::<Vec<_>>();
+    let coerced_fields = fields_with_udf(&fields, func)?;
+    drop(fields);
 
-    expressions
-        .into_iter()
-        .enumerate()
-        .map(|(i, expr)| expr.cast_to(&coerced_types[i], schema))
-        .collect()
+    for (expr, field) in expressions.iter_mut().zip(&coerced_fields) {
+        *expr = std::mem::take(expr).cast_to(field.data_type(), schema)?;
+    }
+    Ok(expressions)
 }
 
 fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
@@ -1311,23 +1464,30 @@ fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
 /// - **Datatypes**: Determined by `type_union_coercion()` rules, not input order
 /// - **Nullability**: Later inputs can add nullability but cannot remove it (logical OR)
 /// - **Metadata**: Later inputs take precedence for same keys (HashMap::extend semantics)
-pub fn coerce_union_schema(inputs: &[Arc<LogicalPlan>]) -> Result<DFSchema> {
-    coerce_union_schema_with_schema(&inputs[1..], inputs[0].schema())
+///
+/// What the schema holds is charged to `funding` before it is made.
+pub fn coerce_union_schema(
+    inputs: &[Arc<LogicalPlan>],
+    funding: &Funding,
+) -> Result<DFSchema> {
+    coerce_union_schema_with_schema(&inputs[1..], inputs[0].schema(), funding)
 }
 fn coerce_union_schema_with_schema(
     inputs: &[Arc<LogicalPlan>],
     base_schema: &DFSchemaRef,
+    funding: &Funding,
 ) -> Result<DFSchema> {
-    let mut union_datatypes = base_schema
-        .fields()
-        .iter()
-        .map(|f| f.data_type().clone())
-        .collect::<Vec<_>>();
-    let mut union_nullabilities = base_schema
-        .fields()
-        .iter()
-        .map(|f| f.is_nullable())
-        .collect::<Vec<_>>();
+    let width = base_schema.fields().len();
+    // Each column's type and nullability so far, freed once the schema is made of them;
+    // the types are kept by its fields.
+    let mut union_datatypes = funding.held::<Vec<DataType>>();
+    union_datatypes.reserve_exact(width)?;
+    let mut union_nullabilities = funding.held::<Vec<bool>>();
+    union_nullabilities.reserve_exact(width)?;
+    for field in base_schema.fields().iter() {
+        union_datatypes.push(funding.cloned(field.data_type())?)?;
+        union_nullabilities.push(field.is_nullable())?;
+    }
     let mut union_field_meta = base_schema
         .fields()
         .iter()
@@ -1370,56 +1530,75 @@ fn coerce_union_schema_with_schema(
                     },
                 )?;
 
-            *union_datatype = coerced_type;
+            // The coerced type is made on its own: charged once it is made, the type it
+            // replaces given back.
+            funding.charge(coerced_type.clone_bytes())?;
+            funding.released_clone(std::mem::replace(union_datatype, coerced_type));
             *union_nullable = *union_nullable || plan_field.is_nullable();
             union_field_map.extend(plan_field.metadata().clone());
         }
     }
-    let union_qualified_fields = izip!(
+    // The fields, freed once the schema holds them.
+    let mut union_qualified_fields =
+        funding.held::<Vec<(Option<TableReference>, FieldRef)>>();
+    union_qualified_fields.reserve_exact(width)?;
+    for (field, datatype, nullable, metadata) in izip!(
         base_schema.fields(),
-        union_datatypes.into_iter(),
-        union_nullabilities,
+        union_datatypes.drain(..),
+        union_nullabilities.iter().copied(),
         union_field_meta.into_iter()
-    )
-    .map(|(field, datatype, nullable, metadata)| {
-        let mut field = Field::new(field.name().clone(), datatype, nullable);
+    ) {
+        let mut field = Field::new(funding.string(field.name())?, datatype, nullable);
         field.set_metadata(metadata);
-        (None, field.into())
-    })
-    .collect::<Vec<_>>();
+        union_qualified_fields.push((None, funding.arc(field)?))?;
+    }
 
-    DFSchema::new_with_metadata(union_qualified_fields, metadata)
+    DFSchema::new_with_metadata(&union_qualified_fields, metadata, funding)
 }
 
 /// See `<https://github.com/apache/datafusion/pull/2108>`
+///
+/// Each alias added is charged before it is made, each one replaced given back.
 fn project_with_column_index(
-    expr: Vec<Expr>,
+    funding: &Funding,
+    mut expr: Vec<Expr>,
     input: Arc<LogicalPlan>,
     schema: DFSchemaRef,
 ) -> Result<LogicalPlan> {
-    let alias_expr = expr
-        .into_iter()
-        .enumerate()
-        .map(|(i, e)| match e {
-            Expr::Alias(Alias { ref name, .. }) if name != schema.field(i).name() => {
-                Ok(e.unalias().alias(schema.field(i).name()))
+    for (i, e) in expr.iter_mut().enumerate() {
+        let name = schema.field(i).name();
+        match e {
+            Expr::Alias(Alias { name: alias, .. }) if alias.as_str() != name.as_str() => {
+                let Expr::Alias(Alias {
+                    expr: inner,
+                    name: alias,
+                    ..
+                }) = std::mem::take(e)
+                else {
+                    unreachable!()
+                };
+                funding.released(alias);
+                *e = aliased(funding, funding.unboxed(inner), None, name)?;
             }
-            Expr::Column(Column {
-                relation: _,
-                ref name,
-                spans: _,
-            }) if name != schema.field(i).name() => Ok(e.alias(schema.field(i).name())),
-            Expr::Alias { .. } | Expr::Column { .. } => Ok(e),
+            Expr::Column(Column { name: column, .. })
+                if column.as_str() != name.as_str() =>
+            {
+                let column = std::mem::take(e);
+                *e = aliased(funding, column, None, name)?;
+            }
+            Expr::Alias { .. } | Expr::Column { .. } => {}
             #[expect(deprecated)]
             Expr::Wildcard { .. } => {
-                plan_err!("Wildcard should be expanded before type coercion")
+                return plan_err!("Wildcard should be expanded before type coercion");
             }
-            _ => Ok(e.alias(schema.field(i).name())),
-        })
-        .collect::<Result<Vec<_>>>()?;
+            _ => {
+                let other = std::mem::take(e);
+                *e = aliased(funding, other, None, name)?;
+            }
+        }
+    }
 
-    Projection::try_new_with_schema(alias_expr, input, schema)
-        .map(LogicalPlan::Projection)
+    Projection::try_new_with_schema(expr, input, schema).map(LogicalPlan::Projection)
 }
 
 #[cfg(test)]
@@ -1431,12 +1610,14 @@ mod test {
     use arrow::datatypes::{DataType, Field, Schema, SchemaBuilder, TimeUnit};
     use insta::assert_snapshot;
 
-    use crate::analyzer::Analyzer;
     use crate::analyzer::type_coercion::{
         TypeCoercion, TypeCoercionRewriter, coerce_case_expression,
     };
+    use crate::analyzer::{Analyzer, AnalyzerRule};
     use crate::assert_analyzed_plan_with_config_eq_snapshot;
+    use crate::funded::Freed;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::{Funding, PlanningFunding};
     use datafusion_common::tree_node::{TransformedResult, TreeNode};
     use datafusion_common::{
         DFSchema, DFSchemaRef, Result, ScalarValue, Spans, TableReference,
@@ -1537,7 +1718,11 @@ mod test {
     fn simple_case() -> Result<()> {
         let expr = col("a").lt(lit(2_u32));
         let empty = empty_with_type(DataType::Float64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -1567,6 +1752,7 @@ mod test {
                 DFSchema::try_from_qualified_schema(
                     TableReference::full("datafusion", "test", "foo"),
                     &Schema::new(vec![Field::new("a", DataType::Int32, false)]),
+                    &Funding::default(),
                 )
                 .unwrap(),
             ),
@@ -1577,6 +1763,7 @@ mod test {
                 DFSchema::try_from_qualified_schema(
                     TableReference::full("datafusion", "test", "foo"),
                     &Schema::new(vec![Field::new("a", DataType::Int64, false)]),
+                    &Funding::default(),
                 )
                 .unwrap(),
             ),
@@ -1589,6 +1776,7 @@ mod test {
         let top_level_plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("a")],
             Arc::new(analyzed_union),
+            &Funding::default(),
         )?);
 
         assert_analyzed_plan_eq!(
@@ -1694,6 +1882,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![expr.clone()],
             Arc::clone(&empty),
+            &Funding::default(),
         )?);
 
         // Plan A: no coerce
@@ -1722,6 +1911,7 @@ mod test {
         let bool_plan = LogicalPlan::Projection(Projection::try_new(
             vec![bool_expr],
             Arc::clone(&empty),
+            &Funding::default(),
         )?);
         // Plan B: no coerce
         coerce_on_output_if_viewtype!(
@@ -1789,6 +1979,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("a")],
             Arc::new(sort_plan),
+            &Funding::default(),
         )?);
         // Plan D: no coerce
         coerce_on_output_if_viewtype!(
@@ -1825,6 +2016,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![expr.clone()],
             Arc::clone(&empty),
+            &Funding::default(),
         )?);
 
         // Plan A: no coerce
@@ -1853,6 +2045,7 @@ mod test {
         let bool_plan = LogicalPlan::Projection(Projection::try_new(
             vec![bool_expr],
             Arc::clone(&empty),
+            &Funding::default(),
         )?);
 
         // Plan B: no coerce
@@ -1911,6 +2104,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![col("a")],
             Arc::new(sort_plan),
+            &Funding::default(),
         )?);
 
         // Plan D: no coerce
@@ -1948,6 +2142,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![expr.clone().or(expr)],
             empty,
+            &Funding::default(),
         )?);
 
         assert_analyzed_plan_eq!(
@@ -2015,7 +2210,11 @@ mod test {
             signature: Signature::uniform(1, vec![DataType::Float32], Volatility::Stable),
         })
         .call(vec![lit(123_i32)]);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![udf], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![udf],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2033,7 +2232,7 @@ mod test {
             signature: Signature::uniform(1, vec![DataType::Float32], Volatility::Stable),
         })
         .call(vec![lit("Apple")]);
-        Projection::try_new(vec![udf], empty)
+        Projection::try_new(vec![udf], empty, &Funding::default())
             .expect_err("Expected an error due to incorrect function input");
 
         Ok(())
@@ -2052,6 +2251,7 @@ mod test {
         let plan = LogicalPlan::Projection(Projection::try_new(
             vec![scalar_function_expr],
             empty,
+            &Funding::default(),
         )?);
 
         assert_analyzed_plan_eq!(
@@ -2082,7 +2282,11 @@ mod test {
             vec![],
             None,
         ));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![udaf], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![udaf],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2118,7 +2322,9 @@ mod test {
             None,
         ));
 
-        let err = Projection::try_new(vec![udaf], empty).err().unwrap();
+        let err = Projection::try_new(vec![udaf], empty, &Funding::default())
+            .err()
+            .unwrap();
         assert!(
             err.strip_backtrace().starts_with("Error during planning: Failed to coerce arguments to satisfy a call to 'MY_AVG' function: coercion from Utf8 to the signature Uniform(1, [Float64]) failed")
         );
@@ -2136,7 +2342,11 @@ mod test {
             vec![],
             None,
         ));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![agg_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![agg_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2155,7 +2365,11 @@ mod test {
             vec![],
             None,
         ));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![agg_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![agg_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2177,7 +2391,7 @@ mod test {
             vec![],
             None,
         ));
-        let err = Projection::try_new(vec![agg_expr], empty)
+        let err = Projection::try_new(vec![agg_expr], empty, &Funding::default())
             .err()
             .unwrap()
             .strip_backtrace();
@@ -2194,7 +2408,11 @@ mod test {
         let expr = cast(lit("1998-03-18"), DataType::Date32)
             + lit(ScalarValue::new_interval_dt(123, 456));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2210,7 +2428,11 @@ mod test {
         // a in (1,4,8), a is int64
         let expr = col("a").in_list(vec![lit(1_i32), lit(4_i8), lit(8_i64)], false);
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_analyzed_plan_eq!(
             plan,
             @r"
@@ -2227,7 +2449,11 @@ mod test {
                 std::collections::HashMap::new(),
             )?),
         }));
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_analyzed_plan_eq!(
             plan,
             @r"
@@ -2297,8 +2523,11 @@ mod test {
         // is true
         let expr = col("a").is_true();
         let empty = empty_with_type(DataType::Boolean);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![expr.clone()], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr.clone()],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2309,7 +2538,11 @@ mod test {
         )?;
 
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "Cannot infer common argument type for comparison operation Int64 IS DISTINCT FROM Boolean",
@@ -2318,7 +2551,11 @@ mod test {
         // is not true
         let expr = col("a").is_not_true();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2331,7 +2568,11 @@ mod test {
         // is false
         let expr = col("a").is_false();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2344,7 +2585,11 @@ mod test {
         // is not false
         let expr = col("a").is_not_false();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2362,7 +2607,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![like_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2376,7 +2625,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::Null));
         let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![like_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2390,7 +2643,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let like_expr = Expr::Like(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![like_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![like_expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "There isn't a common type to coerce Int64 and Utf8 in LIKE expression",
@@ -2401,7 +2658,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![ilike_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2415,7 +2676,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::Null));
         let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![ilike_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2429,7 +2694,11 @@ mod test {
         let pattern = Box::new(lit(ScalarValue::new_utf8("abc")));
         let ilike_expr = Expr::Like(Like::new(false, expr, pattern, None, true));
         let empty = empty_with_type(DataType::Int64);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![ilike_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![ilike_expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "There isn't a common type to coerce Int64 and Utf8 in ILIKE expression",
@@ -2446,8 +2715,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2464,8 +2736,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2481,8 +2756,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Utf8View);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2498,8 +2776,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(Utf8);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2518,8 +2799,11 @@ mod test {
             Box::new(DataType::Int32),
             Box::new(Utf8),
         ));
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2535,8 +2819,11 @@ mod test {
         let similar_to_expr =
             Expr::SimilarTo(Like::new(false, expr, pattern, None, false));
         let empty = empty_with_type(DataType::Int64);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![similar_to_expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![similar_to_expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "There isn't a common type to coerce Int64 and Utf8 in SIMILAR TO expression",
@@ -2550,8 +2837,11 @@ mod test {
         // unknown
         let expr = col("a").is_unknown();
         let empty = empty_with_type(DataType::Boolean);
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![expr.clone()], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr.clone()],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2562,7 +2852,11 @@ mod test {
         )?;
 
         let empty = empty_with_type(Utf8);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
         assert_type_coercion_error(
             plan,
             "Cannot infer common argument type for comparison operation Utf8 IS DISTINCT FROM Boolean",
@@ -2571,7 +2865,11 @@ mod test {
         // is not unknown
         let expr = col("a").is_not_unknown();
         let empty = empty_with_type(DataType::Boolean);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -2592,8 +2890,11 @@ mod test {
             signature: Signature::variadic(vec![Utf8], Volatility::Immutable),
         })
         .call(args.to_vec());
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(vec![expr], Arc::clone(&empty))?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            Arc::clone(&empty),
+            &Funding::default(),
+        )?);
         assert_analyzed_plan_eq!(
             plan,
             @r#"
@@ -2610,7 +2911,8 @@ mod test {
             vec![Field::new("a", DataType::Int64, true)].into(),
             std::collections::HashMap::new(),
         )?);
-        let mut rewriter = TypeCoercionRewriter { schema: &schema };
+        let funding = Funding::default();
+        let mut rewriter = TypeCoercionRewriter::new(&schema, &funding);
         let expr = is_true(lit(12i32).gt(lit(13i64)));
         let expected = is_true(cast(lit(12i32), DataType::Int64).gt(lit(13i64)));
         let result = expr.rewrite(&mut rewriter).data()?;
@@ -2621,7 +2923,8 @@ mod test {
             vec![Field::new("a", DataType::Int64, true)].into(),
             std::collections::HashMap::new(),
         )?);
-        let mut rewriter = TypeCoercionRewriter { schema: &schema };
+        let funding = Funding::default();
+        let mut rewriter = TypeCoercionRewriter::new(&schema, &funding);
         let expr = is_true(lit(12i32).eq(lit(13i64)));
         let expected = is_true(cast(lit(12i32), DataType::Int64).eq(lit(13i64)));
         let result = expr.rewrite(&mut rewriter).data()?;
@@ -2632,7 +2935,8 @@ mod test {
             vec![Field::new("a", DataType::Int64, true)].into(),
             std::collections::HashMap::new(),
         )?);
-        let mut rewriter = TypeCoercionRewriter { schema: &schema };
+        let funding = Funding::default();
+        let mut rewriter = TypeCoercionRewriter::new(&schema, &funding);
         let expr = is_true(lit(12i32).lt(lit(13i64)));
         let expected = is_true(cast(lit(12i32), DataType::Int64).lt(lit(13i64)));
         let result = expr.rewrite(&mut rewriter).data()?;
@@ -2649,7 +2953,11 @@ mod test {
         )
         .eq(cast(lit("1998-03-18"), DataType::Date32));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3000,7 +3308,11 @@ mod test {
 
         let expr = col("a").eq(cast(col("a"), may_type_custom));
         let empty = empty_with_type(map_type_entries);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3027,7 +3339,11 @@ mod test {
 
         let expr = ScalarUDF::from(TestArrayElementUDF).call(vec![col("a"), lit(1_i64)]);
         let empty = empty_with_type(list_type);
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3050,7 +3366,11 @@ mod test {
             )),
         ));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3075,7 +3395,11 @@ mod test {
             )),
         ));
         let empty = empty();
-        let plan = LogicalPlan::Projection(Projection::try_new(vec![expr], empty)?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![expr],
+            empty,
+            &Funding::default(),
+        )?);
 
         assert_analyzed_plan_eq!(
             plan,
@@ -3170,5 +3494,39 @@ mod test {
           EmptyRelation: rows=0
         "
         )
+    }
+
+    /// Funding without a limit.
+    struct Unlimited;
+
+    impl PlanningFunding for Unlimited {
+        fn charge(&self, _bytes: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn coerced_plan_holds_what_coercing_charged() -> Result<()> {
+        let mut options = ConfigOptions::default();
+        options.funding = Funding::new(Arc::new(Unlimited));
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![lit(1i32) + lit(1i64)],
+            empty(),
+            &Funding::default(),
+        )?);
+        let before = plan.freed_bytes();
+
+        let coerced = TypeCoercion::new().analyze(plan, &options)?;
+
+        // The cast and the alias keeping the name are kept by the plan; the schemas
+        // coercing it are given back.
+        assert!(coerced.freed_bytes() > before);
+        assert_eq!(
+            options.funding.outstanding(),
+            coerced.freed_bytes() - before
+        );
+        Ok(())
     }
 }

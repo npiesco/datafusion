@@ -19,6 +19,7 @@
 
 use datafusion_common::funding::Funding;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt;
 
 use crate::analyzer::type_coercion::TypeCoercionRewriter;
 use arrow::array::{Array, RecordBatch, new_null_array};
@@ -155,8 +156,9 @@ pub(crate) fn schema_columns<'a>(schema: &'a DFSchema) -> HashSet<ColumnReferenc
         .collect::<HashSet<_>>()
 }
 
-/// Log the plan in debug/tracing mode after some part of the optimizer runs
-pub fn log_plan(description: &str, plan: &LogicalPlan) {
+/// Log the plan in debug/tracing mode after some part of the optimizer runs. The
+/// description is written only if the plan is logged: nothing is allocated for it here.
+pub fn log_plan(description: fmt::Arguments<'_>, plan: &LogicalPlan) {
     debug!("{description}:\n{}\n", plan.display_indent());
     trace!("{description}::\n{}\n", plan.display_indent_schema());
 }
@@ -246,7 +248,9 @@ fn evaluate_expr_with_null_column<'a>(
 }
 
 fn coerce(expr: Expr, schema: &DFSchema) -> Result<Expr> {
-    let mut expr_rewrite = TypeCoercionRewriter { schema };
+    // The predicate is evaluated here and dropped: nothing coercing it makes is kept.
+    let funding = Funding::default();
+    let mut expr_rewrite = TypeCoercionRewriter::new(schema, &funding);
     expr.rewrite(&mut expr_rewrite).data()
 }
 

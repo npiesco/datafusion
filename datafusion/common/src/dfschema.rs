@@ -18,12 +18,14 @@
 //! DFSchema is an extended schema struct that DataFusion uses to provide support for
 //! fields with optional relation names.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
 
+use crate::cloned::CloneBytes;
 use crate::error::{_plan_err, _schema_err, DataFusionError, Result};
+use crate::funding::{Funding, arc_bytes, arc_slice_bytes};
 use crate::{
     Column, FunctionalDependencies, SchemaError, TableReference, field_not_found,
     unqualified_field_not_found,
@@ -63,11 +65,12 @@ pub type DFSchemaRef = Arc<DFSchema>;
 ///
 /// ```rust
 /// use arrow::datatypes::{DataType, Field, Schema};
+/// use datafusion_common::funding::Funding;
 /// use datafusion_common::{Column, DFSchema};
 ///
 /// let arrow_schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
 ///
-/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema).unwrap();
+/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema, &Funding::default()).unwrap();
 /// let column = Column::from_qualified_name("t1.c1");
 /// assert!(df_schema.has_column(&column));
 ///
@@ -150,18 +153,24 @@ impl DFSchema {
         &self.inner
     }
 
-    /// Create a `DFSchema` from an Arrow schema where all the fields have a given qualifier
+    /// Create a `DFSchema` of `qualified_fields`, what it makes charged to `funding`
     pub fn new_with_metadata(
-        qualified_fields: Vec<(Option<TableReference>, Arc<Field>)>,
+        qualified_fields: &[(Option<TableReference>, Arc<Field>)],
         metadata: HashMap<String, String>,
+        funding: &Funding,
     ) -> Result<Self> {
-        let (qualifiers, fields): (Vec<Option<TableReference>>, Vec<Arc<Field>>) =
-            qualified_fields.into_iter().unzip();
-
-        let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
-
+        let mut qualifiers = funding.vec_with_capacity(qualified_fields.len())?;
+        qualifiers.extend(
+            qualified_fields
+                .iter()
+                .map(|(qualifier, _)| qualifier.clone()),
+        );
+        let mut fields = funding.held::<Vec<FieldRef>>();
+        fields.reserve_exact(qualified_fields.len())?;
+        fields.extend(qualified_fields.iter().map(|(_, field)| Arc::clone(field)));
+        let fields = funding.fields(&fields)?;
         let dfschema = Self {
-            inner: schema,
+            inner: funding.arc(Schema::new_with_metadata(fields, metadata))?,
             field_qualifiers: qualifiers,
             functional_dependencies: FunctionalDependencies::empty(),
         };
@@ -189,14 +198,21 @@ impl DFSchema {
     ///
     /// To create a schema from an Arrow schema without a qualifier, use
     /// `DFSchema::try_from`.
+    ///
+    /// Its Arrow schema's block and its qualifiers' list are charged to `funding` before they
+    /// are made; the fields are shared, the metadata map copied uncharged.
     pub fn try_from_qualified_schema(
         qualifier: impl Into<TableReference>,
         schema: &Schema,
+        funding: &Funding,
     ) -> Result<Self> {
         let qualifier = qualifier.into();
+        let mut field_qualifiers = funding.vec_with_capacity(schema.fields.len())?;
+        field_qualifiers
+            .extend(std::iter::repeat_n(Some(qualifier), schema.fields.len()));
         let schema = DFSchema {
-            inner: schema.clone().into(),
-            field_qualifiers: vec![Some(qualifier); schema.fields.len()],
+            inner: funding.arc(schema.clone())?,
+            field_qualifiers,
             functional_dependencies: FunctionalDependencies::empty(),
         };
         schema.check_names()?;
@@ -236,32 +252,40 @@ impl DFSchema {
         })
     }
 
-    /// Check if the schema have some fields with the same name
+    /// Check if the schema have some fields with the same name, allocating nothing.
+    ///
+    /// The first name repeated, in field order, is the duplicate reported; failing that, the
+    /// least qualified name an unqualified field also has is the ambiguous one reported.
     pub fn check_names(&self) -> Result<()> {
-        let mut qualified_names = BTreeSet::new();
-        let mut unqualified_names = BTreeSet::new();
-
-        for (field, qualifier) in self.inner.fields().iter().zip(&self.field_qualifiers) {
-            if let Some(qualifier) = qualifier {
-                if !qualified_names.insert((qualifier, field.name())) {
-                    return _schema_err!(SchemaError::DuplicateQualifiedField {
-                        qualifier: Box::new(qualifier.clone()),
-                        name: field.name().to_string(),
-                    });
-                }
-            } else if !unqualified_names.insert(field.name()) {
-                return _schema_err!(SchemaError::DuplicateUnqualifiedField {
-                    name: field.name().to_string()
-                });
+        let named = || self.field_qualifiers.iter().zip(self.inner.fields().iter());
+        for (index, (qualifier, field)) in named().enumerate() {
+            let repeated = named().take(index).any(|(earlier, earlier_field)| {
+                earlier == qualifier && earlier_field.name() == field.name()
+            });
+            if !repeated {
+                continue;
             }
+            return match qualifier {
+                Some(qualifier) => _schema_err!(SchemaError::DuplicateQualifiedField {
+                    qualifier: Box::new(qualifier.clone()),
+                    name: field.name().to_string(),
+                }),
+                None => _schema_err!(SchemaError::DuplicateUnqualifiedField {
+                    name: field.name().to_string()
+                }),
+            };
         }
 
-        for (qualifier, name) in qualified_names {
-            if unqualified_names.contains(name) {
-                return _schema_err!(SchemaError::AmbiguousReference {
-                    field: Box::new(Column::new(Some(qualifier.clone()), name))
-                });
-            }
+        let ambiguous = named()
+            .filter_map(|(qualifier, field)| Some((qualifier.as_ref()?, field.name())))
+            .filter(|(_, name)| {
+                named().any(|(other, field)| other.is_none() && field.name() == *name)
+            })
+            .min();
+        if let Some((qualifier, name)) = ambiguous {
+            return _schema_err!(SchemaError::AmbiguousReference {
+                field: Box::new(Column::new(Some(qualifier.clone()), name))
+            });
         }
         Ok(())
     }
@@ -306,8 +330,8 @@ impl DFSchema {
         Ok(new_self)
     }
 
-    /// Modify this schema by appending the fields from the supplied schema, ignoring any
-    /// duplicate fields.
+    /// This schema with the fields from the supplied schema appended, ignoring any
+    /// duplicate fields, what it makes charged to `funding`.
     ///
     /// ## Merge Precedence
     ///
@@ -322,41 +346,68 @@ impl DFSchema {
     ///
     /// Take note how the precedence for fields & metadata merging differs;
     /// merging prefers fields from `self` but prefers metadata from `other_schema`.
-    pub fn merge(&mut self, other_schema: &DFSchema) {
+    pub fn merge(&self, other_schema: &DFSchema, funding: &Funding) -> Result<Self> {
         if other_schema.inner.fields.is_empty() {
-            return;
+            return funding.cloned(self);
         }
 
-        let self_fields: HashSet<(Option<&TableReference>, &FieldRef)> =
-            self.iter().collect();
-        let self_unqualified_names: HashSet<&str> = self
-            .inner
-            .fields
-            .iter()
-            .map(|field| field.name().as_str())
-            .collect();
+        let added = || {
+            other_schema
+                .iter()
+                .filter(|(qualifier, field)| match qualifier {
+                    Some(q) => !self
+                        .iter()
+                        .any(|(own, own_field)| own == Some(*q) && own_field == *field),
+                    // for unqualified columns, check as unqualified name
+                    None => !self
+                        .inner
+                        .fields
+                        .iter()
+                        .any(|own_field| own_field.name() == field.name()),
+                })
+        };
+        let count = self.field_qualifiers.len() + added().count();
 
-        let mut schema_builder = SchemaBuilder::from(self.inner.fields.clone());
-        let mut qualifiers = Vec::new();
-        for (qualifier, field) in other_schema.iter() {
-            // skip duplicate columns
-            let duplicated_field = match qualifier {
-                Some(q) => self_fields.contains(&(Some(q), field)),
-                // for unqualified columns, check as unqualified name
-                None => self_unqualified_names.contains(field.name().as_str()),
-            };
-            if !duplicated_field {
-                schema_builder.push(Arc::clone(field));
-                qualifiers.push(qualifier.cloned());
-            }
-        }
+        let mut qualifiers = funding.vec_with_capacity(count)?;
+        qualifiers.extend(self.field_qualifiers.iter().cloned());
+        qualifiers.extend(added().map(|(qualifier, _)| qualifier.cloned()));
+        let mut fields = funding.held::<Vec<FieldRef>>();
+        fields.reserve_exact(count)?;
+        fields.extend(self.inner.fields.iter().cloned());
+        fields.extend(added().map(|(_, field)| Arc::clone(field)));
+        let fields = funding.fields(&fields)?;
+
         let mut metadata = self.inner.metadata.clone();
         metadata.extend(other_schema.inner.metadata.clone());
 
-        let finished = schema_builder.finish();
-        let finished_with_metadata = finished.with_metadata(metadata);
-        self.inner = finished_with_metadata.into();
-        self.field_qualifiers.extend(qualifiers);
+        Ok(Self {
+            inner: funding.arc(Schema::new_with_metadata(fields, metadata))?,
+            field_qualifiers: qualifiers,
+            functional_dependencies: funding.cloned(&self.functional_dependencies)?,
+        })
+    }
+
+    /// `self`, a schema [`DFSchema::merge`] made through `funding`, freed: what merging
+    /// allocated for it is given back. Its qualifier list and dependencies are its own; its
+    /// Arrow schema and field list are freed, and given back, only if no other handle to the
+    /// Arrow schema remains: one taken from the schema it was merged from (merging an empty
+    /// schema) or from the merged schema itself keeps them.
+    pub fn released(self, funding: &Funding) {
+        let DFSchema {
+            inner,
+            field_qualifiers,
+            functional_dependencies,
+        } = self;
+        let mut freed = functional_dependencies.clone_bytes();
+        drop(functional_dependencies);
+        funding.released(field_qualifiers);
+        if let Ok(schema) = Arc::try_unwrap(inner) {
+            freed += arc_bytes::<Schema>();
+            if let Ok(fields) = arc_slice_bytes::<FieldRef>(schema.fields().len()) {
+                freed += fields;
+            }
+        }
+        funding.discharge(freed);
     }
 
     /// Get a list of fields for this schema
@@ -1376,6 +1427,48 @@ pub fn qualified_name(qualifier: Option<&TableReference>, name: &str) -> String 
     s
 }
 
+/// The bytes of the name [`qualified_name`] makes, yielded without allocating.
+pub(crate) fn qualified_name_bytes<'a>(
+    qualifier: Option<&'a TableReference>,
+    name: &'a str,
+) -> impl Iterator<Item = u8> + 'a {
+    let parts: [Option<&'a str>; 4] = match qualifier {
+        None => [None, None, None, Some(name)],
+        Some(TableReference::Bare { table }) => [Some(table), None, None, Some(name)],
+        Some(TableReference::Partial { schema, table }) => {
+            [Some(schema), Some(table), None, Some(name)]
+        }
+        Some(TableReference::Full {
+            catalog,
+            schema,
+            table,
+        }) => [Some(catalog), Some(schema), Some(table), Some(name)],
+    };
+    parts
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(i, part)| (i > 0).then_some(b'.').into_iter().chain(part.bytes()))
+}
+
+/// Whether [`qualified_name`] of `qualifier` and `name` is `text`, compared without
+/// allocating.
+pub fn qualified_name_is(
+    qualifier: Option<&TableReference>,
+    name: &str,
+    text: &str,
+) -> bool {
+    qualified_name_bytes(qualifier, name).eq(text.bytes())
+}
+
+/// Whether two qualified names are the same [`qualified_name`], compared without allocating.
+pub fn qualified_names_equal(
+    left: (Option<&TableReference>, &str),
+    right: (Option<&TableReference>, &str),
+) -> bool {
+    qualified_name_bytes(left.0, left.1).eq(qualified_name_bytes(right.0, right.1))
+}
+
 #[cfg(test)]
 mod tests {
     use crate::assert_contains;
@@ -1415,7 +1508,11 @@ mod tests {
     #[test]
     fn qualifier_in_name() -> Result<()> {
         let col = Column::from_name("t1.c0");
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         // lookup with unqualified name "t1.c0"
         let err = schema.index_of_column(&col).unwrap_err();
         let expected = "Schema error: No field named \"t1.c0\". Did you mean 't1.c0'?\n\
@@ -1433,6 +1530,7 @@ mod tests {
                 Field::new("CapitalColumn", DataType::Boolean, true),
                 Field::new("field.with.period", DataType::Boolean, true),
             ]),
+            &Funding::default(),
         )?;
 
         // lookup with unqualified name "t1.c0"
@@ -1466,6 +1564,7 @@ mod tests {
                 Field::new("URL", DataType::Boolean, true),
                 Field::new("URLHash", DataType::Boolean, true),
             ]),
+            &Funding::default(),
         )?;
 
         let err = schema.field_with_unqualified_name("url").unwrap_err();
@@ -1487,7 +1586,11 @@ mod tests {
 
     #[test]
     fn from_qualified_schema() -> Result<()> {
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         assert_eq!("fields:[t1.c0, t1.c1], metadata:{}", schema.to_string());
         Ok(())
     }
@@ -1508,7 +1611,7 @@ mod tests {
     #[test]
     fn test_from_qualified_fields() -> Result<()> {
         let schema = DFSchema::new_with_metadata(
-            vec![
+            &vec![
                 (
                     Some("t0".into()),
                     Arc::new(Field::new("c0", DataType::Boolean, true)),
@@ -1516,6 +1619,7 @@ mod tests {
                 (None, Arc::new(Field::new("c1", DataType::Boolean, true))),
             ],
             HashMap::new(),
+            &Funding::default(),
         )?;
         assert_eq!("fields:[t0.c0, c1], metadata:{}", schema.to_string());
         Ok(())
@@ -1523,7 +1627,11 @@ mod tests {
 
     #[test]
     fn from_qualified_schema_into_arrow_schema() -> Result<()> {
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let arrow_schema = schema.as_arrow();
         insta::assert_snapshot!(arrow_schema.to_string(), @r#"Field { "c0": nullable Boolean }, Field { "c1": nullable Boolean }"#);
         Ok(())
@@ -1531,8 +1639,16 @@ mod tests {
 
     #[test]
     fn join_qualified() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
-        let right = DFSchema::try_from_qualified_schema("t2", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+        let right = DFSchema::try_from_qualified_schema(
+            "t2",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let join = left.join(&right)?;
         assert_eq!(
             "fields:[t1.c0, t1.c1, t2.c0, t2.c1], metadata:{}",
@@ -1556,8 +1672,16 @@ mod tests {
 
     #[test]
     fn join_qualified_duplicate() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
-        let right = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+        let right = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let join = left.join(&right);
         assert_eq!(
             join.unwrap_err().strip_backtrace(),
@@ -1580,7 +1704,11 @@ mod tests {
 
     #[test]
     fn join_mixed() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let right = DFSchema::try_from(test_schema_2())?;
         let join = left.join(&right)?;
         assert_eq!(
@@ -1607,7 +1735,11 @@ mod tests {
 
     #[test]
     fn join_mixed_duplicate() -> Result<()> {
-        let left = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let right = DFSchema::try_from(test_schema_1())?;
         let join = left.join(&right);
         assert_contains!(
@@ -1620,7 +1752,11 @@ mod tests {
 
     #[test]
     fn helpful_error_messages() -> Result<()> {
-        let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+        let schema = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
         let expected_help = "Valid fields are t1.c0, t1.c1.";
         assert_contains!(
             schema
@@ -1727,28 +1863,44 @@ mod tests {
         // qualified exists
         {
             let col = Column::from_qualified_name("t1.c0");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(schema.is_column_from_schema(&col));
         }
 
         // qualified not exists
         {
             let col = Column::from_qualified_name("t1.c2");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(!schema.is_column_from_schema(&col));
         }
 
         // unqualified exists
         {
             let col = Column::from_name("c0");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(schema.is_column_from_schema(&col));
         }
 
         // unqualified not exists
         {
             let col = Column::from_name("c2");
-            let schema = DFSchema::try_from_qualified_schema("t1", &test_schema_1())?;
+            let schema = DFSchema::try_from_qualified_schema(
+                "t1",
+                &test_schema_1(),
+                &Funding::default(),
+            )?;
             assert!(!schema.is_column_from_schema(&col));
         }
 
@@ -2206,6 +2358,7 @@ mod tests {
                 Field::new("id", DataType::Int32, false),
                 Field::new("name", DataType::Utf8, true),
             ]),
+            &Funding::default(),
         )
         .unwrap();
 
@@ -2360,7 +2513,7 @@ mod tests {
     fn test_print_schema_mixed_qualified_unqualified() {
         // Test a schema with mixed qualified and unqualified fields
         let schema = DFSchema::new_with_metadata(
-            vec![
+            &vec![
                 (
                     Some("table1".into()),
                     Arc::new(Field::new("id", DataType::Int32, false)),
@@ -2376,6 +2529,7 @@ mod tests {
                 ),
             ],
             HashMap::new(),
+            &Funding::default(),
         )
         .unwrap();
 

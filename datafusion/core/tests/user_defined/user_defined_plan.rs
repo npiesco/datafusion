@@ -933,6 +933,7 @@ impl MyAnalyzerRule {
                     Transformed::yes(LogicalPlan::Projection(Projection::try_new(
                         expr,
                         projection.input,
+                        &datafusion::common::funding::Funding::default(),
                     )?))
                 }
                 _ => Transformed::no(plan),

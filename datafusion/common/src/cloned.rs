@@ -27,10 +27,12 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use crate::error::Result;
-use crate::funding::Funding;
+use crate::funding::{Funding, arc_bytes};
 use crate::metadata::FieldMetadata;
 use crate::spans::Spans;
-use crate::{Column, DFSchema, ScalarValue, TableReference};
+use crate::{
+    Column, DFSchema, RecursionUnnestOption, ScalarValue, TableReference, UnnestOptions,
+};
 
 /// A value whose clone is measured before it is made.
 pub trait CloneBytes: Clone {
@@ -61,6 +63,26 @@ impl Funding {
         let bytes = value.clone_bytes();
         drop(value);
         self.discharge(bytes);
+    }
+
+    /// A copy of `items`, in a list with room for exactly them, all it allocates charged
+    /// before it is made.
+    pub fn to_vec<T: CloneBytes>(&self, items: &[T]) -> Result<Vec<T>> {
+        self.charge(slice_clone_bytes(items))?;
+        Ok(items.to_vec())
+    }
+
+    /// The value out of `shared`, a counted block charged through this handle
+    /// ([`Funding::arc`]): when `shared` was its last handle the block is freed and given
+    /// back; otherwise the value is copied, charged ([`Funding::cloned`]).
+    pub fn unwrapped<T: CloneBytes>(&self, shared: Arc<T>) -> Result<T> {
+        match Arc::try_unwrap(shared) {
+            Ok(value) => {
+                self.discharge(arc_bytes::<T>());
+                Ok(value)
+            }
+            Err(shared) => self.cloned(shared.as_ref()),
+        }
     }
 }
 
@@ -196,6 +218,20 @@ impl CloneBytes for DFSchema {
         size_of::<Option<TableReference>>()
             .saturating_mul(self.fields().len())
             .saturating_add(self.functional_dependencies().clone_bytes())
+    }
+}
+
+impl CloneBytes for UnnestOptions {
+    fn clone_bytes(&self) -> usize {
+        self.recursions.clone_bytes()
+    }
+}
+
+impl CloneBytes for RecursionUnnestOption {
+    fn clone_bytes(&self) -> usize {
+        self.input_column
+            .clone_bytes()
+            .saturating_add(self.output_column.clone_bytes())
     }
 }
 

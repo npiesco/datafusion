@@ -18,16 +18,15 @@
 //! [`EliminateOuterJoin`] rewrites outer joins to simpler join types when
 //! filters make the outer rows unnecessary (e.g. `LEFT`/`RIGHT` to `INNER`,
 //! and `FULL` to `LEFT`/`RIGHT`/`INNER`).
-use crate::push_down_filter::replace_cols_by_name;
+use crate::funded::plan_mut;
 use crate::{OptimizerConfig, OptimizerRule};
-use datafusion_common::{Column, DFSchema, Result, qualified_name};
-use datafusion_expr::logical_plan::{Join, JoinType, LogicalPlan, Projection};
-use datafusion_expr::{Expr, Filter, Operator};
+use datafusion_common::{Column, DFSchema, Result, internal_err, qualified_names_equal};
+use datafusion_expr::logical_plan::{Join, JoinType, LogicalPlan};
+use datafusion_expr::{Expr, Operator};
 
 use crate::optimizer::ApplyOrder;
 use datafusion_common::tree_node::Transformed;
 use datafusion_expr::expr::{BinaryExpr, Cast, InList, Like, TryCast};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Attempt to simplify outer joins when filters make their null-padded
@@ -71,10 +70,10 @@ use std::sync::Arc;
 ///       Join(LEFT/RIGHT/FULL)
 /// ```
 ///
-/// In the projection case, the rule rewrites a copy of the predicate through
-/// each Projection so it can analyze the predicate against the Join inputs.
-/// The original filter predicate and Projection nodes are preserved when the
-/// plan is rebuilt.
+/// In the projection case, the rule follows each column of the predicate through
+/// each Projection to the expression defining it, analyzing the predicate against
+/// the Join inputs without rewriting it. The filter and Projection nodes are kept;
+/// only the join's type is changed, in place.
 #[derive(Default, Debug)]
 pub struct EliminateOuterJoin;
 
@@ -102,61 +101,61 @@ impl OptimizerRule for EliminateOuterJoin {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        let LogicalPlan::Filter(filter) = plan else {
+        let LogicalPlan::Filter(mut filter) = plan else {
             return Ok(Transformed::no(plan));
         };
 
         // Descend through one or more Projection nodes until we find a Join.
-        // For each Projection we encounter, rewrite a working copy of the
-        // predicate by replacing references to projection output columns with
-        // the expressions that define them. Keep the filter's original
-        // predicate intact for eventual use in the rebuilt plan; the rewritten
-        // predicate is used only for the null-rejection analysis.
-        let mut rewritten_predicate = filter.predicate.clone();
-        let mut projections: Vec<Projection> = Vec::new();
-        let mut cur = Arc::clone(&filter.input);
-
-        let new_join = loop {
-            match cur.as_ref() {
-                LogicalPlan::Projection(p) => {
-                    rewritten_predicate =
-                        inline_through_projection(rewritten_predicate, p)?;
-                    let next = Arc::clone(&p.input);
-                    projections.push(p.clone());
-                    cur = next;
-                }
-                LogicalPlan::Join(join) => {
-                    let Some(new_join) = try_simplify_join(join, &rewritten_predicate)
-                    else {
-                        return Ok(Transformed::no(LogicalPlan::Filter(filter)));
-                    };
-                    break new_join;
-                }
-                _ => {
-                    return Ok(Transformed::no(LogicalPlan::Filter(filter)));
-                }
-            }
+        let Some(new_join_type) = join_below(&filter.input).and_then(|join| {
+            simplified_join_type(join, &filter.predicate, &filter.input)
+        }) else {
+            return Ok(Transformed::no(LogicalPlan::Filter(filter)));
         };
 
-        let rebuilt_inner = rewrap_projections(new_join, projections);
-        Filter::try_new(filter.predicate, Arc::new(rebuilt_inner))
-            .map(|f| Transformed::yes(LogicalPlan::Filter(f)))
+        // Each node down to the join copied first if it is shared, charged.
+        let funding = config.funding();
+        let mut cur = &mut filter.input;
+        loop {
+            match plan_mut(&funding, cur)? {
+                LogicalPlan::Projection(p) => cur = &mut p.input,
+                LogicalPlan::Join(join) => {
+                    join.join_type = new_join_type;
+                    break;
+                }
+                _ => return internal_err!("eliminate_outer_join lost its join"),
+            }
+        }
+        Ok(Transformed::yes(LogicalPlan::Filter(filter)))
     }
 }
 
-/// Attempt to simplify an outer join by analyzing `predicate` for
-/// null-rejection.  If the predicate filters out rows padded with NULLs on one
-/// or both sides, return a copy of `join` rewritten to an equivalent join type
-/// that omits those rows in the first place; otherwise return `None`.
-fn try_simplify_join(join: &Join, predicate: &Expr) -> Option<LogicalPlan> {
+/// The join under `plan` and any Projections above it.
+fn join_below(plan: &LogicalPlan) -> Option<&Join> {
+    match plan {
+        LogicalPlan::Projection(p) => join_below(&p.input),
+        LogicalPlan::Join(join) => Some(join),
+        _ => None,
+    }
+}
+
+/// The type `join` simplifies to, analyzing `predicate` (over `plan`'s output: `join`, or
+/// Projections above it) for null-rejection. If the predicate filters out rows padded with
+/// NULLs on one or both sides, the equivalent join type that omits those rows in the first
+/// place; otherwise `None`.
+fn simplified_join_type(
+    join: &Join,
+    predicate: &Expr,
+    plan: &LogicalPlan,
+) -> Option<JoinType> {
     if !join.join_type.is_outer() {
         return None;
     }
 
     let null_rejecting_sides = extract_null_rejecting_sides(
         predicate,
+        plan,
         join.left.schema(),
         join.right.schema(),
         true,
@@ -167,57 +166,46 @@ fn try_simplify_join(join: &Join, predicate: &Expr) -> Option<LogicalPlan> {
         null_rejecting_sides.left,
         null_rejecting_sides.right,
     );
-    if new_join_type == join.join_type {
-        return None;
-    }
-
-    Some(LogicalPlan::Join(Join {
-        left: Arc::clone(&join.left),
-        right: Arc::clone(&join.right),
-        join_type: new_join_type,
-        join_constraint: join.join_constraint,
-        on: join.on.clone(),
-        filter: join.filter.clone(),
-        schema: Arc::clone(&join.schema),
-        null_equality: join.null_equality,
-        null_aware: join.null_aware,
-    }))
+    (new_join_type != join.join_type).then_some(new_join_type)
 }
 
-/// Substitute the projection's output column references in `predicate` with
-/// the projection's defining expressions (stripped of any `Alias` wrapper).
-/// The result expresses `predicate` over the projection's *input* schema.
+/// The sides `col` (of `plan`'s output) null-rejects: a column a Projection defines is
+/// followed to its defining expression (stripped of any `Alias` wrapper), analyzed in its
+/// place, as if the predicate were rewritten over the projection's *input* schema.
 ///
 /// Unlike `PushDownFilter`, this rule does not change expression evaluation
-/// behavior (in fact, the rewritten expressions are only used for analysis
-/// purposes). Therefore, function volatility and `MoveTowardsLeafNodes`
-/// placement can be ignored here.
-fn inline_through_projection(predicate: Expr, p: &Projection) -> Result<Expr> {
-    let mut map: HashMap<String, Expr> = HashMap::new();
+/// behavior (the defining expressions are only analyzed). Therefore, function
+/// volatility and `MoveTowardsLeafNodes` placement can be ignored here.
+fn column_sides(
+    col: &Column,
+    plan: &LogicalPlan,
+    left_schema: &Arc<DFSchema>,
+    right_schema: &Arc<DFSchema>,
+    top_level: bool,
+) -> NullRejectingSides {
+    let LogicalPlan::Projection(p) = plan else {
+        return NullRejectingSides::for_column(col, left_schema, right_schema);
+    };
+    // The last field of that name defines it.
+    let mut defining = None;
     for ((qualifier, field), expr) in p.schema.iter().zip(p.expr.iter()) {
-        map.insert(
-            qualified_name(qualifier, field.name()),
-            unalias(expr).clone(),
-        );
+        if qualified_names_equal(
+            (col.relation.as_ref(), &col.name),
+            (qualifier, field.name()),
+        ) {
+            defining = Some(expr);
+        }
     }
-    replace_cols_by_name(predicate, &map)
-}
-
-/// Re-attach a stack of projections above `new_inner`, restoring the original
-/// plan shape with the new (possibly retyped) join at the bottom. Projection
-/// schemas are reused as-is; only nullability of columns sourced from the
-/// formerly-outer side may have changed, and the existing rule already takes
-/// this looser-schema approach at the join itself.
-fn rewrap_projections(
-    new_inner: LogicalPlan,
-    projections: Vec<Projection>,
-) -> LogicalPlan {
-    let mut current = new_inner;
-    for mut p in projections.into_iter().rev() {
-        p.input = Arc::new(current);
-        current = LogicalPlan::Projection(p);
+    match defining {
+        Some(expr) => extract_null_rejecting_sides(
+            unalias(expr),
+            &p.input,
+            left_schema,
+            right_schema,
+            top_level,
+        ),
+        None => column_sides(col, &p.input, left_schema, right_schema, top_level),
     }
-    current
 }
 
 fn unalias(expr: &Expr) -> &Expr {
@@ -287,24 +275,27 @@ impl NullRejectingSides {
 /// by an enclosing expression.
 fn extract_null_rejecting_sides(
     expr: &Expr,
+    plan: &LogicalPlan,
     left_schema: &Arc<DFSchema>,
     right_schema: &Arc<DFSchema>,
     top_level: bool,
 ) -> NullRejectingSides {
     match expr {
         Expr::Column(col) => {
-            NullRejectingSides::for_column(col, left_schema, right_schema)
+            column_sides(col, plan, left_schema, right_schema, top_level)
         }
         Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
             Operator::And | Operator::Or => {
                 let left_sides = extract_null_rejecting_sides(
                     left,
+                    plan,
                     left_schema,
                     right_schema,
                     top_level,
                 );
                 let right_sides = extract_null_rejecting_sides(
                     right,
+                    plan,
                     left_schema,
                     right_schema,
                     top_level,
@@ -325,10 +316,20 @@ fn extract_null_rejecting_sides(
             // Other NULL-on-NULL operators preserve null rejection from either
             // operand.
             op if op.returns_null_on_null() => {
-                let left_sides =
-                    extract_null_rejecting_sides(left, left_schema, right_schema, false);
-                let right_sides =
-                    extract_null_rejecting_sides(right, left_schema, right_schema, false);
+                let left_sides = extract_null_rejecting_sides(
+                    left,
+                    plan,
+                    left_schema,
+                    right_schema,
+                    false,
+                );
+                let right_sides = extract_null_rejecting_sides(
+                    right,
+                    plan,
+                    left_schema,
+                    right_schema,
+                    false,
+                );
                 left_sides.union(right_sides)
             }
             // Other operators, notably IS [ NOT ] DISTINCT FROM, are not
@@ -336,7 +337,7 @@ fn extract_null_rejecting_sides(
             _ => NullRejectingSides::default(),
         },
         Expr::Not(arg) | Expr::Negative(arg) => {
-            extract_null_rejecting_sides(arg, left_schema, right_schema, false)
+            extract_null_rejecting_sides(arg, plan, left_schema, right_schema, false)
         }
         // These wrappers return FALSE on NULL input, so they reject NULLs only
         // when they are themselves in the root WHERE context. Under another
@@ -347,28 +348,42 @@ fn extract_null_rejecting_sides(
         | Expr::IsFalse(arg)
         | Expr::IsNotUnknown(arg) => {
             if top_level {
-                extract_null_rejecting_sides(arg, left_schema, right_schema, false)
+                extract_null_rejecting_sides(arg, plan, left_schema, right_schema, false)
             } else {
                 NullRejectingSides::default()
             }
         }
         Expr::Cast(Cast { expr, field: _ })
         | Expr::TryCast(TryCast { expr, field: _ }) => {
-            extract_null_rejecting_sides(expr, left_schema, right_schema, false)
+            extract_null_rejecting_sides(expr, plan, left_schema, right_schema, false)
         }
         // IN list and BETWEEN reject NULLs from their input expression; list
         // values and range bounds do not affect which join side is padded.
         Expr::InList(InList { expr, .. }) => {
-            extract_null_rejecting_sides(expr, left_schema, right_schema, false)
+            extract_null_rejecting_sides(expr, plan, left_schema, right_schema, false)
         }
-        Expr::Between(between) => {
-            extract_null_rejecting_sides(&between.expr, left_schema, right_schema, false)
-        }
+        Expr::Between(between) => extract_null_rejecting_sides(
+            &between.expr,
+            plan,
+            left_schema,
+            right_schema,
+            false,
+        ),
         Expr::Like(Like { expr, pattern, .. }) => {
-            let expr_sides =
-                extract_null_rejecting_sides(expr, left_schema, right_schema, false);
-            let pattern_sides =
-                extract_null_rejecting_sides(pattern, left_schema, right_schema, false);
+            let expr_sides = extract_null_rejecting_sides(
+                expr,
+                plan,
+                left_schema,
+                right_schema,
+                false,
+            );
+            let pattern_sides = extract_null_rejecting_sides(
+                pattern,
+                plan,
+                left_schema,
+                right_schema,
+                false,
+            );
             expr_sides.union(pattern_sides)
         }
         // Strict scalar functions are NULL-propagating: if any argument from a
@@ -378,7 +393,7 @@ fn extract_null_rejecting_sides(
             .args
             .iter()
             .map(|arg| {
-                extract_null_rejecting_sides(arg, left_schema, right_schema, false)
+                extract_null_rejecting_sides(arg, plan, left_schema, right_schema, false)
             })
             .fold(NullRejectingSides::default(), NullRejectingSides::union),
         // Everything else is conservative: NULL-accepting predicates such as
@@ -1710,5 +1725,53 @@ mod tests {
               TableScan: t1
               TableScan: t2
         ")
+    }
+
+    /// Funding refusing everything.
+    struct Refusing;
+
+    impl datafusion_common::funding::PlanningFunding for Refusing {
+        fn charge(&self, _bytes: usize) -> bool {
+            false
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn retyping_a_shared_join_is_refused_unfunded() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(
+                t2,
+                JoinType::Left,
+                (vec![Column::from_name("a")], vec![Column::from_name("a")]),
+                None,
+            )?
+            .filter(col("t2.b").is_not_null())?
+            .build()?;
+        let LogicalPlan::Filter(filter) = &plan else {
+            unreachable!()
+        };
+        // Shared, the join is copied before it is retyped.
+        let shared = Arc::clone(&filter.input);
+        let mut options = datafusion_common::config::ConfigOptions::default();
+        options.funding = datafusion_common::funding::Funding::new(Arc::new(Refusing));
+        let config = OptimizerContext::new_with_config_options(Arc::new(options));
+
+        let refused = EliminateOuterJoin::new()
+            .rewrite(plan, &config)
+            .unwrap_err();
+
+        assert!(refused.refused().is_some());
+        assert!(matches!(
+            shared.as_ref(),
+            LogicalPlan::Join(Join {
+                join_type: JoinType::Left,
+                ..
+            })
+        ));
+        Ok(())
     }
 }

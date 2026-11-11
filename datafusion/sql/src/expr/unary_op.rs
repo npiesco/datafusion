@@ -38,7 +38,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             UnaryOperator::Not => {
                 let operand =
                     self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
-                let field = operand.to_field(schema)?.1;
+                let field = operand.to_field(schema, self.funding())?.1;
                 let data_type = field.data_type();
                 let bool_coercible = BinaryTypeCoercer::new(
                     data_type,
@@ -69,7 +69,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             UnaryOperator::Plus => {
                 let operand =
                     self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
-                let field = operand.to_field(schema)?.1;
+                let field = operand.to_field(schema, self.funding())?.1;
                 let data_type = field.data_type();
                 if data_type.is_numeric()
                     || is_interval(data_type)
@@ -106,7 +106,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     _ => {
                         let operand =
                             self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
-                        let field = operand.to_field(schema)?.1;
+                        let field = operand.to_field(schema, self.funding())?.1;
                         let data_type = field.data_type();
                         if data_type.is_null()
                             || is_signed_numeric(data_type)

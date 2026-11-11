@@ -19,24 +19,22 @@
 //! such as DataFrames and Views and inlines the LogicalPlan.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::analyzer::AnalyzerRule;
+use crate::funded::{
+    Freed, HashIndex, aliased, binary, column_expr, freed, nullable_cast,
+    transform_up_plan_with_subqueries,
+};
 
 use arrow::datatypes::DataType;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{
-    Column, DFSchema, Result, ScalarValue, internal_datafusion_err, plan_err,
-};
+use datafusion_common::funding::{Funding, Held};
+use datafusion_common::tree_node::{Transformed, TransformedResult};
+use datafusion_common::{DFSchema, Result, ScalarValue, internal_err, plan_err};
 use datafusion_expr::expr::{AggregateFunction, Alias};
 use datafusion_expr::logical_plan::LogicalPlan;
-use datafusion_expr::utils::grouping_set_to_exprlist;
-use datafusion_expr::{
-    Aggregate, Expr, Projection, bitwise_and, bitwise_or, bitwise_shift_left,
-    bitwise_shift_right, cast,
-};
+use datafusion_expr::{Aggregate, Expr, GroupingSet, Operator, Projection};
 use itertools::Itertools;
 
 /// Replaces grouping aggregation function with value derived from internal grouping id
@@ -50,8 +48,12 @@ impl ResolveGroupingFunction {
 }
 
 impl AnalyzerRule for ResolveGroupingFunction {
-    fn analyze(&self, plan: LogicalPlan, _: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up(analyze_internal).data()
+    fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
+        let funding = &config.funding;
+        transform_up_plan_with_subqueries(funding, plan, |plan| {
+            analyze_internal(plan, funding)
+        })
+        .data()
     }
 
     fn name(&self) -> &str {
@@ -59,118 +61,181 @@ impl AnalyzerRule for ResolveGroupingFunction {
     }
 }
 
-/// Create a map from grouping expr to index in the internal grouping id.
+/// The grouping expressions of an aggregate, each found at its index in the internal
+/// grouping id, in place of a map from each to its index.
 ///
 /// For more details on how the grouping id bitmap works the documentation for
 /// [[Aggregate::INTERNAL_GROUPING_ID]]
-fn group_expr_to_bitmap_index(group_expr: &[Expr]) -> Result<HashMap<&Expr, usize>> {
-    Ok(grouping_set_to_exprlist(group_expr)?
-        .into_iter()
-        .rev()
-        .enumerate()
-        .map(|(idx, v)| (v, idx))
-        .collect::<HashMap<_, _>>())
+struct GroupingBits<'a> {
+    exprs: &'a [&'a Expr],
+    index: HashIndex<'a, &'a Expr>,
 }
 
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
-fn replace_grouping_exprs(
-    input: Arc<LogicalPlan>,
-    schema: &DFSchema,
-    group_expr: Vec<Expr>,
-    aggr_expr: Vec<Expr>,
-) -> Result<LogicalPlan> {
-    // Create HashMap from Expr to index in the grouping_id bitmap
-    let is_grouping_set = matches!(group_expr.as_slice(), [Expr::GroupingSet(_)]);
-    let group_expr_to_bitmap_index = group_expr_to_bitmap_index(&group_expr)?;
-    let columns = schema.columns();
-    let mut new_agg_expr = Vec::new();
-    let mut projection_exprs = Vec::new();
-    let grouping_id_len = if is_grouping_set { 1 } else { 0 };
-    let group_expr_len = columns.len() - aggr_expr.len() - grouping_id_len;
-    projection_exprs.extend(
-        columns
+impl GroupingBits<'_> {
+    /// The index of `expr`'s bit in the internal grouping id.
+    fn get(&self, expr: &Expr) -> Option<usize> {
+        self.index
+            .position(expr)
+            .map(|at| self.exprs.len() - 1 - at)
+    }
+
+    /// How many distinct grouping expressions there are.
+    fn len(&self) -> usize {
+        (0..self.exprs.len())
+            .filter(|at| self.index.is_first(*at))
+            .count()
+    }
+
+    /// The distinct grouping expressions.
+    fn distinct(&self) -> impl Iterator<Item = &Expr> {
+        self.exprs
             .iter()
-            .take(group_expr_len)
-            .map(|column| Expr::Column(column.clone())),
-    );
-    for (expr, column) in aggr_expr
-        .into_iter()
-        .zip(columns.into_iter().skip(group_expr_len + grouping_id_len))
-    {
-        let grouping_id_type = is_grouping_set
-            .then(|| {
-                schema
-                    .field_with_name(None, Aggregate::INTERNAL_GROUPING_ID)
-                    .map(|f| f.data_type().clone())
-            })
-            .transpose()?;
-        match expr {
-            Expr::AggregateFunction(ref function) if is_grouping_function(&expr) => {
-                let grouping_expr = grouping_function_on_id(
-                    function,
-                    &group_expr_to_bitmap_index,
-                    grouping_id_type,
-                )?;
-                projection_exprs.push(Expr::Alias(Alias::new(
-                    grouping_expr,
-                    column.relation,
-                    column.name,
-                )));
+            .enumerate()
+            .filter(|(at, _)| self.index.is_first(*at))
+            .map(|(_, expr)| *expr)
+    }
+}
+
+/// The grouping expressions of `group_expr` ([`grouping_set_to_exprlist`]), in a list charged
+/// before it is made.
+///
+/// [`grouping_set_to_exprlist`]: datafusion_expr::utils::grouping_set_to_exprlist
+fn grouping_exprs<'a>(
+    funding: &Funding,
+    group_expr: &'a [Expr],
+) -> Result<Held<Vec<&'a Expr>>> {
+    let mut exprs = funding.held::<Vec<&Expr>>();
+    match group_expr.first() {
+        Some(Expr::GroupingSet(grouping_set)) => {
+            if group_expr.len() > 1 {
+                return plan_err!(
+                    "Invalid group by expressions, GroupingSet must be the only expression"
+                );
             }
-            Expr::Alias(Alias {
-                ref relation,
-                ref name,
-                ..
-            }) if is_grouping_function(&expr) => {
-                let function = unwrap_alias_to_grouping_function(&expr)?;
-                let grouping_expr = grouping_function_on_id(
-                    function,
-                    &group_expr_to_bitmap_index,
-                    grouping_id_type,
-                )?;
-                // Preserve the outermost user-provided alias
-                projection_exprs.push(Expr::Alias(Alias::new(
-                    grouping_expr,
-                    relation.clone(),
-                    name.clone(),
-                )));
+            match grouping_set {
+                GroupingSet::Rollup(list) | GroupingSet::Cube(list) => {
+                    exprs.reserve_exact(list.len())?;
+                    for expr in list {
+                        exprs.push(expr)?;
+                    }
+                }
+                GroupingSet::GroupingSets(groups) => {
+                    for expr in groups.iter().flatten() {
+                        if !exprs.contains(&expr) {
+                            exprs.push(expr)?;
+                        }
+                    }
+                }
             }
-            _ => {
-                projection_exprs.push(Expr::Column(column));
-                new_agg_expr.push(expr);
+        }
+        _ => {
+            let index = HashIndex::new(funding, group_expr)?;
+            for (at, expr) in group_expr.iter().enumerate() {
+                if index.is_first(at) {
+                    exprs.push(expr)?;
+                }
             }
         }
     }
+    Ok(exprs)
+}
+
+fn replace_grouping_exprs(
+    funding: &Funding,
+    input: Arc<LogicalPlan>,
+    schema: &DFSchema,
+    group_expr: Vec<Expr>,
+    mut aggr_expr: Vec<Expr>,
+) -> Result<LogicalPlan> {
+    let is_grouping_set = matches!(group_expr.as_slice(), [Expr::GroupingSet(_)]);
+    let exprs = grouping_exprs(funding, &group_expr)?;
+    let bits = GroupingBits {
+        exprs: &exprs,
+        index: HashIndex::new(funding, &exprs)?,
+    };
+    let grouping_id_len = if is_grouping_set { 1 } else { 0 };
+    let group_expr_len = schema.fields().len() - aggr_expr.len() - grouping_id_len;
+    let grouping_id_type = is_grouping_set
+        .then(|| {
+            schema
+                .field_with_name(None, Aggregate::INTERNAL_GROUPING_ID)
+                .map(|f| f.data_type())
+        })
+        .transpose()?;
+    let mut projection_exprs =
+        funding.vec_with_capacity(group_expr_len + aggr_expr.len())?;
+    for (qualifier, field) in schema.iter().take(group_expr_len) {
+        projection_exprs.push(column_expr(funding, qualifier, field.name())?);
+    }
+    for (expr, (qualifier, field)) in aggr_expr
+        .iter()
+        .zip(schema.iter().skip(group_expr_len + grouping_id_len))
+    {
+        let projected = match expr {
+            Expr::AggregateFunction(function) if is_grouping_function(expr) => {
+                let grouping_expr =
+                    grouping_function_on_id(funding, function, &bits, grouping_id_type)?;
+                aliased(funding, grouping_expr, qualifier, field.name())?
+            }
+            Expr::Alias(Alias { relation, name, .. }) if is_grouping_function(expr) => {
+                let function = unwrap_alias_to_grouping_function(expr)?;
+                let grouping_expr =
+                    grouping_function_on_id(funding, function, &bits, grouping_id_type)?;
+                // Preserve the outermost user-provided alias
+                aliased(funding, grouping_expr, relation.as_ref(), name)?
+            }
+            _ => column_expr(funding, qualifier, field.name())?,
+        };
+        projection_exprs.push(projected);
+    }
+    drop(bits);
+    drop(exprs);
+    // The grouping functions are computed by the projection: the aggregate keeps the rest,
+    // in its own list, each one dropped freed and given back.
+    aggr_expr.retain(|expr| {
+        let kept = !is_grouping_function(expr);
+        if !kept {
+            funding.discharge(expr.freed_bytes());
+        }
+        kept
+    });
     // Recreate aggregate without grouping functions
     let new_aggregate =
-        LogicalPlan::Aggregate(Aggregate::try_new(input, group_expr, new_agg_expr)?);
+        LogicalPlan::Aggregate(Aggregate::try_new(input, group_expr, aggr_expr)?);
     // Create projection with grouping functions calculations
     let projection = LogicalPlan::Projection(Projection::try_new(
         projection_exprs,
-        new_aggregate.into(),
+        funding.arc(new_aggregate)?,
+        funding,
     )?);
     Ok(projection)
 }
 
-fn analyze_internal(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-    // rewrite any subqueries in the plan first
-    let transformed_plan =
-        plan.map_subqueries(|plan| plan.transform_up(analyze_internal))?;
-
-    let transformed_plan = transformed_plan.transform_data(|plan| match plan {
+fn analyze_internal(
+    plan: LogicalPlan,
+    funding: &Funding,
+) -> Result<Transformed<LogicalPlan>> {
+    match plan {
         LogicalPlan::Aggregate(Aggregate {
             input,
             group_expr,
             aggr_expr,
             schema,
             ..
-        }) if contains_grouping_function(&aggr_expr) => Ok(Transformed::yes(
-            replace_grouping_exprs(input, schema.as_ref(), group_expr, aggr_expr)?,
-        )),
+        }) if contains_grouping_function(&aggr_expr) => {
+            let plan = replace_grouping_exprs(
+                funding,
+                input,
+                schema.as_ref(),
+                group_expr,
+                aggr_expr,
+            )?;
+            // The aggregate's schema is replaced by what the rewrite planned.
+            freed(funding, schema);
+            Ok(Transformed::yes(plan))
+        }
         _ => Ok(Transformed::no(plan)),
-    })?;
-
-    Ok(transformed_plan)
+    }
 }
 
 /// Recursively unwrap `Expr::Alias` nodes to reach the inner `AggregateFunction`.
@@ -201,35 +266,31 @@ fn contains_grouping_function(exprs: &[Expr]) -> bool {
 }
 
 /// Validate that the arguments to the grouping function are in the group by clause.
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
-fn validate_args(
-    function: &AggregateFunction,
-    group_by_expr: &HashMap<&Expr, usize>,
-) -> Result<()> {
+fn validate_args(function: &AggregateFunction, bits: &GroupingBits<'_>) -> Result<()> {
     let expr_not_in_group_by = function
         .params
         .args
         .iter()
-        .find(|expr| !group_by_expr.contains_key(expr));
+        .find(|expr| bits.get(expr).is_none());
     if let Some(expr) = expr_not_in_group_by {
         plan_err!(
             "Argument {} to grouping function is not in grouping columns {}",
             expr,
-            group_by_expr.keys().map(|e| e.to_string()).join(", ")
+            bits.distinct().map(|e| e.to_string()).join(", ")
         )
     } else {
         Ok(())
     }
 }
 
-#[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Expr contains Arc with interior mutability but is intentionally used as hash key
 fn grouping_function_on_id(
+    funding: &Funding,
     function: &AggregateFunction,
-    group_by_expr: &HashMap<&Expr, usize>,
+    bits: &GroupingBits<'_>,
     // None means not a grouping set (result is always 0).
-    grouping_id_type: Option<DataType>,
+    grouping_id_type: Option<&DataType>,
 ) -> Result<Expr> {
-    validate_args(function, group_by_expr)?;
+    validate_args(function, bits)?;
     let args = &function.params.args;
 
     // Postgres allows grouping function for group by without grouping sets, the result is then
@@ -242,56 +303,68 @@ fn grouping_function_on_id(
     // accounts for duplicate-ordinal bits that `Aggregate::grouping_id_type`
     // packs into the high bits of the column, which a simple count of grouping
     // expressions would miss.
-    let literal = |value: usize| match &grouping_id_type {
+    let literal = |value: usize| match grouping_id_type {
         DataType::UInt8 => Expr::Literal(ScalarValue::from(value as u8), None),
         DataType::UInt16 => Expr::Literal(ScalarValue::from(value as u16), None),
         DataType::UInt32 => Expr::Literal(ScalarValue::from(value as u32), None),
         DataType::UInt64 => Expr::Literal(ScalarValue::from(value as u64), None),
         other => panic!("unexpected __grouping_id type: {other}"),
     };
-    let grouping_id_column = Expr::Column(Column::from(Aggregate::INTERNAL_GROUPING_ID));
-    if args.len() == group_by_expr.len()
+    let grouping_id_column =
+        || column_expr(funding, None, Aggregate::INTERNAL_GROUPING_ID);
+    let n = bits.len();
+    if args.len() == n
         && args
             .iter()
             .rev()
             .enumerate()
-            .all(|(idx, expr)| group_by_expr.get(expr) == Some(&idx))
+            .all(|(idx, expr)| bits.get(expr) == Some(idx))
     {
-        let n = group_by_expr.len();
         // Mask the ordinal bits above position `n` so only the semantic bitmask is visible.
         // checked_shl returns None when n >= 64 (all bits are semantic), mapping to u64::MAX.
         let semantic_mask: u64 = 1u64.checked_shl(n as u32).map_or(u64::MAX, |m| m - 1);
-        let masked_id =
-            bitwise_and(grouping_id_column.clone(), literal(semantic_mask as usize));
-        return Ok(cast(masked_id, DataType::Int32));
+        let masked_id = binary(
+            funding,
+            grouping_id_column()?,
+            Operator::BitwiseAnd,
+            literal(semantic_mask as usize),
+        )?;
+        return nullable_cast(funding, masked_id, &DataType::Int32);
     }
 
-    args.iter()
-        .rev()
-        .enumerate()
-        .map(|(arg_idx, expr)| {
-            group_by_expr.get(expr).map(|group_by_idx| {
-                let group_by_bit =
-                    bitwise_and(grouping_id_column.clone(), literal(1 << group_by_idx));
-                match group_by_idx.cmp(&arg_idx) {
-                    Ordering::Less => {
-                        bitwise_shift_left(group_by_bit, literal(arg_idx - group_by_idx))
-                    }
-                    Ordering::Greater => {
-                        bitwise_shift_right(group_by_bit, literal(group_by_idx - arg_idx))
-                    }
-                    Ordering::Equal => group_by_bit,
-                }
-            })
-        })
-        .collect::<Option<Vec<_>>>()
-        .and_then(|bit_exprs| {
-            bit_exprs
-                .into_iter()
-                .reduce(bitwise_or)
-                .map(|expr| cast(expr, DataType::Int32))
-        })
-        .ok_or_else(|| {
-            internal_datafusion_err!("Grouping sets should contains at least one element")
-        })
+    let mut combined: Option<Expr> = None;
+    for (arg_idx, expr) in args.iter().rev().enumerate() {
+        let Some(group_by_idx) = bits.get(expr) else {
+            return internal_err!("Grouping sets should contains at least one element");
+        };
+        let group_by_bit = binary(
+            funding,
+            grouping_id_column()?,
+            Operator::BitwiseAnd,
+            literal(1 << group_by_idx),
+        )?;
+        let bit = match group_by_idx.cmp(&arg_idx) {
+            Ordering::Less => binary(
+                funding,
+                group_by_bit,
+                Operator::BitwiseShiftLeft,
+                literal(arg_idx - group_by_idx),
+            )?,
+            Ordering::Greater => binary(
+                funding,
+                group_by_bit,
+                Operator::BitwiseShiftRight,
+                literal(group_by_idx - arg_idx),
+            )?,
+            Ordering::Equal => group_by_bit,
+        };
+        combined = Some(match combined {
+            Some(left) => binary(funding, left, Operator::BitwiseOr, bit)?,
+            None => bit,
+        });
+    }
+    match combined {
+        Some(expr) => nullable_cast(funding, expr, &DataType::Int32),
+        None => internal_err!("Grouping sets should contains at least one element"),
+    }
 }

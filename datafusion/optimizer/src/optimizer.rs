@@ -27,19 +27,11 @@ use log::{debug, warn};
 
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::instant::Instant;
-use datafusion_common::tree_node::{
-    Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
-};
-use datafusion_common::{DFSchema, DataFusionError, HashSet, Result, internal_err};
-use datafusion_expr::dml::CopyTo;
+use datafusion_common::tree_node::{Transformed, TreeNodeRecursion};
+use datafusion_common::{DFSchema, DataFusionError, Result, internal_err};
 use datafusion_expr::logical_plan::LogicalPlan;
-use datafusion_expr::{
-    Aggregate, Analyze, CreateMemoryTable, CreateView, DdlStatement, Distinct,
-    DistinctOn, DmlStatement, Explain, Expr, Extension, Filter, Join, Limit, Projection,
-    RecursiveQuery, Repartition, Sort, Statement, Subquery, SubqueryAlias, Union, Unnest,
-    Window,
-};
 
 use crate::common_subexpr_eliminate::CommonSubexprEliminate;
 use crate::decorrelate_lateral_join::DecorrelateLateralJoin;
@@ -54,6 +46,10 @@ use crate::eliminate_outer_join::EliminateOuterJoin;
 use crate::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use crate::extract_leaf_expressions::{ExtractLeafExpressions, PushDownLeafProjections};
 use crate::filter_null_join_keys::FilterNullJoinKeys;
+use crate::funded::{
+    apply_plan, cloned_plan, freed, has_subquery_exprs, map_inputs_mut,
+    map_subqueries_mut, recomputed, with_context,
+};
 use crate::optimize_projections::OptimizeProjections;
 use crate::optimize_unions::OptimizeUnions;
 use crate::plan_signature::LogicalPlanSignature;
@@ -155,7 +151,7 @@ pub trait OptimizerConfig {
 
     /// The funding optimization charges what it allocates to: the options' own. The handle is
     /// cloned, a count bumped.
-    fn funding(&self) -> datafusion_common::funding::Funding {
+    fn funding(&self) -> Funding {
         self.options().funding.clone()
     }
 
@@ -333,274 +329,145 @@ impl Optimizer {
     }
 }
 
-/// Recursively rewrites LogicalPlans
-struct Rewriter<'a> {
-    apply_order: ApplyOrder,
-    rule: &'a dyn OptimizerRule,
-    config: &'a dyn OptimizerConfig,
-}
-
-impl<'a> Rewriter<'a> {
-    fn new(
-        apply_order: ApplyOrder,
-        rule: &'a dyn OptimizerRule,
-        config: &'a dyn OptimizerConfig,
-    ) -> Self {
-        Self {
-            apply_order,
-            rule,
-            config,
-        }
-    }
-}
-
-impl TreeNodeRewriter for Rewriter<'_> {
-    type Node = LogicalPlan;
-
-    fn f_down(&mut self, node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-        if self.apply_order == ApplyOrder::TopDown {
-            self.rule.rewrite(node, self.config)
-        } else {
-            Ok(Transformed::no(node))
-        }
-    }
-
-    fn f_up(&mut self, node: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
-        if self.apply_order == ApplyOrder::BottomUp {
-            self.rule.rewrite(node, self.config)
-        } else {
-            Ok(Transformed::no(node))
-        }
-    }
-}
-
-/// Applies `f` to each child (input) of `plan` in place, using
-/// [`Arc::make_mut`] for copy-on-write semantics on `Arc<LogicalPlan>`
-/// children. When the `Arc` refcount is 1 (the common case here)
-/// `Arc::make_mut` hands out a `&mut` without cloning; when it is >1 the
-/// inner value is cloned first.
+/// Rewrites `plan` in place with `rule`, each node in `apply_order`, and returns whether
+/// it changed and how the traversal goes on. Each shared input is copied before it is
+/// changed, the copy charged first ([`map_inputs_mut`]): an input held once is rewritten in
+/// its own block, so the traversal allocates nothing for the nodes it visits.
 ///
-/// Returns `Ok(true)` if any child was modified by `f`.
-///
-/// This is deliberately private to the optimizer rather than a method on
-/// [`LogicalPlan`]: it is an implementation detail of in-place rewriting, and
-/// the `Arc::make_mut` approach does not generalize to the other tree types
-/// (`Expr` children are `Box`ed; `PhysicalExpr`/`ExecutionPlan` children are
-/// `Arc<dyn _>`, which `Arc::make_mut` cannot handle). If `TreeNode` ever
-/// grows an in-place traversal this logic can move there.
-///
-/// # Error semantics
-///
-/// If `f` returns `Err` for a child, that error is returned immediately;
-/// children visited earlier keep whatever modifications `f` already applied
-/// to them — they are **not** rolled back.
-fn map_children_mut<F: FnMut(&mut LogicalPlan) -> Result<bool>>(
-    plan: &mut LogicalPlan,
-    mut f: F,
-) -> Result<bool> {
-    Ok(match plan {
-        LogicalPlan::Projection(Projection { input, .. })
-        | LogicalPlan::Filter(Filter { input, .. })
-        | LogicalPlan::Repartition(Repartition { input, .. })
-        | LogicalPlan::Window(Window { input, .. })
-        | LogicalPlan::Aggregate(Aggregate { input, .. })
-        | LogicalPlan::Sort(Sort { input, .. })
-        | LogicalPlan::Limit(Limit { input, .. })
-        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
-        | LogicalPlan::Analyze(Analyze { input, .. })
-        | LogicalPlan::Dml(DmlStatement { input, .. })
-        | LogicalPlan::Copy(CopyTo { input, .. })
-        | LogicalPlan::Unnest(Unnest { input, .. }) => f(Arc::make_mut(input))?,
-        LogicalPlan::Subquery(Subquery { subquery, .. }) => f(Arc::make_mut(subquery))?,
-        LogicalPlan::Join(Join { left, right, .. }) => {
-            let l = f(Arc::make_mut(left))?;
-            let r = f(Arc::make_mut(right))?;
-            l || r
-        }
-        LogicalPlan::Union(Union { inputs, .. }) => {
-            let mut changed = false;
-            for input in inputs {
-                changed |= f(Arc::make_mut(input))?;
-            }
-            changed
-        }
-        LogicalPlan::Distinct(Distinct::All(input)) => f(Arc::make_mut(input))?,
-        LogicalPlan::Distinct(Distinct::On(DistinctOn { input, .. })) => {
-            f(Arc::make_mut(input))?
-        }
-        LogicalPlan::Explain(Explain { plan, .. }) => f(Arc::make_mut(plan))?,
-        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
-            input,
-            ..
-        }))
-        | LogicalPlan::Ddl(DdlStatement::CreateView(CreateView { input, .. })) => {
-            f(Arc::make_mut(input))?
-        }
-        LogicalPlan::RecursiveQuery(RecursiveQuery {
-            static_term,
-            recursive_term,
-            ..
-        }) => {
-            let s = f(Arc::make_mut(static_term))?;
-            let r = f(Arc::make_mut(recursive_term))?;
-            s || r
-        }
-        LogicalPlan::Statement(Statement::Prepare(p)) => f(Arc::make_mut(&mut p.input))?,
-        LogicalPlan::Extension(Extension { node }) => {
-            let inputs = node.inputs();
-            if inputs.is_empty() {
-                false
-            } else {
-                // Extension nodes don't expose mutable children,
-                // fall back to the ownership-based API
-                let mut changed = false;
-                let exprs = node.expressions();
-                let new_inputs: Vec<LogicalPlan> = inputs
-                    .into_iter()
-                    .map(|input| {
-                        let mut plan = input.clone();
-                        if f(&mut plan)? {
-                            changed = true;
-                        }
-                        Ok(plan)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if changed {
-                    *node = node.with_exprs_and_inputs(exprs, new_inputs)?;
-                }
-                changed
-            }
-        }
-        // plans without inputs
-        LogicalPlan::TableScan { .. }
-        | LogicalPlan::EmptyRelation { .. }
-        | LogicalPlan::Values { .. }
-        | LogicalPlan::DescribeTable(_)
-        | LogicalPlan::Ddl(DdlStatement::CreateExternalTable(_))
-        | LogicalPlan::Ddl(DdlStatement::CreateCatalogSchema(_))
-        | LogicalPlan::Ddl(DdlStatement::CreateCatalog(_))
-        | LogicalPlan::Ddl(DdlStatement::CreateIndex(_))
-        | LogicalPlan::Ddl(DdlStatement::DropTable(_))
-        | LogicalPlan::Ddl(DdlStatement::DropView(_))
-        | LogicalPlan::Ddl(DdlStatement::DropCatalogSchema(_))
-        | LogicalPlan::Ddl(DdlStatement::CreateFunction(_))
-        | LogicalPlan::Ddl(DdlStatement::DropFunction(_))
-        | LogicalPlan::Statement(_) => false,
-    })
-}
-
-/// Rewrites a plan tree in place using `Arc::make_mut` for
-/// copy-on-write semantics on `Arc<LogicalPlan>` children.
-///
-/// This avoids the `Arc::unwrap_or_clone` + `Arc::new` cycle that the
-/// ownership-based `TreeNode::rewrite` performs at every child node.
+/// `with_subqueries`, each subquery is rewritten too (before the node's inputs), as the
+/// [`LogicalPlan::Subquery`] node holding it, and the traversal goes on as
+/// [`LogicalPlan::rewrite_with_subqueries`] does: a rule's `Jump` skips the node's
+/// subqueries and inputs, its `Stop` ends the traversal. Without, a `Stop` ends the
+/// node's subtree, and a node is given a recomputed schema once an input's has changed.
 ///
 /// # Error semantics
 ///
 /// On `Err`, `*plan` is left in an **unspecified** state and must not be used.
-/// Note this is different than consuming APIs such as [`TreeNode::rewrite`]
-/// where the original plan is freed and no longer available on error
 #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
 fn rewrite_plan_in_place(
     plan: &mut LogicalPlan,
     apply_order: ApplyOrder,
+    with_subqueries: bool,
     rule: &dyn OptimizerRule,
     config: &dyn OptimizerConfig,
-) -> Result<bool> {
-    // f_down phase
+) -> Result<(bool, TreeNodeRecursion)> {
+    let funding = config.funding();
+    // `rule.rewrite()` takes the plan by value: it is moved out, leaving
+    // `LogicalPlan::default()` (a shared empty schema, nothing allocated), and back.
     let mut changed = false;
     if apply_order == ApplyOrder::TopDown {
-        // `rule.rewrite()` takes the plan by value, so bridge the `&mut` to an
-        // owned value with `std::mem::take`. `LogicalPlan::default()` is a cheap
-        // empty placeholder (shared empty schema, no allocation) and is
-        // overwritten with the rule's output on the next line.
-        let owned = std::mem::take(plan);
-        let result = rule.rewrite(owned, config)?;
+        let result = rule.rewrite(std::mem::take(plan), config)?;
         *plan = result.data;
         changed |= result.transformed;
-        // Respect TreeNodeRecursion::Stop/Jump from the rule
-        if result.tnr == TreeNodeRecursion::Stop {
-            return Ok(changed);
+        match result.tnr {
+            TreeNodeRecursion::Stop => return Ok((changed, TreeNodeRecursion::Stop)),
+            TreeNodeRecursion::Jump if with_subqueries => {
+                return Ok((changed, TreeNodeRecursion::Continue));
+            }
+            _ => {}
         }
     }
 
+    let mut stopped = false;
+    if with_subqueries {
+        changed |= map_subqueries_mut(plan, &mut |subquery| {
+            if stopped {
+                return Ok(false);
+            }
+            let (subquery_changed, tnr) =
+                rewrite_plan_in_place(subquery, apply_order, true, rule, config)?;
+            stopped = tnr == TreeNodeRecursion::Stop;
+            Ok(subquery_changed)
+        })?;
+    }
+
     let mut child_schema_changed = false;
-    let children_changed = map_children_mut(plan, |child| {
+    changed |= map_inputs_mut(&funding, plan, &mut |child| {
+        if stopped {
+            return Ok(false);
+        }
         let old_schema = Arc::clone(child.schema());
-        let child_changed = rewrite_plan_in_place(child, apply_order, rule, config)?;
+        let (child_changed, tnr) =
+            rewrite_plan_in_place(child, apply_order, with_subqueries, rule, config)?;
+        stopped = with_subqueries && tnr == TreeNodeRecursion::Stop;
         if child_changed && old_schema.as_ref() != child.schema().as_ref() {
             child_schema_changed = true;
         }
         Ok(child_changed)
     })?;
-    changed |= children_changed;
+    if stopped {
+        return Ok((changed, TreeNodeRecursion::Stop));
+    }
 
-    if child_schema_changed {
+    if child_schema_changed && !with_subqueries {
         // Child rewrites can change their output schemas. Recompute the current
         // node before later rules use positional requirements from that schema.
-        let owned = std::mem::take(plan);
-        *plan = owned.recompute_schema()?;
+        *plan = recomputed(&funding, std::mem::take(plan))?;
     }
 
     // f_up phase
     if apply_order == ApplyOrder::BottomUp {
-        let owned = std::mem::take(plan);
-        let result = rule.rewrite(owned, config)?;
+        let result = rule.rewrite(std::mem::take(plan), config)?;
         *plan = result.data;
         changed |= result.transformed;
+        if with_subqueries && result.tnr == TreeNodeRecursion::Stop {
+            return Ok((changed, TreeNodeRecursion::Stop));
+        }
     }
 
-    Ok(changed)
+    Ok((changed, TreeNodeRecursion::Continue))
 }
 
 /// Returns true if the plan contains any subquery expressions
-/// (EXISTS, IN subquery, scalar subquery, set comparison).
+/// (EXISTS, IN subquery, scalar subquery, set comparison), found without allocating.
 ///
-/// Used to determine whether the more expensive `rewrite_with_subqueries`
-/// traversal is needed. When the plan has no subqueries, the cheaper
-/// `rewrite` traversal is sufficient since all plan nodes are reachable
-/// via direct children.
-fn plan_has_subqueries(plan: &LogicalPlan) -> bool {
+/// Used to determine whether subqueries are to be rewritten too.
+fn plan_has_subqueries(plan: &LogicalPlan, funding: &Funding) -> Result<bool> {
     let mut found = false;
-    let _ = plan.apply(|node| {
-        if found {
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        node.apply_expressions(|expr| {
-            if found {
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            expr.apply(|e| {
-                if matches!(
-                    e,
-                    Expr::Exists(_)
-                        | Expr::InSubquery(_)
-                        | Expr::SetComparison(_)
-                        | Expr::ScalarSubquery(_)
-                ) {
-                    found = true;
-                    Ok(TreeNodeRecursion::Stop)
-                } else {
-                    Ok(TreeNodeRecursion::Continue)
-                }
-            })
-        })?;
+    apply_plan(funding, plan, false, &mut |node| {
+        found = has_subquery_exprs(node);
         Ok(if found {
             TreeNodeRecursion::Stop
         } else {
             TreeNodeRecursion::Continue
         })
-    });
-    found
+    })?;
+    Ok(found)
 }
 
 impl Optimizer {
     /// Optimizes the logical plan by applying optimizer rules, and
     /// invoking observer function after each call
+    ///
+    /// What optimizing allocates is charged to the [`OptimizerConfig::funding`] before it
+    /// is allocated: the plan returned holds what is charged for it, what was freed on the
+    /// way is given back. A rule that fails and is skipped (`skip_failed_rules`) gives back
+    /// everything its attempt made. A refusal is never skipped: it is returned as it is.
+    ///
+    /// Failing, everything optimizing made is freed and given back.
     pub fn optimize<F>(
         &self,
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
+        observer: F,
+    ) -> Result<LogicalPlan>
+    where
+        F: FnMut(&LogicalPlan, &dyn OptimizerRule),
+    {
+        let funding = config.funding();
+        let before = funding.outstanding();
+        let optimized = self.optimize_passes(plan, config, &funding, observer);
+        if optimized.is_err() {
+            funding.unwound(before);
+        }
+        optimized
+    }
+
+    fn optimize_passes<F>(
+        &self,
+        plan: LogicalPlan,
+        config: &dyn OptimizerConfig,
+        funding: &Funding,
         mut observer: F,
     ) -> Result<LogicalPlan>
     where
@@ -608,107 +475,112 @@ impl Optimizer {
     {
         // verify LP is valid, before the first LP optimizer pass.
         plan.check_invariants(InvariantLevel::Executable)
-            .map_err(|e| e.context("Invalid input plan before LP Optimizers"))?;
+            .map_err(|e| with_context(e, || "Invalid input plan before LP Optimizers"))?;
 
         let start_time = Instant::now();
         let options = config.options();
         let mut new_plan = plan;
 
-        let mut previous_plans = HashSet::with_capacity(16);
-        previous_plans.insert(LogicalPlanSignature::new(&new_plan));
+        // Scratch: the signatures of the plans each pass ended with, freed with the call.
+        let mut previous_plans = funding.held::<Vec<LogicalPlanSignature>>();
+        previous_plans.reserve_exact(options.optimizer.max_passes.saturating_add(1))?;
+        previous_plans.push(LogicalPlanSignature::new(&new_plan))?;
 
         let starting_schema = Arc::clone(new_plan.schema());
 
         let mut i = 0;
         while i < options.optimizer.max_passes {
-            log_plan(&format!("Optimizer input (pass {i})"), &new_plan);
+            log_plan(format_args!("Optimizer input (pass {i})"), &new_plan);
 
             // Track subquery presence across the pass. Refresh after changed
             // rules so decorrelation can move later rules onto the in-place
             // path; that path refreshes parent schemas after child schemas
             // change.
-            let mut has_subqueries = plan_has_subqueries(&new_plan);
+            let mut has_subqueries = plan_has_subqueries(&new_plan, funding)?;
 
             for rule in &self.rules {
-                // If skipping failed rules, copy plan before attempting to rewrite
-                // as rewriting is destructive
-                let prev_plan = options
-                    .optimizer
-                    .skip_failed_rules
-                    .then(|| new_plan.clone());
-
                 let starting_schema = Arc::clone(new_plan.schema());
+
+                // If skipping failed rules, the rule is tried on a copy (its inputs shared,
+                // each copied once it is changed), as rewriting is destructive: what the
+                // attempt made is all made from here.
+                let before = funding.outstanding();
+                let (mut attempt, kept): (LogicalPlan, Option<LogicalPlan>) =
+                    if options.optimizer.skip_failed_rules {
+                        (cloned_plan(funding, &new_plan)?, Some(new_plan))
+                    } else {
+                        (new_plan, None)
+                    };
 
                 let result = match rule.apply_order() {
                     // optimizer handles recursion
                     Some(apply_order) => {
-                        if has_subqueries {
-                            // Plans with subqueries need the full
-                            // rewrite_with_subqueries traversal to
-                            // recurse into subquery plans.
-                            new_plan.rewrite_with_subqueries(
-                                &mut Rewriter::new(
-                                    apply_order,
-                                    rule.as_ref(),
-                                    config,
-                                ),
-                            )
-                        } else {
-                            // No subqueries: use in-place rewriting
-                            // with Arc::make_mut for zero-cost CoW on
-                            // children, avoiding Arc unwrap/rewrap.
-                            //
-                            // On error `new_plan` is left in an unspecified
-                            // state (see `rewrite_plan_in_place`); the result
-                            // handling below discards it, restoring `prev_plan`
-                            // when `skip_failed_rules` is set or propagating
-                            // the error otherwise.
-                            rewrite_plan_in_place(
-                                &mut new_plan,
-                                apply_order,
-                                rule.as_ref(),
-                                config,
-                            )
-                            .map(|transformed| {
-                                Transformed::new_transformed(
-                                    std::mem::take(&mut new_plan),
-                                    transformed,
-                                )
-                            })
-                        }
+                        // On error `attempt` is left in an unspecified state (see
+                        // `rewrite_plan_in_place`) and freed with the error, before the
+                        // result handling below restores the kept plan when
+                        // `skip_failed_rules` is set or propagates the error otherwise.
+                        rewrite_plan_in_place(
+                            &mut attempt,
+                            apply_order,
+                            has_subqueries,
+                            rule.as_ref(),
+                            config,
+                        )
+                        .map(move |(transformed, _)| {
+                            Transformed::new_transformed(attempt, transformed)
+                        })
                     }
                     // rule handles recursion itself
-                    None => {
-                        rule.rewrite(new_plan, config)
-                    },
+                    None => rule.rewrite(attempt, config),
                 }
                 .and_then(|tnr| {
                     // run checks optimizer invariant checks, per optimizer rule applied
-                    assert_valid_optimization(&tnr.data, &starting_schema)
-                        .map_err(|e| e.context(format!("Check optimizer-specific invariants after optimizer rule: {}", rule.name())))?;
+                    assert_valid_optimization(&tnr.data, &starting_schema).map_err(
+                        |e| {
+                            with_context(e, || {
+                                format!(
+                                    "Check optimizer-specific invariants after optimizer rule: {}",
+                                    rule.name()
+                                )
+                            })
+                        },
+                    )?;
 
                     // run LP invariant checks only in debug mode for performance reasons
                     #[cfg(debug_assertions)]
-                    tnr.data.check_invariants(InvariantLevel::Executable)
-                        .map_err(|e| e.context(format!("Invalid (non-executable) plan after Optimizer rule: {}", rule.name())))?;
+                    tnr.data
+                        .check_invariants(InvariantLevel::Executable)
+                        .map_err(|e| {
+                            with_context(e, || {
+                                format!(
+                                    "Invalid (non-executable) plan after Optimizer rule: {}",
+                                    rule.name()
+                                )
+                            })
+                        })?;
 
                     Ok(tnr)
                 });
 
                 // Handle results
-                match (result, prev_plan) {
+                match (result, kept) {
                     // OptimizerRule was successful
                     (
                         Ok(Transformed {
                             data, transformed, ..
                         }),
-                        _,
+                        kept,
                     ) => {
+                        // The plan tried on is freed: what the rewritten plan no longer
+                        // shares with it is given back.
+                        if let Some(kept) = kept {
+                            freed(funding, kept);
+                        }
                         new_plan = data;
                         observer(&new_plan, rule.as_ref());
                         if transformed {
-                            has_subqueries = plan_has_subqueries(&new_plan);
-                            log_plan(rule.name(), &new_plan);
+                            has_subqueries = plan_has_subqueries(&new_plan, funding)?;
+                            log_plan(format_args!("{}", rule.name()), &new_plan);
                         } else {
                             debug!(
                                 "Plan unchanged by optimizer rule '{}' (pass {})",
@@ -718,8 +590,12 @@ impl Optimizer {
                         }
                     }
                     // OptimizerRule was unsuccessful, but skipped failed rules is on
-                    // so use the previous plan
-                    (Err(e), Some(orig_plan)) => {
+                    // so use the kept plan, everything the attempt made given back
+                    (Err(e), Some(kept)) => {
+                        funding.unwound(before);
+                        if e.refused().is_some() {
+                            return Err(e);
+                        }
                         // Note to future readers: if you see this warning it signals a
                         // bug in the DataFusion optimizer. Please consider filing a ticket
                         // https://github.com/apache/datafusion
@@ -728,43 +604,41 @@ impl Optimizer {
                             rule.name(),
                             e
                         );
-                        new_plan = orig_plan;
+                        new_plan = kept;
                     }
                     // OptimizerRule was unsuccessful, but skipped failed rules is off, return error
                     (Err(e), None) => {
-                        return Err(e.context(format!(
-                            "Optimizer rule '{}' failed",
-                            rule.name()
-                        )));
+                        return Err(with_context(e, || {
+                            format!("Optimizer rule '{}' failed", rule.name())
+                        }));
                     }
                 }
             }
-            log_plan(&format!("Optimized plan (pass {i})"), &new_plan);
+            log_plan(format_args!("Optimized plan (pass {i})"), &new_plan);
 
-            // HashSet::insert returns, whether the value was newly inserted.
-            let plan_is_fresh =
-                previous_plans.insert(LogicalPlanSignature::new(&new_plan));
-            if !plan_is_fresh {
+            let signature = LogicalPlanSignature::new(&new_plan);
+            if previous_plans.contains(&signature) {
                 // plan did not change, so no need to continue trying to optimize
                 debug!("optimizer pass {i} did not make changes");
                 break;
             }
+            previous_plans.push(signature)?;
             i += 1;
         }
 
         // verify that the optimizer passes only mutated what was permitted.
         assert_valid_optimization(&new_plan, &starting_schema).map_err(|e| {
-            e.context("Check optimizer-specific invariants after all passes")
+            with_context(e, || "Check optimizer-specific invariants after all passes")
         })?;
 
         // verify LP is valid, after the last optimizer pass.
         new_plan
             .check_invariants(InvariantLevel::Executable)
             .map_err(|e| {
-                e.context("Invalid (non-executable) plan after LP Optimizers")
+                with_context(e, || "Invalid (non-executable) plan after LP Optimizers")
             })?;
 
-        log_plan("Final optimized plan", &new_plan);
+        log_plan(format_args!("Final optimized plan"), &new_plan);
         debug!("Optimizer took {} ms", start_time.elapsed().as_millis());
         Ok(new_plan)
     }
@@ -789,6 +663,8 @@ fn assert_valid_optimization(
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::{Funding, PlanningFunding, arc_bytes};
     use datafusion_common::tree_node::Transformed;
     use datafusion_common::{
         Column, DFSchema, DFSchemaRef, DataFusionError, Result, assert_contains, plan_err,
@@ -799,6 +675,7 @@ mod tests {
     };
 
     use crate::optimizer::Optimizer;
+    use crate::plan_signature::LogicalPlanSignature;
     use crate::test::{test_table_scan, test_table_scan_with_name};
     use crate::{OptimizerConfig, OptimizerContext, OptimizerRule};
 
@@ -898,9 +775,10 @@ mod tests {
 
         assert_eq!(plan.schema().fields().len(), 6);
 
-        let changed = super::rewrite_plan_in_place(
+        let (changed, _) = super::rewrite_plan_in_place(
             &mut plan,
             ApplyOrder::TopDown,
+            false,
             &KeepOnlyAProjectionRule {},
             &OptimizerContext::new(),
         )?;
@@ -977,7 +855,10 @@ mod tests {
             .collect::<Vec<_>>();
 
         let new_metadata = schema.metadata().clone();
-        Arc::new(DFSchema::new_with_metadata(new_fields, new_metadata).unwrap())
+        Arc::new(
+            DFSchema::new_with_metadata(&new_fields, new_metadata, &Funding::default())
+                .unwrap(),
+        )
     }
 
     fn observe(_plan: &LogicalPlan, _rule: &dyn OptimizerRule) {}
@@ -1057,7 +938,11 @@ mod tests {
             let expr = Expr::from(Column::from(projection.schema.qualified_field(0)));
 
             Ok(Transformed::yes(LogicalPlan::Projection(
-                Projection::try_new(vec![expr], Arc::clone(&projection.input))?,
+                Projection::try_new(
+                    vec![expr],
+                    Arc::clone(&projection.input),
+                    &Funding::default(),
+                )?,
             )))
         }
     }
@@ -1113,8 +998,169 @@ mod tests {
             }
 
             Ok(Transformed::yes(LogicalPlan::Projection(
-                Projection::try_new(exprs, Arc::clone(&projection.input))?,
+                Projection::try_new(
+                    exprs,
+                    Arc::clone(&projection.input),
+                    &Funding::default(),
+                )?,
             )))
         }
+    }
+
+    /// Funding of `limit` bytes, recording what it holds.
+    struct Limited {
+        limit: usize,
+        held: Mutex<usize>,
+    }
+
+    impl PlanningFunding for Limited {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if bytes > self.limit - *held {
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    fn funded(limit: usize, skip_failed_rules: bool) -> (Arc<Limited>, OptimizerContext) {
+        let source = Arc::new(Limited {
+            limit,
+            held: Mutex::new(0),
+        });
+        let mut options = ConfigOptions::default();
+        options.funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+        options.optimizer.skip_failed_rules = skip_failed_rules;
+        (
+            source,
+            OptimizerContext::new_with_config_options(Arc::new(options)),
+        )
+    }
+
+    fn held(source: &Limited) -> usize {
+        *source.held.lock().unwrap()
+    }
+
+    /// The pass signatures the optimizer holds while it runs, with the default passes.
+    fn signatures() -> usize {
+        size_of::<LogicalPlanSignature>()
+            * (ConfigOptions::default().optimizer.max_passes + 1)
+    }
+
+    /// Charges what it is given, then fails: an attempt that made something.
+    #[derive(Default, Debug)]
+    struct ChargeThenFailRule {}
+
+    impl OptimizerRule for ChargeThenFailRule {
+        fn name(&self) -> &str {
+            "charge then fail"
+        }
+
+        fn supports_rewrite(&self) -> bool {
+            true
+        }
+
+        fn rewrite(
+            &self,
+            _plan: LogicalPlan,
+            config: &dyn OptimizerConfig,
+        ) -> Result<Transformed<LogicalPlan>> {
+            config.funding().charge(100)?;
+            plan_err!("rule failed")
+        }
+    }
+
+    /// Changes nothing, visiting every node.
+    #[derive(Default, Debug)]
+    struct NoopRule {}
+
+    impl OptimizerRule for NoopRule {
+        fn name(&self) -> &str {
+            "noop"
+        }
+
+        fn apply_order(&self) -> Option<ApplyOrder> {
+            Some(ApplyOrder::BottomUp)
+        }
+
+        fn supports_rewrite(&self) -> bool {
+            true
+        }
+
+        fn rewrite(
+            &self,
+            plan: LogicalPlan,
+            _config: &dyn OptimizerConfig,
+        ) -> Result<Transformed<LogicalPlan>> {
+            Ok(Transformed::no(plan))
+        }
+    }
+
+    /// A rule skipped gives back everything its attempt made, the copy it was tried on
+    /// included: the plan kept is the one given.
+    #[test]
+    fn a_skipped_rule_gives_back_what_its_attempt_made() -> Result<()> {
+        let (source, config) = funded(1 << 20, true);
+        let plan = LogicalPlanBuilder::empty(false)
+            .project([lit(1), lit(2)])?
+            .build()?;
+        let opt = Optimizer::with_rules(vec![Arc::new(ChargeThenFailRule {})]);
+        let optimized = opt.optimize(plan.clone(), &config, observe)?;
+        assert_eq!(optimized, plan);
+        assert_eq!(held(&source), 0);
+        Ok(())
+    }
+
+    /// A refusal is not skipped: the copy a rule would be tried on is refused before it is
+    /// made, and nothing stays charged.
+    #[test]
+    fn a_refusal_is_returned_not_skipped() -> Result<()> {
+        let (source, config) = funded(signatures(), true);
+        let plan = LogicalPlanBuilder::empty(false)
+            .project([lit(1), lit(2)])?
+            .build()?;
+        let opt = Optimizer::with_rules(vec![Arc::new(ChargeThenFailRule {})]);
+        let err = opt.optimize(plan, &config, observe).unwrap_err();
+        assert_eq!(err.refused(), Some(2 * size_of::<Expr>()));
+        assert_eq!(held(&source), 0);
+        Ok(())
+    }
+
+    /// A shared input is copied once before it is rewritten, the copy charged exactly
+    /// once and held by the plan returned; one byte short, it is refused and nothing stays
+    /// charged.
+    #[test]
+    fn a_shared_input_is_copied_charged_once() -> Result<()> {
+        let input = Arc::new(
+            LogicalPlanBuilder::empty(false)
+                .project([lit(1)])?
+                .build()?,
+        );
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            vec![col("Int32(1)")],
+            Arc::clone(&input),
+            &Funding::default(),
+        )?);
+        // The input's own expression, its block, and the empty relation below it, shared
+        // once the input is copied.
+        let copies = size_of::<Expr>() + 2 * arc_bytes::<LogicalPlan>();
+        let opt = Optimizer::with_rules(vec![Arc::new(NoopRule {})]);
+
+        let (source, config) = funded(signatures() + copies, false);
+        let optimized = opt.optimize(plan.clone(), &config, observe)?;
+        assert_eq!(optimized, plan);
+        assert_eq!(held(&source), copies);
+
+        let (source, config) = funded(signatures() + copies - 1, false);
+        let err = opt.optimize(plan, &config, observe).unwrap_err();
+        assert!(err.refused().is_some());
+        assert_eq!(held(&source), 0);
+        drop(input);
+        Ok(())
     }
 }

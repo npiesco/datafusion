@@ -56,6 +56,7 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion_common::cse::{NormalizeEq, Normalizeable};
 use datafusion_common::format::{ExplainAnalyzeCategories, ExplainFormat, MetricType};
+use datafusion_common::funding::Funding;
 use datafusion_common::metadata::check_metadata_with_storage_equal;
 use datafusion_common::tree_node::{
     Transformed, TreeNode, TreeNodeContainer, TreeNodeRecursion,
@@ -67,6 +68,7 @@ use datafusion_common::{
     aggregate_functional_dependencies, assert_eq_or_internal_err, assert_or_internal_err,
     internal_err, plan_err, validate_range_split_points,
 };
+use datafusion_common::{qualified_name_is, qualified_names_equal};
 use indexmap::IndexSet;
 use itertools::Itertools as _;
 
@@ -633,7 +635,8 @@ impl LogicalPlan {
                 expr,
                 input,
                 schema: _,
-            }) => Projection::try_new(expr, input).map(LogicalPlan::Projection),
+            }) => Projection::try_new(expr, input, &Funding::default())
+                .map(LogicalPlan::Projection),
             LogicalPlan::Dml(_) => Ok(self),
             LogicalPlan::Copy(_) => Ok(self),
             LogicalPlan::Values(Values { schema, values }) => {
@@ -668,8 +671,12 @@ impl LogicalPlan {
                 null_equality,
                 null_aware,
             }) => {
-                let schema =
-                    build_join_schema(left.schema(), right.schema(), &join_type)?;
+                let schema = build_join_schema(
+                    left.schema(),
+                    right.schema(),
+                    &join_type,
+                    &Funding::default(),
+                )?;
 
                 let new_on: Vec<_> = on
                     .into_iter()
@@ -803,7 +810,8 @@ impl LogicalPlan {
             // may change. We need to use try_new method instead of try_new_with_schema method.
             LogicalPlan::Projection(Projection { .. }) => {
                 let input = self.only_input(inputs)?;
-                Projection::try_new(expr, Arc::new(input)).map(LogicalPlan::Projection)
+                Projection::try_new(expr, Arc::new(input), &Funding::default())
+                    .map(LogicalPlan::Projection)
             }
             LogicalPlan::Dml(DmlStatement {
                 table_name,
@@ -953,7 +961,12 @@ impl LogicalPlan {
                 ..
             }) => {
                 let (left, right) = self.only_two_inputs(inputs)?;
-                let schema = build_join_schema(left.schema(), right.schema(), join_type)?;
+                let schema = build_join_schema(
+                    left.schema(),
+                    right.schema(),
+                    join_type,
+                    &Funding::default(),
+                )?;
 
                 let equi_expr_count = on.len() * 2;
                 assert!(expr.len() >= equi_expr_count);
@@ -1604,7 +1617,7 @@ impl LogicalPlan {
                     // if no placeholders.
                     Ok(Transformed::no(e))
                 } else {
-                    let original_name = name_preserver.save(&e);
+                    let original_name = name_preserver.save(&e, &Funding::default())?;
                     let transformed_expr = e.transform_up(|e| {
                         if let Expr::Placeholder(Placeholder { id, .. }) = e {
                             let (value, metadata) = param_values
@@ -1616,7 +1629,8 @@ impl LogicalPlan {
                         }
                     })?;
                     // Preserve name to avoid breaking column references to this expression
-                    Ok(transformed_expr.update_data(|expr| original_name.restore(expr)))
+                    transformed_expr
+                        .map_data(|expr| original_name.restore(expr, &Funding::default()))
                 }
             })?
             .map_data(|plan| plan.update_schema_data_type())
@@ -2258,7 +2272,7 @@ impl LogicalPlan {
     /// [`LambdaVariable`]: crate::expr::LambdaVariable
     pub fn resolve_lambda_variables(self) -> Result<Transformed<LogicalPlan>> {
         self.transform_with_subqueries(|plan| {
-            let schema = merge_schema(&plan.inputs());
+            let schema = merge_schema(&plan.inputs(), &Funding::default())?;
 
             plan.map_expressions(|expr| expr.resolve_lambda_variables(&schema))
         })
@@ -2414,8 +2428,12 @@ fn recursive_query_output_schema(
         })
         .collect::<Vec<_>>();
 
-    DFSchema::new_with_metadata(fields, static_schema.metadata().clone())
-        .map(DFSchemaRef::new)
+    DFSchema::new_with_metadata(
+        &fields,
+        static_schema.metadata().clone(),
+        &Funding::default(),
+    )
+    .map(DFSchemaRef::new)
 }
 
 /// Values expression. See
@@ -2467,8 +2485,12 @@ impl PartialOrd for Projection {
 
 impl Projection {
     /// Create a new Projection
-    pub fn try_new(expr: Vec<Expr>, input: Arc<LogicalPlan>) -> Result<Self> {
-        let projection_schema = projection_schema(&input, &expr)?;
+    pub fn try_new(
+        expr: Vec<Expr>,
+        input: Arc<LogicalPlan>,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let projection_schema = projection_schema(&input, &expr, funding)?;
         Self::try_new_with_schema(expr, input, projection_schema)
     }
 
@@ -2525,18 +2547,24 @@ impl Projection {
 /// A `Result` containing an `Arc<DFSchema>` representing the schema of the result
 /// produced by the projection operation. If the schema computation is successful,
 /// the `Result` will contain the schema; otherwise, it will contain an error.
-pub fn projection_schema(input: &LogicalPlan, exprs: &[Expr]) -> Result<Arc<DFSchema>> {
-    // Preserve input schema metadata at the schema level
+pub fn projection_schema(
+    input: &LogicalPlan,
+    exprs: &[Expr],
+    funding: &Funding,
+) -> Result<Arc<DFSchema>> {
+    // Preserve input schema metadata at the schema level. A non-empty metadata map is
+    // copied uncharged: its table's size is not measured.
     let metadata = input.schema().metadata().clone();
 
     // Convert expressions to fields with Field properties determined by `Expr::to_field`
-    let schema =
-        DFSchema::new_with_metadata(exprlist_to_fields(exprs, input)?, metadata)?
-            .with_functional_dependencies(calc_func_dependencies_for_project(
-                exprs, input,
-            )?)?;
+    let fields = exprlist_to_fields(exprs, input, funding)?;
+    let schema = DFSchema::new_with_metadata(&fields, metadata, funding)?;
+    funding.released(fields);
+    let schema = schema.with_functional_dependencies(
+        calc_func_dependencies_for_project(exprs, input, funding)?,
+    )?;
 
-    Ok(Arc::new(schema))
+    funding.arc(schema)
 }
 
 /// Aliased subquery
@@ -2583,7 +2611,8 @@ impl SubqueryAlias {
                     }
                 })
                 .collect();
-            let projection = Projection::try_new(projection_expressions, plan)?;
+            let projection =
+                Projection::try_new(projection_expressions, plan, &Funding::default())?;
             Arc::new(LogicalPlan::Projection(projection))
         } else {
             plan
@@ -2598,8 +2627,12 @@ impl SubqueryAlias {
         let schema = schema.as_arrow();
 
         let schema = DFSchemaRef::new(
-            DFSchema::try_from_qualified_schema(alias.clone(), schema)?
-                .with_functional_dependencies(func_dependencies)?,
+            DFSchema::try_from_qualified_schema(
+                alias.clone(),
+                schema,
+                &Funding::default(),
+            )?
+            .with_functional_dependencies(func_dependencies)?,
         );
         Ok(SubqueryAlias {
             input: plan,
@@ -2800,7 +2833,8 @@ impl Window {
             .collect();
         let input_len = fields.len();
         let mut window_fields = fields;
-        let expr_fields = exprlist_to_fields(window_expr.as_slice(), &input)?;
+        let expr_fields =
+            exprlist_to_fields(window_expr.as_slice(), &input, &Funding::default())?;
         window_fields.extend_from_slice(expr_fields.as_slice());
         let metadata = input.schema().metadata().clone();
 
@@ -2867,8 +2901,12 @@ impl Window {
             window_expr,
             input,
             Arc::new(
-                DFSchema::new_with_metadata(window_fields, metadata)?
-                    .with_functional_dependencies(window_func_dependencies)?,
+                DFSchema::new_with_metadata(
+                    &window_fields,
+                    metadata,
+                    &Funding::default(),
+                )?
+                .with_functional_dependencies(window_func_dependencies)?,
             ),
         )
     }
@@ -3030,7 +3068,7 @@ impl TableScan {
             .with_projection(projection)
             .with_filters(filters)
             .with_fetch(fetch)
-            .build()
+            .build(&Funding::default())
     }
 }
 
@@ -3095,8 +3133,8 @@ impl TableScanBuilder {
     }
 
     /// Build the [`TableScan`], deriving its `projected_schema` from the
-    /// source schema and projection.
-    pub fn build(self) -> Result<TableScan> {
+    /// source schema and projection, all it allocates charged to `funding` before it is made.
+    pub fn build(self, funding: &Funding) -> Result<TableScan> {
         let TableScanBuilder {
             table_name,
             source,
@@ -3113,29 +3151,31 @@ impl TableScanBuilder {
         let func_dependencies = FunctionalDependencies::new_from_constraints(
             source.constraints(),
             schema.fields.len(),
-        );
-        let projected_schema = projection
-            .as_ref()
-            .map(|p| {
-                let projected_func_dependencies =
-                    func_dependencies.project_functional_dependencies(p, p.len());
-
+            funding,
+        )?;
+        let projected_schema = match projection.as_ref() {
+            Some(p) => {
+                let projected_func_dependencies = func_dependencies
+                    .project_functional_dependencies(p, p.len(), funding)?;
+                funding.released_clone(func_dependencies);
+                let mut qualified_fields = funding.vec_with_capacity(p.len())?;
+                qualified_fields.extend(p.iter().map(|i| {
+                    (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
+                }));
                 let df_schema = DFSchema::new_with_metadata(
-                    p.iter()
-                        .map(|i| {
-                            (Some(table_name.clone()), Arc::clone(&schema.fields()[*i]))
-                        })
-                        .collect(),
+                    &qualified_fields,
                     schema.metadata.clone(),
+                    funding,
                 )?;
+                funding.released(qualified_fields);
                 df_schema.with_functional_dependencies(projected_func_dependencies)
-            })
-            .unwrap_or_else(|| {
-                let df_schema =
-                    DFSchema::try_from_qualified_schema(table_name.clone(), &schema)?;
-                df_schema.with_functional_dependencies(func_dependencies)
-            })?;
-        let projected_schema = Arc::new(projected_schema);
+            }
+            None => {
+                DFSchema::try_from_qualified_schema(table_name.clone(), &schema, funding)?
+                    .with_functional_dependencies(func_dependencies)
+            }
+        }?;
+        let projected_schema = funding.arc(projected_schema)?;
 
         Ok(TableScan {
             table_name,
@@ -3330,7 +3370,11 @@ impl Union {
         );
 
         // Functional Dependencies are not preserved after UNION operation
-        let schema = DFSchema::new_with_metadata(union_fields, union_schema_metadata)?;
+        let schema = DFSchema::new_with_metadata(
+            &union_fields,
+            union_schema_metadata,
+            &Funding::default(),
+        )?;
         let schema = Arc::new(schema);
 
         Ok(schema)
@@ -3402,13 +3446,17 @@ impl Union {
                 field.set_metadata(field_metadata);
                 Ok((None, Arc::new(field)))
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let union_schema_metadata = intersect_metadata_for_union(
             inputs.iter().map(|input| input.schema().metadata()),
         );
 
         // Functional Dependencies are not preserved after UNION operation
-        let schema = DFSchema::new_with_metadata(union_fields, union_schema_metadata)?;
+        let schema = DFSchema::new_with_metadata(
+            &union_fields,
+            union_schema_metadata,
+            &Funding::default(),
+        )?;
         let schema = Arc::new(schema);
 
         Ok(schema)
@@ -3786,13 +3834,15 @@ impl DistinctOn {
         }
 
         let on_expr = normalize_cols(on_expr, input.as_ref())?;
-        let qualified_fields = exprlist_to_fields(select_expr.as_slice(), &input)?
-            .into_iter()
-            .collect();
+        let qualified_fields: Vec<_> =
+            exprlist_to_fields(select_expr.as_slice(), &input, &Funding::default())?
+                .into_iter()
+                .collect();
 
         let dfschema = DFSchema::new_with_metadata(
-            qualified_fields,
+            &qualified_fields,
             input.schema().metadata().clone(),
+            &Funding::default(),
         )?;
 
         let mut distinct_on = DistinctOn {
@@ -3916,7 +3966,8 @@ impl Aggregate {
 
         let grouping_expr: Vec<&Expr> = grouping_set_to_exprlist(group_expr.as_slice())?;
 
-        let mut qualified_fields = exprlist_to_fields(grouping_expr, &input)?;
+        let mut qualified_fields =
+            exprlist_to_fields(grouping_expr, &input, &Funding::default())?;
 
         // Even columns that cannot be null will become nullable when used in a grouping set.
         if is_grouping_set {
@@ -3936,11 +3987,16 @@ impl Aggregate {
             ));
         }
 
-        qualified_fields.extend(exprlist_to_fields(aggr_expr.as_slice(), &input)?);
+        qualified_fields.extend(exprlist_to_fields(
+            aggr_expr.as_slice(),
+            &input,
+            &Funding::default(),
+        )?);
 
         let schema = DFSchema::new_with_metadata(
-            qualified_fields,
+            &qualified_fields,
             input.schema().metadata().clone(),
+            &Funding::default(),
         )?;
 
         Self::try_new_with_schema(input, group_expr, aggr_expr, Arc::new(schema))
@@ -4153,66 +4209,63 @@ fn calc_func_dependencies_for_aggregate(
 fn calc_func_dependencies_for_project(
     exprs: &[Expr],
     input: &LogicalPlan,
+    funding: &Funding,
 ) -> Result<FunctionalDependencies> {
     // Sentinel for projection outputs that do not map back to any input field.
     const COMPUTED_EXPR_INDEX: usize = usize::MAX;
 
-    let input_fields = input.schema().field_names();
+    let input_schema = input.schema();
+    // The input column an expression displayed as `text` is, its display made through
+    // `funding` and freed once it is looked up.
+    let input_index = |text: String| {
+        let index = input_schema
+            .iter()
+            .position(|(qualifier, field)| {
+                qualified_name_is(qualifier, field.name(), &text)
+            })
+            .unwrap_or(COMPUTED_EXPR_INDEX);
+        funding.released(text);
+        index
+    };
     // Map each projection output position to its input column index.
     // A projection expression can produce multiple output columns, such as `*`.
-    let proj_indices = exprs
-        .iter()
-        .map(|expr| match expr {
+    let mut proj_indices = funding.vec_with_capacity(exprs.len())?;
+    for expr in exprs {
+        match expr {
             #[expect(deprecated)]
-            Expr::Wildcard { qualifier, options } => {
-                let wildcard_fields = exprlist_to_fields(
-                    vec![&Expr::Wildcard {
-                        qualifier: qualifier.clone(),
-                        options: options.clone(),
-                    }],
-                    input,
-                )?;
-                Ok::<_, DataFusionError>(
-                    wildcard_fields
-                        .into_iter()
-                        .map(|(qualifier, f)| {
-                            let flat_name = qualifier
-                                .map(|t| format!("{}.{}", t, f.name()))
-                                .unwrap_or_else(|| f.name().clone());
-                            input_fields
-                                .iter()
-                                .position(|item| *item == flat_name)
-                                .unwrap_or(COMPUTED_EXPR_INDEX)
+            Expr::Wildcard { .. } => {
+                let wildcard_fields =
+                    exprlist_to_fields(std::slice::from_ref(expr), input, funding)?;
+                for (qualifier, f) in &wildcard_fields {
+                    let index = input_schema
+                        .iter()
+                        .position(|(input_qualifier, input_field)| {
+                            qualified_names_equal(
+                                (qualifier.as_ref(), f.name()),
+                                (input_qualifier, input_field.name()),
+                            )
                         })
-                        .collect::<Vec<_>>(),
-                )
+                        .unwrap_or(COMPUTED_EXPR_INDEX);
+                    funding.push(&mut proj_indices, index)?;
+                }
+                funding.released(wildcard_fields);
             }
             Expr::Alias(alias) => {
-                let name = format!("{}", alias.expr);
-                let input_index = input_fields
-                    .iter()
-                    .position(|item| *item == name)
-                    .unwrap_or(COMPUTED_EXPR_INDEX);
-                Ok(vec![input_index])
+                let index = input_index(funding.format(format_args!("{}", alias.expr))?);
+                funding.push(&mut proj_indices, index)?;
             }
             _ => {
-                let name = format!("{expr}");
-                let input_index = input_fields
-                    .iter()
-                    .position(|item| *item == name)
-                    .unwrap_or(COMPUTED_EXPR_INDEX);
-                Ok(vec![input_index])
+                let index = input_index(funding.format(format_args!("{expr}"))?);
+                funding.push(&mut proj_indices, index)?;
             }
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+        }
+    }
 
-    Ok(input
-        .schema()
+    let func_dependencies = input_schema
         .functional_dependencies()
-        .project_functional_dependencies(&proj_indices, exprs.len()))
+        .project_functional_dependencies(&proj_indices, exprs.len(), funding)?;
+    funding.released(proj_indices);
+    Ok(func_dependencies)
 }
 
 /// Sorts its input according to a list of sort expressions.
@@ -4271,6 +4324,7 @@ impl Join {
     /// * `join_constraint` - Join constraint (On, Using)
     /// * `null_equality` - How to handle nulls in join comparisons
     /// * `null_aware` - Whether this is a null-aware anti join (for NOT IN semantics)
+    /// * `funding` - What the schema and its node are charged to before they are allocated
     ///
     /// # Returns
     ///
@@ -4285,8 +4339,10 @@ impl Join {
         join_constraint: JoinConstraint,
         null_equality: NullEquality,
         null_aware: bool,
+        funding: &Funding,
     ) -> Result<Self> {
-        let join_schema = build_join_schema(left.schema(), right.schema(), &join_type)?;
+        let join_schema =
+            build_join_schema(left.schema(), right.schema(), &join_type, funding)?;
 
         Ok(Join {
             left,
@@ -4295,7 +4351,7 @@ impl Join {
             filter,
             join_type,
             join_constraint,
-            schema: Arc::new(join_schema),
+            schema: funding.arc(join_schema)?,
             null_equality,
             null_aware,
         })
@@ -4341,6 +4397,7 @@ impl Join {
             left_sch.schema(),
             right_sch.schema(),
             &original_join.join_type,
+            &Funding::default(),
         )?;
 
         Ok((
@@ -4808,7 +4865,8 @@ impl Unnest {
             .collect::<Vec<_>>();
 
         let metadata = input_schema.metadata().clone();
-        let df_schema = DFSchema::new_with_metadata(fields, metadata)?;
+        let df_schema =
+            DFSchema::new_with_metadata(&fields, metadata, &Funding::default())?;
         // We can use the existing functional dependencies:
         let deps = input_schema.functional_dependencies().clone();
         let schema = Arc::new(df_schema.with_functional_dependencies(deps)?);
@@ -4972,14 +5030,15 @@ mod tests {
             LogicalTableSource::new(Arc::new(employee_schema()))
                 .with_constraints(constraints),
         );
-        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
-            .project(vec![
-                lit(1i32).alias("__common_expr_1"),
-                col("id"),
-                col("first_name"),
-                col("salary"),
-            ])?
-            .build()?;
+        let plan =
+            LogicalPlanBuilder::scan("employee_csv", source, None, &Funding::default())?
+                .project(vec![
+                    lit(1i32).alias("__common_expr_1"),
+                    col("id"),
+                    col("first_name"),
+                    col("salary"),
+                ])?
+                .build()?;
 
         let deps = plan.schema().functional_dependencies();
         assert_eq!(deps.len(), 1);
@@ -4996,12 +5055,13 @@ mod tests {
             LogicalTableSource::new(Arc::new(employee_schema()))
                 .with_constraints(constraints),
         );
-        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
-            .project(vec![
-                SelectExpr::Expression(lit(1i32).alias("__common_expr_1")),
-                SelectExpr::Wildcard(Default::default()),
-            ])?
-            .build()?;
+        let plan =
+            LogicalPlanBuilder::scan("employee_csv", source, None, &Funding::default())?
+                .project(vec![
+                    SelectExpr::Expression(lit(1i32).alias("__common_expr_1")),
+                    SelectExpr::Wildcard(Default::default()),
+                ])?
+                .build()?;
 
         let deps = plan.schema().functional_dependencies();
         assert_eq!(plan.schema().fields().len(), 6);
@@ -5020,7 +5080,9 @@ mod tests {
             LogicalTableSource::new(Arc::new(employee_schema()))
                 .with_constraints(constraints),
         );
-        let input = LogicalPlanBuilder::scan("employee_csv", source, None)?.build()?;
+        let input =
+            LogicalPlanBuilder::scan("employee_csv", source, None, &Funding::default())?
+                .build()?;
         #[expect(deprecated)]
         let projection = Projection::try_new(
             vec![
@@ -5031,6 +5093,7 @@ mod tests {
                 col("employee_csv.id"),
             ],
             Arc::new(input),
+            &Funding::default(),
         )?;
 
         let deps = projection.schema.functional_dependencies();
@@ -5875,6 +5938,7 @@ mod tests {
             DFSchema::try_from_qualified_schema(
                 TableReference::bare("tab"),
                 &source.schema(),
+                &Funding::default(),
             )
             .unwrap(),
         );
@@ -5905,7 +5969,9 @@ mod tests {
                             vec![0],
                         )])),
                         1,
-                    ),
+                        &Funding::default(),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
         );
@@ -6232,8 +6298,10 @@ mod tests {
                 Field::new("b", DataType::Int32, false),
             ]);
 
-            let left_schema = DFSchema::try_from_qualified_schema("t1", &schema)?;
-            let right_schema = DFSchema::try_from_qualified_schema("t2", &schema)?;
+            let left_schema =
+                DFSchema::try_from_qualified_schema("t1", &schema, &Funding::default())?;
+            let right_schema =
+                DFSchema::try_from_qualified_schema("t2", &schema, &Funding::default())?;
 
             Ok(LogicalPlan::Join(Join {
                 left: Arc::new(
@@ -6361,6 +6429,7 @@ mod tests {
                 JoinConstraint::On,
                 NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )?;
 
             match join_type {
@@ -6507,6 +6576,7 @@ mod tests {
                 JoinConstraint::Using,
                 NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )?;
 
             let fields = join.schema.fields();
@@ -6559,6 +6629,7 @@ mod tests {
                 JoinConstraint::On,
                 NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )?;
 
             let fields = join.schema.fields();
@@ -6609,6 +6680,7 @@ mod tests {
                 JoinConstraint::On,
                 NullEquality::NullEqualsNull,
                 false,
+                &Funding::default(),
             )?;
 
             assert_eq!(join.null_equality, NullEquality::NullEqualsNull);
@@ -6652,6 +6724,7 @@ mod tests {
                 JoinConstraint::On,
                 NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )?;
 
             let fields = join.schema.fields();
@@ -6692,6 +6765,7 @@ mod tests {
             JoinConstraint::Using,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
 
         assert_eq!(

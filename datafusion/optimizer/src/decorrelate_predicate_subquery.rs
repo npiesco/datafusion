@@ -2033,6 +2033,7 @@ mod tests {
             subquery_table_source,
             None,
             vec![],
+            &datafusion_common::funding::Funding::default(),
         )?
         .unnest_column("arr")?
         .build()?;
@@ -2068,6 +2069,7 @@ mod tests {
             subquery_table_source,
             None,
             vec![],
+            &datafusion_common::funding::Funding::default(),
         )?
         .unnest_column("a")?
         .filter(col("a").eq(out_ref_col(DataType::UInt32, "test.b")))?

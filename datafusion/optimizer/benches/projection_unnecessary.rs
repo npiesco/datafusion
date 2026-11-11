@@ -35,7 +35,11 @@ fn is_projection_unnecessary_old(
     {
         return Ok(false);
     }
-    let proj_schema = projection_schema(input, proj_exprs)?;
+    let proj_schema = projection_schema(
+        input,
+        proj_exprs,
+        &datafusion_common::funding::Funding::default(),
+    )?;
     Ok(&proj_schema == input.schema())
 }
 

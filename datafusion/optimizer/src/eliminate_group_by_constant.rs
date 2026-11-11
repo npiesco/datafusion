@@ -17,14 +17,14 @@
 
 //! [`EliminateGroupByConstant`] removes constant and functionally redundant
 //! expressions from `GROUP BY` clause
+use crate::funded::HashIndex;
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
-use std::collections::HashSet;
-
-use datafusion_common::Result;
 use datafusion_common::tree_node::Transformed;
-use datafusion_expr::{Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Volatility};
+use datafusion_common::{Column, Result};
+use datafusion_expr::logical_plan::builder::project;
+use datafusion_expr::{Aggregate, Expr, LogicalPlan, Volatility};
 
 /// Optimizer rule that removes constant expressions from `GROUP BY` clause
 /// and places additional projection on top of aggregation, to preserve
@@ -46,24 +46,39 @@ impl OptimizerRule for EliminateGroupByConstant {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Aggregate(aggregate) => {
-                // Collect bare column references in GROUP BY
-                let group_by_columns: HashSet<&datafusion_common::Column> = aggregate
-                    .group_expr
-                    .iter()
-                    .filter_map(|expr| match expr {
-                        Expr::Column(c) => Some(c),
-                        _ => None,
-                    })
-                    .collect();
-
-                let (redundant, required): (Vec<_>, Vec<_>) = aggregate
-                    .group_expr
-                    .iter()
-                    .partition(|expr| is_redundant_group_expr(expr, &group_by_columns));
+                let funding = config.funding();
+                let redundant =
+                    {
+                        // Bare column references in GROUP BY
+                        let mut group_by_columns = funding.held::<Vec<&Column>>();
+                        group_by_columns.reserve_exact(
+                            aggregate
+                                .group_expr
+                                .iter()
+                                .filter(|expr| matches!(expr, Expr::Column(_)))
+                                .count(),
+                        )?;
+                        // Room for each is charged: extending allocates nothing.
+                        group_by_columns.extend(aggregate.group_expr.iter().filter_map(
+                            |expr| match expr {
+                                Expr::Column(c) => Some(c),
+                                _ => None,
+                            },
+                        ));
+                        let group_by_columns =
+                            HashIndex::new(&funding, &group_by_columns)?;
+                        let mut redundant = funding.held::<Vec<bool>>();
+                        redundant.reserve_exact(aggregate.group_expr.len())?;
+                        redundant.extend(aggregate.group_expr.iter().map(|expr| {
+                            is_redundant_group_expr(expr, &group_by_columns)
+                        }));
+                        redundant
+                    };
+                let redundant_count = redundant.iter().filter(|r| **r).count();
                 // Return now if no simplification can be done. We also bail out
                 // if applying the optimization would eliminate all of the
                 // grouping expressions (e.g., GROUP BY on only constant
@@ -71,22 +86,36 @@ impl OptimizerRule for EliminateGroupByConstant {
                 // ungrouped aggregate, which changes query semantics (grouped
                 // aggregates produce an empty result set on an empty input,
                 // whereas ungrouped aggregates return a single row).
-                if redundant.is_empty() || required.is_empty() {
+                if redundant_count == 0 || redundant_count == aggregate.group_expr.len() {
                     return Ok(Transformed::no(LogicalPlan::Aggregate(aggregate)));
                 }
 
+                let mut required = funding
+                    .vec_with_capacity(aggregate.group_expr.len() - redundant_count)?;
+                for (expr, redundant) in aggregate.group_expr.iter().zip(redundant.iter())
+                {
+                    if !redundant {
+                        // Room for each is charged: pushing allocates nothing.
+                        required.push(funding.cloned(expr)?);
+                    }
+                }
+                drop(redundant);
                 let simplified_aggregate = LogicalPlan::Aggregate(Aggregate::try_new(
                     aggregate.input,
-                    required.into_iter().cloned().collect(),
-                    aggregate.aggr_expr.clone(),
+                    required,
+                    funding.to_vec(&aggregate.aggr_expr)?,
                 )?);
 
-                let projection_expr =
-                    aggregate.group_expr.into_iter().chain(aggregate.aggr_expr);
-
-                let projection = LogicalPlanBuilder::from(simplified_aggregate)
-                    .project(projection_expr)?
-                    .build()?;
+                let (mut group_expr, mut aggr_expr) =
+                    (aggregate.group_expr, aggregate.aggr_expr);
+                let projection = project(
+                    simplified_aggregate,
+                    group_expr.drain(..).chain(aggr_expr.drain(..)),
+                    &funding,
+                )?;
+                // The lists the expressions were moved out of are given back.
+                funding.released(group_expr);
+                funding.released(aggr_expr);
 
                 Ok(Transformed::yes(projection))
             }
@@ -107,10 +136,7 @@ impl OptimizerRule for EliminateGroupByConstant {
 /// changing grouping semantics). An expression is redundant if it is a
 /// deterministic function of constants and columns already present as bare
 /// column references in the GROUP BY.
-fn is_redundant_group_expr(
-    expr: &Expr,
-    group_by_columns: &HashSet<&datafusion_common::Column>,
-) -> bool {
+fn is_redundant_group_expr(expr: &Expr, group_by_columns: &HashIndex<&Column>) -> bool {
     // Bare column references are never redundant - they define the grouping
     if matches!(expr, Expr::Column(_)) {
         return false;
@@ -120,10 +146,7 @@ fn is_redundant_group_expr(
 
 /// Returns true if `expr` is a deterministic expression whose only column
 /// references are contained in `known_columns`.
-fn is_deterministic_of(
-    expr: &Expr,
-    known_columns: &HashSet<&datafusion_common::Column>,
-) -> bool {
+fn is_deterministic_of(expr: &Expr, known_columns: &HashIndex<&Column>) -> bool {
     match expr {
         Expr::Alias(e) => is_deterministic_of(&e.expr, known_columns),
         Expr::Column(c) => known_columns.contains(c),
@@ -352,5 +375,33 @@ mod tests {
         Aggregate: groupBy=[[scalar_fn_mock(UInt32(123)), test.a]], aggr=[[count(test.c)]]
           TableScan: test
         ")
+    }
+
+    /// Funding refusing everything.
+    struct Refusing;
+
+    impl datafusion_common::funding::PlanningFunding for Refusing {
+        fn charge(&self, _bytes: usize) -> bool {
+            false
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn eliminating_a_constant_is_refused_unfunded() -> Result<()> {
+        let plan = LogicalPlanBuilder::from(test_table_scan()?)
+            .aggregate(vec![col("a"), lit(1u32)], vec![count(col("c"))])?
+            .build()?;
+        let mut options = datafusion_common::config::ConfigOptions::default();
+        options.funding = datafusion_common::funding::Funding::new(Arc::new(Refusing));
+        let config = OptimizerContext::new_with_config_options(Arc::new(options));
+
+        let refused = EliminateGroupByConstant::new()
+            .rewrite(plan, &config)
+            .unwrap_err();
+
+        assert!(refused.refused().is_some());
+        Ok(())
     }
 }

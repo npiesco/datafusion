@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, internal_err, tree_node::Transformed};
-use datafusion_expr::{Expr, Operator, and, lit, or};
+use datafusion_expr::{Expr, Operator, lit};
 use datafusion_expr_common::interval_arithmetic::Interval;
+
+use crate::funded::{Freed, binary, conjoined, disjoined, freed};
 
 /// Rewrites a binary expression using its "preimage"
 ///
@@ -25,42 +28,76 @@ use datafusion_expr_common::interval_arithmetic::Interval;
 /// x`) where `<expr>` is known to have a pre-image (aka the entire single
 /// range for which it is valid) and `x` is not `NULL`
 ///
+/// Each box and copy of `expr` the rewrite makes is charged to `f` before it is made; the
+/// interval's bounds are moved into it. The interval is the preimage's, never charged.
+///
 /// For details see [`datafusion_expr::ScalarUDFImpl::preimage`]
 pub(super) fn rewrite_with_preimage(
+    f: &Funding,
     preimage_interval: Interval,
     op: Operator,
     expr: Expr,
 ) -> Result<Transformed<Expr>> {
     let (lower, upper) = preimage_interval.into_bounds();
     let (lower, upper) = (lit(lower), lit(upper));
+    // The bounds came with the preimage, made without funding: charged now they are kept.
+    f.charge(lower.freed_bytes().saturating_add(upper.freed_bytes()))?;
 
     let rewritten_expr = match op {
         // <expr> < x   ==>  <expr> < lower
-        Operator::Lt => expr.lt(lower),
+        Operator::Lt => {
+            freed(f, upper);
+            binary(f, expr, Operator::Lt, lower)?
+        }
         // <expr> >= x  ==>  <expr> >= lower
-        Operator::GtEq => expr.gt_eq(lower),
+        Operator::GtEq => {
+            freed(f, upper);
+            binary(f, expr, Operator::GtEq, lower)?
+        }
         // <expr> > x ==> <expr> >= upper
-        Operator::Gt => expr.gt_eq(upper),
+        Operator::Gt => {
+            freed(f, lower);
+            binary(f, expr, Operator::GtEq, upper)?
+        }
         // <expr> <= x ==> <expr> < upper
-        Operator::LtEq => expr.lt(upper),
+        Operator::LtEq => {
+            freed(f, lower);
+            binary(f, expr, Operator::Lt, upper)?
+        }
         // <expr> = x ==> (<expr> >= lower) and (<expr> < upper)
-        Operator::Eq => and(expr.clone().gt_eq(lower), expr.lt(upper)),
+        Operator::Eq => conjoined(
+            f,
+            binary(f, f.cloned(&expr)?, Operator::GtEq, lower)?,
+            binary(f, expr, Operator::Lt, upper)?,
+        )?,
         // <expr> != x ==> (<expr> < lower) or (<expr> >= upper)
-        Operator::NotEq => or(expr.clone().lt(lower), expr.gt_eq(upper)),
+        Operator::NotEq => disjoined(
+            f,
+            binary(f, f.cloned(&expr)?, Operator::Lt, lower)?,
+            binary(f, expr, Operator::GtEq, upper)?,
+        )?,
         // <expr> is not distinct from x ==> (<expr> is NULL and x is NULL) or ((<expr> >= lower) and (<expr> < upper))
         // but since x is always not NULL => (<expr> is not NULL) and (<expr> >= lower) and (<expr> < upper)
-        Operator::IsNotDistinctFrom => expr
-            .clone()
-            .is_not_null()
-            .and(expr.clone().gt_eq(lower))
-            .and(expr.lt(upper)),
+        Operator::IsNotDistinctFrom => {
+            let not_null = Expr::IsNotNull(f.boxed(f.cloned(&expr)?)?);
+            let at_least = binary(f, f.cloned(&expr)?, Operator::GtEq, lower)?;
+            conjoined(
+                f,
+                conjoined(f, not_null, at_least)?,
+                binary(f, expr, Operator::Lt, upper)?,
+            )?
+        }
         // <expr> is distinct from x ==> (<expr> < lower) or (<expr> >= upper) or (<expr> is NULL and x is not NULL) or (<expr> is not NULL and x is NULL)
         // but given that x is always not NULL => (<expr> < lower) or (<expr> >= upper) or (<expr> is NULL)
-        Operator::IsDistinctFrom => expr
-            .clone()
-            .lt(lower)
-            .or(expr.clone().gt_eq(upper))
-            .or(expr.is_null()),
+        Operator::IsDistinctFrom => {
+            let below = binary(f, f.cloned(&expr)?, Operator::Lt, lower)?;
+            let at_least = binary(f, f.cloned(&expr)?, Operator::GtEq, upper)?;
+            disjoined(
+                f,
+                disjoined(f, below, at_least)?,
+                Expr::IsNull(f.boxed(expr)?),
+            )?
+        }
         _ => return internal_err!("Expect comparison operators"),
     };
     Ok(Transformed::yes(rewritten_expr))

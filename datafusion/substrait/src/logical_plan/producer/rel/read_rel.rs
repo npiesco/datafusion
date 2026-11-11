@@ -85,6 +85,7 @@ pub fn from_table_scan(
             DFSchema::try_from_qualified_schema(
                 scan.table_name.clone(),
                 &(scan.source.schema()),
+                &datafusion::common::funding::Funding::default(),
             )
             .unwrap(),
         );

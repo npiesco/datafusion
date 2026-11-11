@@ -51,17 +51,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(vec![]);
         }
 
-        let mut combined_schema;
-        let order_by_schema = match additional_schema {
-            Some(schema) => {
-                combined_schema = input_schema.clone();
-                combined_schema.merge(schema);
-                &combined_schema
-            }
-            None => input_schema,
-        };
+        let funding = self.funding();
+        let merged = additional_schema
+            .map(|schema| input_schema.merge(schema, funding))
+            .transpose()?;
+        let order_by_schema = merged.as_ref().unwrap_or(input_schema);
 
-        let mut sort_expr_vec = Vec::with_capacity(order_by_exprs.len());
+        let mut sort_expr_vec = funding.vec_with_capacity(order_by_exprs.len())?;
 
         let make_sort_expr = |expr: Expr,
                               asc: Option<bool>,
@@ -104,8 +100,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         );
                     }
 
-                    Expr::Column(Column::from(
-                        input_schema.qualified_field(field_index - 1),
+                    let (qualifier, field) =
+                        input_schema.qualified_field(field_index - 1);
+                    Expr::Column(Column::new(
+                        qualifier.cloned(),
+                        funding.string(field.name())?,
                     ))
                 }
                 e => {
@@ -118,9 +117,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     expr
                 }
             };
-            sort_expr_vec.push(make_sort_expr(expr, asc, nulls_first));
+            funding.push(&mut sort_expr_vec, make_sort_expr(expr, asc, nulls_first))?;
         }
 
+        if let Some(merged) = merged {
+            merged.released(funding);
+        }
         Ok(sort_expr_vec)
     }
 }

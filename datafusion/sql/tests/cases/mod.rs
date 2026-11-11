@@ -17,5 +17,6 @@
 
 mod collection;
 mod diagnostic;
+mod funding;
 mod params;
 mod plan_to_sql;

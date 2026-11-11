@@ -1790,8 +1790,13 @@ impl SessionContext {
     pub fn read_table(&self, provider: Arc<dyn TableProvider>) -> Result<DataFrame> {
         Ok(DataFrame::new(
             self.state(),
-            LogicalPlanBuilder::scan(UNNAMED_TABLE, provider_as_source(provider), None)?
-                .build()?,
+            LogicalPlanBuilder::scan(
+                UNNAMED_TABLE,
+                provider_as_source(provider),
+                None,
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .build()?,
         ))
     }
 
@@ -1804,6 +1809,7 @@ impl SessionContext {
                 UNNAMED_TABLE,
                 provider_as_source(Arc::new(provider)),
                 None,
+                &datafusion_common::funding::Funding::default(),
             )?
             .build()?,
         ))
@@ -1827,6 +1833,7 @@ impl SessionContext {
                 UNNAMED_TABLE,
                 provider_as_source(Arc::new(provider)),
                 None,
+                &datafusion_common::funding::Funding::default(),
             )?
             .build()?,
         ))
@@ -2001,6 +2008,7 @@ impl SessionContext {
             table_ref,
             provider_as_source(Arc::clone(&provider)),
             None,
+            &datafusion_common::funding::Funding::default(),
         )?
         .build()?;
         Ok(DataFrame::new(self.state(), plan))

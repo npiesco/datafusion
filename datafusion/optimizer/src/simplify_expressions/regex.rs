@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::Transformed;
 use datafusion_common::{DataFusionError, Result, ScalarValue};
+use datafusion_expr::expr::InList;
 use datafusion_expr::{BinaryExpr, Expr, Like, Operator, lit};
 use regex_syntax::hir::{Capture, Hir, HirKind, Literal, Look};
 
+use crate::funded::{conjoined, disjoined, freed, replaced};
 use crate::simplify_expressions::expr_simplifier::StringScalar;
 
 /// Maximum number of regex alternations (`foo|bar|...`) that will be expanded into multiple `LIKE` expressions.
@@ -41,8 +44,13 @@ const ANY_CHAR_REGEX_PATTERN: &str = ".*";
 /// - `EQ .*` to NotNull
 /// - `NE .*` to col IS NULL AND Boolean(NULL) (false for any string, or NULL if col is NULL)
 ///
+/// Each expression made is charged to `f` before it is allocated, and what the rewrite
+/// frees is given back. What parsing the pattern allocates is `regex_syntax`'s, not
+/// charged.
+///
 /// Dev note: unit tests of this function are in `expr_simplifier.rs`, case `test_simplify_regex`.
 pub fn simplify_regex_expr(
+    f: &Funding,
     left: Box<Expr>,
     op: Operator,
     right: Box<Expr>,
@@ -67,31 +75,35 @@ pub fn simplify_regex_expr(
     let mode = OperatorMode::new(&op);
     // Handle the special case for ".*" pattern
     if pattern == ANY_CHAR_REGEX_PATTERN {
+        // `left`'s box is the null test's.
         let new_expr = if mode.not {
             let null_bool = lit(ScalarValue::Boolean(None));
             Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(left.is_null()),
+                left: f.boxed(Expr::IsNull(left))?,
                 op: Operator::And,
-                right: Box::new(null_bool),
+                right: f.boxed(null_bool)?,
             })
         } else {
             // not null
-            left.is_not_null()
+            Expr::IsNotNull(left)
         };
-        return Ok(Transformed::yes(new_expr));
+        return Ok(Transformed::yes(replaced(f, right, new_expr)));
     }
 
     match regex_syntax::Parser::new().parse(pattern) {
         Ok(hir) => {
             let kind = hir.kind();
-            if let HirKind::Alternation(alts) = kind {
-                if alts.len() <= MAX_REGEX_ALTERNATIONS_EXPANSION
-                    && let Some(expr) = lower_alt(&mode, &left, alts, &string_scalar)
-                {
-                    return Ok(Transformed::yes(expr));
+            let lowered = if let HirKind::Alternation(alts) = kind {
+                if alts.len() <= MAX_REGEX_ALTERNATIONS_EXPANSION {
+                    lower_alt(f, &mode, &left, alts, &string_scalar)?
+                } else {
+                    None
                 }
-            } else if let Some(expr) = lower_simple(&mode, &left, &hir, &string_scalar) {
-                return Ok(Transformed::yes(expr));
+            } else {
+                lower_simple(f, &mode, &left, &hir, &string_scalar)?
+            };
+            if let Some(expr) = lowered {
+                return Ok(Transformed::yes(replaced(f, (left, right), expr)));
             }
         }
         Err(e) => {
@@ -160,20 +172,32 @@ impl OperatorMode {
     }
 }
 
-fn collect_concat_to_like_string(parts: &[Hir]) -> Option<String> {
-    let mut s = String::with_capacity(parts.len() + 2);
-    s.push('%');
-
+/// `%`, then each literal of `parts`, then `%`, in a text of exactly its bytes charged
+/// before it is made; `None` unless each part is a literal safe for `LIKE`.
+fn collect_concat_to_like_string(f: &Funding, parts: &[Hir]) -> Result<Option<String>> {
+    let mut len = 2usize;
     for sub in parts {
-        if let HirKind::Literal(l) = sub.kind() {
-            s.push_str(like_str_from_literal(l)?);
-        } else {
-            return None;
+        let HirKind::Literal(l) = sub.kind() else {
+            return Ok(None);
+        };
+        let Some(part) = like_str_from_literal(l) else {
+            return Ok(None);
+        };
+        len = len.saturating_add(part.len());
+    }
+    let mut s = String::new();
+    f.reserve_exact(&mut s, len)?;
+    // Within the room charged for it: pushing allocates nothing.
+    s.push('%');
+    for sub in parts {
+        if let HirKind::Literal(l) = sub.kind()
+            && let Some(part) = like_str_from_literal(l)
+        {
+            s.push_str(part);
         }
     }
-
     s.push('%');
-    Some(s)
+    Ok(Some(s))
 }
 
 /// Returns a str represented by `Literal` if it contains a valid utf8
@@ -259,157 +283,193 @@ fn is_anchored_capture(v: &[Hir]) -> bool {
 /// - `[Literal(_), Look::End]`
 ///
 /// Full anchored patterns are handled by [`anchored_literal_to_expr`].
-fn partial_anchored_literal_to_like(v: &[Hir]) -> Option<String> {
+fn partial_anchored_literal_to_like(f: &Funding, v: &[Hir]) -> Result<Option<String>> {
     if v.len() != 2 {
-        return None;
+        return Ok(None);
     }
 
     let (lit, match_begin) = match (&v[0].kind(), &v[1].kind()) {
         (HirKind::Look(Look::Start), HirKind::Literal(l)) => {
-            (like_str_from_literal(l)?, true)
+            let Some(lit) = like_str_from_literal(l) else {
+                return Ok(None);
+            };
+            (lit, true)
         }
         (HirKind::Literal(l), HirKind::Look(Look::End)) => {
-            (like_str_from_literal(l)?, false)
+            let Some(lit) = like_str_from_literal(l) else {
+                return Ok(None);
+            };
+            (lit, false)
         }
-        _ => return None,
+        _ => return Ok(None),
     };
 
     if match_begin {
-        Some(format!("{lit}%"))
+        f.format(format_args!("{lit}%")).map(Some)
     } else {
-        Some(format!("%{lit}"))
+        f.format(format_args!("%{lit}")).map(Some)
     }
 }
 
 /// Extracts a string literal expression assuming that [`is_anchored_literal`]
-/// returned true.
-fn anchored_literal_to_expr(v: &[Hir], string_scalar: &StringScalar) -> Option<Expr> {
+/// returned true, its text charged before it is made.
+fn anchored_literal_to_expr(
+    f: &Funding,
+    v: &[Hir],
+    string_scalar: &StringScalar,
+) -> Result<Option<Expr>> {
     match v.len() {
-        2 => Some(string_scalar.to_expr("")),
+        2 => Ok(Some(string_scalar.to_expr(String::new()))),
         3 => {
             let HirKind::Literal(l) = v[1].kind() else {
-                return None;
+                return Ok(None);
             };
-            like_str_from_literal(l).map(|s| string_scalar.to_expr(s))
+            match like_str_from_literal(l) {
+                Some(s) => Ok(Some(string_scalar.to_expr(f.string(s)?))),
+                None => Ok(None),
+            }
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
+/// The literals of an anchored alternation, in a list of their number, each charged before
+/// it is made.
 fn anchored_alternation_to_exprs(
+    f: &Funding,
     v: &[Hir],
     string_scalar: &StringScalar,
-) -> Option<Vec<Expr>> {
+) -> Result<Option<Vec<Expr>>> {
     if 3 != v.len() {
-        return None;
+        return Ok(None);
     }
 
     if let HirKind::Capture(cap, ..) = v[1].kind() {
         let Capture { sub, .. } = cap;
         if let HirKind::Alternation(alters) = sub.kind() {
-            let mut literals = Vec::with_capacity(alters.len());
+            // Each must be a literal of text before any is made.
+            let all_safe = alters.iter().all(|hir| {
+                matches!(hir.kind(), HirKind::Literal(l) if str_from_literal(l).is_some())
+            });
+            if !all_safe {
+                return Ok(None);
+            }
+            let mut literals = f.vec_with_capacity(alters.len())?;
             for hir in alters {
-                let mut is_safe = false;
                 if let HirKind::Literal(l) = hir.kind()
-                    && let Some(safe_literal) =
-                        str_from_literal(l).map(|s| string_scalar.to_expr(s))
+                    && let Some(s) = str_from_literal(l)
                 {
-                    literals.push(safe_literal);
-                    is_safe = true;
-                }
-
-                if !is_safe {
-                    return None;
+                    // Within the room charged for it: pushing allocates nothing.
+                    literals.push(string_scalar.to_expr(f.string(s)?));
                 }
             }
 
-            return Some(literals);
+            return Ok(Some(literals));
         } else if let HirKind::Literal(l) = sub.kind() {
-            if let Some(safe_literal) =
-                str_from_literal(l).map(|s| string_scalar.to_expr(s))
-            {
-                return Some(vec![safe_literal]);
+            if let Some(s) = str_from_literal(l) {
+                let safe_literal = string_scalar.to_expr(f.string(s)?);
+                return Ok(Some(f.vec_of([safe_literal])?));
             }
-            return None;
+            return Ok(None);
         }
     }
-    None
+    Ok(None)
 }
 
-/// Tries to lower (transform) a simple regex pattern to a LIKE expression.
+/// A copy of `left`, boxed, both charged before they are made.
+fn boxed_copy(f: &Funding, left: &Expr) -> Result<Box<Expr>> {
+    f.boxed(f.cloned(left)?)
+}
+
+/// Tries to lower (transform) a simple regex pattern to a LIKE expression, each expression
+/// made charged first.
 fn lower_simple(
+    f: &Funding,
     mode: &OperatorMode,
     left: &Expr,
     hir: &Hir,
     string_scalar: &StringScalar,
-) -> Option<Expr> {
+) -> Result<Option<Expr>> {
     match hir.kind() {
         HirKind::Empty => {
-            return Some(
-                mode.expr(Box::new(left.clone()), Box::new(string_scalar.to_expr("%"))),
-            );
+            let pattern = string_scalar.to_expr(f.string("%")?);
+            return Ok(Some(mode.expr(boxed_copy(f, left)?, f.boxed(pattern)?)));
         }
         HirKind::Literal(l) => {
-            let s = like_str_from_literal(l)?;
-            return Some(mode.expr(
-                Box::new(left.clone()),
-                Box::new(string_scalar.to_expr(&format!("%{s}%"))),
-            ));
+            let Some(s) = like_str_from_literal(l) else {
+                return Ok(None);
+            };
+            let pattern = string_scalar.to_expr(f.format(format_args!("%{s}%"))?);
+            return Ok(Some(mode.expr(boxed_copy(f, left)?, f.boxed(pattern)?)));
         }
         HirKind::Concat(inner) if is_anchored_literal(inner) => {
-            return anchored_literal_to_expr(inner, string_scalar).map(|right| {
-                if mode.i {
-                    // Case-insensitive: use ILIKE for exact match (no wildcards)
-                    mode.expr(Box::new(left.clone()), Box::new(right))
-                } else {
-                    // Case-sensitive: use Eq / NotEq
-                    mode.expr_matches_literal(Box::new(left.clone()), Box::new(right))
-                }
-            });
+            let Some(right) = anchored_literal_to_expr(f, inner, string_scalar)? else {
+                return Ok(None);
+            };
+            let right = f.boxed(right)?;
+            return Ok(Some(if mode.i {
+                // Case-insensitive: use ILIKE for exact match (no wildcards)
+                mode.expr(boxed_copy(f, left)?, right)
+            } else {
+                // Case-sensitive: use Eq / NotEq
+                mode.expr_matches_literal(boxed_copy(f, left)?, right)
+            }));
         }
         HirKind::Concat(inner) if !mode.i && is_anchored_capture(inner) => {
-            return anchored_alternation_to_exprs(inner, string_scalar)
-                .map(|right| left.clone().in_list(right, mode.not));
+            let Some(right) = anchored_alternation_to_exprs(f, inner, string_scalar)?
+            else {
+                return Ok(None);
+            };
+            return Ok(Some(Expr::InList(InList::new(
+                boxed_copy(f, left)?,
+                right,
+                mode.not,
+            ))));
         }
         HirKind::Concat(inner) => {
-            if let Some(pattern) = partial_anchored_literal_to_like(inner)
-                .or_else(|| collect_concat_to_like_string(inner))
-            {
-                return Some(mode.expr(
-                    Box::new(left.clone()),
-                    Box::new(string_scalar.to_expr(&pattern)),
-                ));
+            let pattern = match partial_anchored_literal_to_like(f, inner)? {
+                Some(pattern) => Some(pattern),
+                None => collect_concat_to_like_string(f, inner)?,
+            };
+            if let Some(pattern) = pattern {
+                let pattern = string_scalar.to_expr(pattern);
+                return Ok(Some(mode.expr(boxed_copy(f, left)?, f.boxed(pattern)?)));
             }
         }
         _ => {}
     }
-    None
+    Ok(None)
 }
 
 /// Calls [`lower_simple`] for each alternative and combine the results with `or` or `and`
 /// based on [`OperatorMode`]. Any fail attempt to lower an alternative will makes this
 /// function to return `None`.
 fn lower_alt(
+    f: &Funding,
     mode: &OperatorMode,
     left: &Expr,
     alts: &[Hir],
     string_scalar: &StringScalar,
-) -> Option<Expr> {
+) -> Result<Option<Expr>> {
     let mut accu: Option<Expr> = None;
 
     for part in alts {
-        let expr = lower_simple(mode, left, part, string_scalar)?;
+        let Some(expr) = lower_simple(f, mode, left, part, string_scalar)? else {
+            // What the alternatives lowered so far made is given back.
+            freed(f, accu);
+            return Ok(None);
+        };
         accu = match accu {
             Some(accu) => {
                 if mode.not {
-                    Some(accu.and(expr))
+                    Some(conjoined(f, accu, expr)?)
                 } else {
-                    Some(accu.or(expr))
+                    Some(disjoined(f, accu, expr)?)
                 }
             }
             None => Some(expr),
         };
     }
 
-    Some(accu.expect("at least two alts"))
+    Ok(Some(accu.expect("at least two alts")))
 }

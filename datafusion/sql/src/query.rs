@@ -23,9 +23,7 @@ use datafusion_common::{Constraints, DFSchema, Result, not_impl_err};
 use datafusion_expr::expr::{Sort, WildcardOptions};
 
 use datafusion_expr::select_expr::SelectExpr;
-use datafusion_expr::{
-    CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan, LogicalPlanBuilder,
-};
+use datafusion_expr::{CreateMemoryTable, DdlStatement, Distinct, Expr, LogicalPlan};
 use sqlparser::ast::{
     Expr as SQLExpr, ExprWithAliasAndOrderBy, Ident, LimitClause, Offset, OffsetRows,
     OrderBy, OrderByExpr, OrderByKind, PipeOperator, Query, SelectInto, SetExpr,
@@ -42,7 +40,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<LogicalPlan> {
         // Each query has its own planner context, including CTEs that are visible within that query.
         // It also inherits the CTEs from the outer query by cloning the outer planner context.
-        let mut query_plan_context = outer_planner_context.clone();
+        let mut query_plan_context = outer_planner_context.try_clone(self.funding())?;
         let planner_context = &mut query_plan_context;
 
         let Query {
@@ -70,9 +68,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let plan = match set_expr {
             SetExpr::Select(mut select) => {
                 let select_into = select.into.take();
-                let plan =
-                    self.select_to_plan(*select, order_by.clone(), planner_context)?;
-                let plan = self.limit(plan, limit_clause.clone(), planner_context)?;
+                let plan = self.select_to_plan(*select, order_by, planner_context)?;
+                let plan = self.limit(plan, limit_clause, planner_context)?;
                 // Process the `SELECT INTO` after `LIMIT`.
                 self.select_into(plan, select_into)
             }
@@ -153,12 +150,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
             PipeOperator::Extend { exprs } => {
                 let empty_from = matches!(plan, LogicalPlan::EmptyRelation(_));
-                let extend_exprs =
+                let mut extend_exprs =
                     self.prepare_select_exprs(&plan, exprs, empty_from, planner_context)?;
-                let all_exprs =
-                    std::iter::once(SelectExpr::Wildcard(WildcardOptions::default()))
-                        .chain(extend_exprs)
-                        .collect();
+                let funding = self.funding();
+                let mut all_exprs = funding.vec_with_capacity(1 + extend_exprs.len())?;
+                all_exprs.push(SelectExpr::Wildcard(WildcardOptions::default()));
+                all_exprs.extend(extend_exprs.drain(..));
+                funding.released(extend_exprs);
                 self.project(plan, all_exprs, None)
             }
             PipeOperator::As { alias } => self.apply_table_alias(
@@ -291,9 +289,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(input);
         }
 
-        LogicalPlanBuilder::from(input)
-            .limit_by_expr(skip, fetch)?
-            .build()
+        self.builder(input)?.limit_by_expr(skip, fetch)?.build()
     }
 
     /// Wrap the logical in a sort
@@ -306,13 +302,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(plan);
         }
 
-        if let LogicalPlan::Distinct(Distinct::On(ref distinct_on)) = plan {
+        match plan {
             // In case of `DISTINCT ON` we must capture the sort expressions since during the plan
             // optimization we're effectively doing a `first_value` aggregation according to them.
-            let distinct_on = distinct_on.clone().with_sort_expr(order_by)?;
-            Ok(LogicalPlan::Distinct(Distinct::On(distinct_on)))
-        } else {
-            LogicalPlanBuilder::from(plan).sort(order_by)?.build()
+            LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
+                Ok(LogicalPlan::Distinct(Distinct::On(
+                    distinct_on.with_sort_expr(order_by)?,
+                )))
+            }
+            plan => self.builder(plan)?.sort(order_by)?.build(),
         }
     }
 
@@ -350,7 +348,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             .map(|e| process_expr(e, planner_context))
             .collect::<Result<Vec<_>>>()?;
 
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .aggregate(group_by_exprs, aggr_exprs)?
             .build()
     }

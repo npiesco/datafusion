@@ -28,6 +28,7 @@ use crate::utils::NamePreserver;
 use datafusion_common::alias::AliasGenerator;
 
 use datafusion_common::cse::{CSE, CSEController, FoundCommonNodes};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, qualified_name};
 use datafusion_expr::expr::{Alias, HigherOrderFunction, ScalarFunction};
@@ -168,9 +169,14 @@ impl CommonSubexprEliminate {
                 common_nodes: common_exprs,
                 new_nodes_list: new_exprs_list,
                 original_nodes_list: original_exprs_list,
-            } => build_common_expr_project_plan(input, common_exprs).map(|new_input| {
-                Transformed::yes((new_exprs_list, new_input, Some(original_exprs_list)))
-            }),
+            } => build_common_expr_project_plan(input, common_exprs, &config.funding())
+                .map(|new_input| {
+                    Transformed::yes((
+                        new_exprs_list,
+                        new_input,
+                        Some(original_exprs_list),
+                    ))
+                }),
             FoundCommonNodes::No {
                 original_nodes_list: original_exprs_list,
             } => Ok(Transformed::no((original_exprs_list, input, None))),
@@ -199,10 +205,10 @@ impl CommonSubexprEliminate {
                     .map(|exprs| {
                         exprs
                             .iter()
-                            .map(|expr| name_preserver.save(expr))
-                            .collect::<Vec<_>>()
+                            .map(|expr| name_preserver.save(expr, &config.funding()))
+                            .collect::<Result<Vec<_>>>()
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
                 new_window_expr_list.into_iter().zip(saved_names).try_rfold(
                     new_input,
                     |plan, (new_window_expr, saved_names)| {
@@ -210,9 +216,9 @@ impl CommonSubexprEliminate {
                             .into_iter()
                             .zip(saved_names)
                             .map(|(new_window_expr, saved_name)| {
-                                saved_name.restore(new_window_expr)
+                                saved_name.restore(new_window_expr, &config.funding())
                             })
-                            .collect::<Vec<_>>();
+                            .collect::<Result<Vec<_>>>()?;
                         Window::try_new(new_window_expr, Arc::new(plan))
                             .map(LogicalPlan::Window)
                     },
@@ -264,15 +270,16 @@ impl CommonSubexprEliminate {
                 let new_aggr_expr = new_exprs_list.pop().unwrap();
                 let new_group_expr = new_exprs_list.pop().unwrap();
 
-                build_common_expr_project_plan(input, common_exprs).map(|new_input| {
-                    let aggr_expr = original_exprs_list.pop().unwrap();
-                    Transformed::yes((
-                        new_aggr_expr,
-                        new_group_expr,
-                        new_input,
-                        Some(aggr_expr),
-                    ))
-                })
+                build_common_expr_project_plan(input, common_exprs, &config.funding())
+                    .map(|new_input| {
+                        let aggr_expr = original_exprs_list.pop().unwrap();
+                        Transformed::yes((
+                            new_aggr_expr,
+                            new_group_expr,
+                            new_input,
+                            Some(aggr_expr),
+                        ))
+                    })
             }
 
             FoundCommonNodes::No {
@@ -322,8 +329,10 @@ impl CommonSubexprEliminate {
                             let name_preserver = NamePreserver::new_for_projection();
                             aggr_expr
                                 .iter()
-                                .map(|expr| Some(name_preserver.save(expr)))
-                                .collect::<Vec<_>>()
+                                .map(|expr| {
+                                    name_preserver.save(expr, &config.funding()).map(Some)
+                                })
+                                .collect::<Result<Vec<_>>>()?
                         } else {
                             (0..new_aggr_expr.len()).map(|_| None).collect()
                         };
@@ -346,7 +355,8 @@ impl CommonSubexprEliminate {
                             if expr_rewritten == expr_orig {
                                 let expr_rewritten = if let Some(saved_name) = saved_name
                                 {
-                                    saved_name.restore(expr_rewritten)
+                                    saved_name
+                                        .restore(expr_rewritten, &config.funding())?
                                 } else {
                                     expr_rewritten
                                 };
@@ -380,7 +390,8 @@ impl CommonSubexprEliminate {
                             new_group_expr,
                             agg_exprs,
                         )?);
-                        Projection::try_new(proj_exprs, Arc::new(agg))
+                        let funding = config.funding();
+                        Projection::try_new(proj_exprs, funding.arc(agg)?, &funding)
                             .map(|p| Transformed::yes(LogicalPlan::Projection(p)))
                     }
 
@@ -405,15 +416,15 @@ impl CommonSubexprEliminate {
                             let name_preserver = NamePreserver::new_for_projection();
                             let saved_names = aggr_expr
                                 .iter()
-                                .map(|expr| name_preserver.save(expr))
-                                .collect::<Vec<_>>();
+                                .map(|expr| name_preserver.save(expr, &config.funding()))
+                                .collect::<Result<Vec<_>>>()?;
                             let new_aggr_expr = rewritten_aggr_expr
                                 .into_iter()
                                 .zip(saved_names)
                                 .map(|(new_expr, saved_name)| {
-                                    saved_name.restore(new_expr)
+                                    saved_name.restore(new_expr, &config.funding())
                                 })
-                                .collect::<Vec<Expr>>();
+                                .collect::<Result<Vec<Expr>>>()?;
 
                             // Since `group_expr` may have changed, schema may also.
                             // Use `try_new()` method.
@@ -469,7 +480,7 @@ impl CommonSubexprEliminate {
                 original_nodes_list: _,
             } => {
                 let new_exprs = new_exprs_list.pop().unwrap();
-                build_common_expr_project_plan(input, common_exprs)
+                build_common_expr_project_plan(input, common_exprs, &config.funding())
                     .map(|new_input| Transformed::yes((new_exprs, new_input)))
             }
             FoundCommonNodes::No {
@@ -599,7 +610,11 @@ impl OptimizerRule for CommonSubexprEliminate {
         if optimized_plan.transformed && optimized_plan.data.schema() != &original_schema
         {
             optimized_plan.map_data(|optimized_plan| {
-                build_recover_project_plan(&original_schema, optimized_plan)
+                build_recover_project_plan(
+                    &original_schema,
+                    optimized_plan,
+                    &config.funding(),
+                )
             })
         } else {
             Ok(optimized_plan)
@@ -787,6 +802,7 @@ impl Default for CommonSubexprEliminate {
 fn build_common_expr_project_plan(
     input: LogicalPlan,
     common_exprs: Vec<(Expr, String)>,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
     let mut fields_set = BTreeSet::new();
     let mut project_exprs = common_exprs
@@ -803,7 +819,8 @@ fn build_common_expr_project_plan(
         }
     }
 
-    Projection::try_new(project_exprs, Arc::new(input)).map(LogicalPlan::Projection)
+    Projection::try_new(project_exprs, funding.arc(input)?, funding)
+        .map(LogicalPlan::Projection)
 }
 
 /// Build the projection plan to eliminate unnecessary columns produced by
@@ -814,9 +831,11 @@ fn build_common_expr_project_plan(
 fn build_recover_project_plan(
     schema: &DFSchema,
     input: LogicalPlan,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
     let col_exprs = schema.iter().map(Expr::from).collect();
-    Projection::try_new(col_exprs, Arc::new(input)).map(LogicalPlan::Projection)
+    Projection::try_new(col_exprs, funding.arc(input)?, funding)
+        .map(LogicalPlan::Projection)
 }
 
 fn extract_expressions(expr: &Expr, result: &mut Vec<Expr>) {
@@ -1203,8 +1222,15 @@ mod test {
             (c_plus_a_2, format!("{CSE_PREFIX}_3")),
             (b_plus_a_2, format!("{CSE_PREFIX}_4")),
         ];
-        let project = build_common_expr_project_plan(table_scan, common_exprs_1).unwrap();
-        let project_2 = build_common_expr_project_plan(project, common_exprs_2).unwrap();
+        let project = build_common_expr_project_plan(
+            table_scan,
+            common_exprs_1,
+            &Funding::default(),
+        )
+        .unwrap();
+        let project_2 =
+            build_common_expr_project_plan(project, common_exprs_2, &Funding::default())
+                .unwrap();
 
         let mut field_set = BTreeSet::new();
         for name in project_2.schema().field_names() {
@@ -1233,8 +1259,12 @@ mod test {
             (c_plus_a_2, format!("{CSE_PREFIX}_3")),
             (b_plus_a_2, format!("{CSE_PREFIX}_4")),
         ];
-        let project = build_common_expr_project_plan(join, common_exprs_1).unwrap();
-        let project_2 = build_common_expr_project_plan(project, common_exprs_2).unwrap();
+        let project =
+            build_common_expr_project_plan(join, common_exprs_1, &Funding::default())
+                .unwrap();
+        let project_2 =
+            build_common_expr_project_plan(project, common_exprs_2, &Funding::default())
+                .unwrap();
 
         let mut field_set = BTreeSet::new();
         for name in project_2.schema().field_names() {

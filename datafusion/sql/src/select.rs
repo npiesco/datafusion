@@ -31,11 +31,16 @@ use crate::utils::{
 
 use arrow::datatypes::DataType;
 use datafusion_common::error::DataFusionErrorBuilder;
+use datafusion_common::funding::{Buffer, Held};
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion_common::{Column, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
+use datafusion_common::{
+    Column, DFSchema, DFSchemaRef, Result, internal_err, not_impl_err, plan_err,
+};
 use datafusion_common::{NullHandling, RecursionUnnestOption, UnnestOptions};
 use datafusion_expr::ExprSchemable;
-use datafusion_expr::builder::get_struct_unnested_columns;
+use datafusion_expr::builder::{
+    get_struct_unnested_columns, project, project_with_schema,
+};
 use datafusion_expr::expr::Unnest as UnnestExpr;
 use datafusion_expr::expr::{PlannedReplaceSelectItem, WildcardOptions};
 use datafusion_expr::expr_rewriter::{
@@ -46,8 +51,9 @@ use datafusion_expr::utils::{
     expr_as_column_expr, expr_to_columns, find_aggregate_exprs, find_window_exprs,
 };
 use datafusion_expr::{
-    Aggregate, Expr, Filter, GroupingSet, LogicalPlan, LogicalPlanBuilder,
-    LogicalPlanBuilderOptions, Partitioning, SortExpr,
+    Aggregate, EmptyRelation, Expr, Filter, GroupingSet, Join, LogicalPlan,
+    LogicalPlanBuilder, LogicalPlanBuilderOptions, Partitioning, Projection, SortExpr,
+    Unnest, Window,
 };
 
 use indexmap::IndexMap;
@@ -85,6 +91,46 @@ struct DistinctOnUnnestPlanResult {
 struct RewrittenUnnestExprGroups {
     plan: LogicalPlan,
     expr_groups: Vec<Vec<Expr>>,
+}
+
+/// The schemas [`LogicalPlan::fallback_normalize_schemas`] lists, held in place rather than in
+/// a list allocated for them.
+struct FallbackSchemas<'a> {
+    schemas: [&'a DFSchema; 2],
+    len: usize,
+}
+
+impl<'a> FallbackSchemas<'a> {
+    fn of(plan: &'a LogicalPlan) -> Self {
+        let empty = DFSchema::empty_ref().as_ref();
+        let (schemas, len) = match plan {
+            LogicalPlan::Window(Window { input, .. })
+            | LogicalPlan::Projection(Projection { input, .. })
+            | LogicalPlan::Aggregate(Aggregate { input, .. })
+            | LogicalPlan::Unnest(Unnest { input, .. }) => {
+                ([input.schema().as_ref(), empty], 1)
+            }
+            LogicalPlan::Join(Join { left, right, .. }) => {
+                ([left.schema().as_ref(), right.schema().as_ref()], 2)
+            }
+            _ => ([empty, empty], 0),
+        };
+        Self { schemas, len }
+    }
+
+    fn as_slice(&self) -> &[&'a DFSchema] {
+        &self.schemas[..self.len]
+    }
+}
+
+/// Whether any of `exprs` calls a window function or unnests, found without allocating.
+fn windowed_or_unnested<'a>(exprs: impl IntoIterator<Item = &'a Expr>) -> Result<bool> {
+    for expr in exprs {
+        if expr.exists(|e| Ok(matches!(e, Expr::WindowFunction(_) | Expr::Unnest(_))))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn flatten_expr_groups(expr_groups: Vec<Vec<Expr>>) -> Vec<Expr> {
@@ -137,19 +183,27 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             planner_context,
         )?;
 
-        // Having and group by clause may reference aliases defined in select projection
+        // Having and group by clause may reference aliases defined in select projection.
+        // The projection holds the base plan as its input: read from there, not copied.
         let projected_plan =
-            self.project(base_plan.clone(), select_exprs, set_expr_left_schema)?;
-        let select_exprs = projected_plan.expressions();
+            self.project(base_plan, select_exprs, set_expr_left_schema)?;
+        let LogicalPlan::Projection(Projection {
+            expr: select_exprs,
+            input: base_plan,
+            ..
+        }) = &projected_plan
+        else {
+            return internal_err!("The SELECT list was not planned as a projection");
+        };
 
-        let order_by =
-            to_order_by_exprs_with_select(query_order_by, Some(&select_exprs))?;
+        let order_by = to_order_by_exprs_with_select(query_order_by, Some(select_exprs))?;
 
         // Place the fields of the base plan at the front so that when there are references
         // with the same name, the fields of the base plan will be searched first.
         // See https://github.com/apache/datafusion/issues/9162
-        let mut combined_schema = base_plan.schema().as_ref().clone();
-        combined_schema.merge(projected_plan.schema());
+        let combined_schema = base_plan
+            .schema()
+            .merge(projected_plan.schema(), self.funding())?;
 
         // Order-by expressions prioritize referencing columns from the select list,
         // then from the FROM clause.
@@ -163,7 +217,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let order_by_rex = normalize_sorts(order_by_rex, &projected_plan)?;
 
         // This alias map is resolved and looked up in both having exprs and group by exprs
-        let alias_map = extract_aliases(&select_exprs);
+        let alias_map = extract_aliases(select_exprs);
 
         // DISTINCT ON expressions are parsed alongside HAVING / QUALIFY so
         // they participate in aggregate / window discovery and get rebased
@@ -180,11 +234,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Some(Distinct::On(exprs)) => std::mem::take(exprs),
             _ => Vec::new(),
         };
-        let mut on_expr_schema = projected_plan.schema().as_ref().clone();
-        on_expr_schema.merge(base_plan.schema());
-        let on_exprs_pre_aggr: Vec<Expr> = on_exprs_sql
-            .into_iter()
-            .map(|e| {
+        let on_exprs_pre_aggr = if on_exprs_sql.is_empty() {
+            Vec::new()
+        } else {
+            let funding = self.funding();
+            let on_expr_schema =
+                projected_plan.schema().merge(base_plan.schema(), funding)?;
+            let mut on_exprs = funding.vec_with_capacity(on_exprs_sql.len())?;
+            for e in on_exprs_sql {
                 let expr =
                     self.sql_expr_to_logical_expr(e, &on_expr_schema, planner_context)?;
                 // PostgreSQL only substitutes an output alias when the whole
@@ -193,9 +250,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let expr = substitute_top_level_alias(expr, &alias_map);
                 let expr = normalize_col(expr, &projected_plan)?;
                 let (expr, _) = expr.infer_placeholder_types(&on_expr_schema)?;
-                Ok(expr)
-            })
-            .collect::<Result<Vec<Expr>>>()?;
+                funding.push(&mut on_exprs, expr)?;
+            }
+            on_expr_schema.released(funding);
+            on_exprs
+        };
 
         // Optionally the HAVING expression.
         let having_expr_opt = select
@@ -247,7 +306,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let group_by_expr =
                         resolve_aliases_to_exprs(group_by_expr, &alias_map)?;
                     let group_by_expr =
-                        resolve_positions_to_exprs(group_by_expr, &select_exprs)?;
+                        resolve_positions_to_exprs(group_by_expr, select_exprs)?;
                     let group_by_expr = normalize_col(group_by_expr, &projected_plan)?;
                     self.validate_schema_satisfies_exprs(
                         base_plan.schema(),
@@ -324,6 +383,36 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
         }
 
+        // A plain SELECT, without aggregation, window functions, QUALIFY, DISTINCT ON or
+        // UNNEST, is the projection already planned: taken as it is, not planned again over
+        // a copy of its input.
+        let plain = group_by_exprs.is_empty()
+            && aggr_exprs.is_empty()
+            && having_expr_opt.is_none()
+            && qualify_expr_opt.is_none()
+            && !matches!(select.distinct, Some(Distinct::On(_)))
+            && !windowed_or_unnested(
+                select_exprs
+                    .iter()
+                    .chain(order_by_rex.iter().map(|sort| &sort.expr)),
+            )?;
+        if plain {
+            let plan = match select.distinct {
+                Some(Distinct::Distinct) => LogicalPlan::Distinct(
+                    datafusion_expr::Distinct::All(self.funding().arc(projected_plan)?),
+                ),
+                _ => projected_plan,
+            };
+            let plan = self.distribute_by(
+                plan,
+                &select.distribute_by,
+                &combined_schema,
+                planner_context,
+            )?;
+            combined_schema.released(self.funding());
+            return self.order_by(plan, order_by_rex);
+        }
+
         // Process group by, aggregation or having
         let AggregatePlanResult {
             plan,
@@ -334,8 +423,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             on_exprs: mut on_exprs_post_aggr,
         } = if !group_by_exprs.is_empty() || !aggr_exprs.is_empty() {
             self.aggregate(
-                &base_plan,
-                &select_exprs,
+                base_plan,
+                select_exprs,
                 having_expr_opt.as_ref(),
                 qualify_expr_opt.as_ref(),
                 &order_by_rex,
@@ -351,8 +440,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     );
                 }
                 None => AggregatePlanResult {
-                    plan: base_plan.clone(),
-                    select_exprs: select_exprs.clone(),
+                    plan: self.funding().cloned(base_plan.as_ref())?,
+                    select_exprs: self.funding().cloned(select_exprs)?,
                     having_expr: having_expr_opt,
                     qualify_expr: qualify_expr_opt,
                     order_by_exprs: order_by_rex,
@@ -362,9 +451,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         let plan = if let Some(having_expr_post_aggr) = having_expr_post_aggr {
-            LogicalPlanBuilder::from(plan)
-                .having(having_expr_post_aggr)?
-                .build()?
+            self.builder(plan)?.having(having_expr_post_aggr)?.build()?
         } else {
             plan
         };
@@ -443,7 +530,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 std::slice::from_ref(&qualify_expr_post_window),
             )?;
 
-            LogicalPlanBuilder::from(plan)
+            self.builder(plan)?
                 .filter(qualify_expr_post_window)?
                 .build()?
         } else {
@@ -462,7 +549,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             }
             Some(Distinct::Distinct) => {
                 let plan = self.try_process_unnest(plan, select_exprs_post_aggr)?;
-                LogicalPlanBuilder::from(plan).distinct()?.build()?
+                self.builder(plan)?.distinct()?.build()?
             }
             Some(Distinct::On(_)) => {
                 if aggr_exprs.is_empty()
@@ -478,9 +565,16 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     // underlying input expression first.
                     order_by_rex =
                         substitute_top_level_aliases_in_sorts(order_by_rex, &alias_map);
-                    LogicalPlanBuilder::from(base_plan)
-                        .distinct_on(on_exprs_post_aggr, select_exprs, None)?
-                        .build()?
+                    LogicalPlanBuilder::new_from_arc(
+                        Arc::clone(base_plan),
+                        self.funding(),
+                    )
+                    .distinct_on(
+                        on_exprs_post_aggr,
+                        self.funding().cloned(select_exprs)?,
+                        None,
+                    )?
+                    .build()?
                 } else {
                     // General path: DistinctOn layered over the post-
                     // aggregate / post-window plan (no extra Projection
@@ -512,38 +606,46 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     )?;
                     order_by_rex = rewritten_order_by_rex;
 
-                    LogicalPlanBuilder::from(plan)
+                    self.builder(plan)?
                         .distinct_on(on_exprs_post_aggr, select_exprs_post_aggr, None)?
                         .build()?
                 }
             }
         };
 
-        // DISTRIBUTE BY
-        let plan = if !select.distribute_by.is_empty() {
-            let x = select
-                .distribute_by
-                .iter()
-                .map(|e| {
-                    self.sql_expr_to_logical_expr(
-                        e.clone(),
-                        &combined_schema,
-                        planner_context,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?;
-            LogicalPlanBuilder::from(plan)
-                .repartition(Partitioning::DistributeBy(x))?
-                .build()?
-        } else {
-            plan
-        };
+        let plan = self.distribute_by(
+            plan,
+            &select.distribute_by,
+            &combined_schema,
+            planner_context,
+        )?;
+        combined_schema.released(self.funding());
 
         let plan = self.order_by(plan, order_by_rex)?;
         Ok(plan)
     }
 
     /// Try converting Expr(Unnest(Expr)) to Projection/Unnest/Projection
+    /// `plan` repartitioned by the DISTRIBUTE BY expressions, if there are any.
+    fn distribute_by(
+        &self,
+        plan: LogicalPlan,
+        distribute_by: &[SQLExpr],
+        schema: &DFSchema,
+        planner_context: &mut PlannerContext,
+    ) -> Result<LogicalPlan> {
+        if distribute_by.is_empty() {
+            return Ok(plan);
+        }
+        let x = distribute_by
+            .iter()
+            .map(|e| self.sql_expr_to_logical_expr(e.clone(), schema, planner_context))
+            .collect::<Result<Vec<_>>>()?;
+        self.builder(plan)?
+            .repartition(Partitioning::DistributeBy(x))?
+            .build()
+    }
+
     pub(super) fn try_process_unnest(
         &self,
         input: LogicalPlan,
@@ -555,7 +657,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 select_exprs.into_iter().map(|expr| vec![expr]).collect(),
             )?;
 
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .project(flatten_expr_groups(expr_groups))?
             .build()
     }
@@ -703,7 +805,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 unnest_col_vec.push(col);
             }
 
-            intermediate_plan = LogicalPlanBuilder::from(intermediate_plan)
+            intermediate_plan = self
+                .builder(intermediate_plan)?
                 .project(inner_projection_exprs)?
                 .unnest_columns_with_options(unnest_col_vec, unnest_options)?
                 .build()?;
@@ -729,7 +832,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             return Ok(None);
         };
 
-        let field = unnest_expr.expr.to_field(input.schema())?.1;
+        let field = unnest_expr.expr.to_field(input.schema(), self.funding())?.1;
         let DataType::Struct(inner_fields) = field.data_type() else {
             return Ok(None);
         };
@@ -754,7 +857,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     self.try_process_group_by_unnest(agg)?;
                 let options = LogicalPlanBuilderOptions::new()
                     .with_add_implicit_group_by_exprs(true);
-                LogicalPlanBuilder::from(new_input)
+                self.builder(new_input)?
                     .with_options(options)
                     .aggregate(new_group_by_exprs, agg_expr)?
                     .build()
@@ -862,7 +965,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     unnest_col_vec.push(col);
                 }
 
-                intermediate_plan = LogicalPlanBuilder::from(intermediate_plan)
+                intermediate_plan = self
+                    .builder(intermediate_plan)?
                     .project(projection_exprs)?
                     .unnest_columns_with_options(unnest_col_vec, unnest_options)?
                     .build()?;
@@ -882,42 +986,50 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<LogicalPlan> {
         match selection {
             Some(predicate_expr) => {
-                let fallback_schemas = plan.fallback_normalize_schemas();
+                let fallback_schemas = FallbackSchemas::of(&plan);
 
                 self.warn_on_null_equality_predicate(&predicate_expr);
                 let filter_expr =
                     self.sql_to_expr(predicate_expr, plan.schema(), planner_context)?;
 
                 // Check for aggregation functions
-                let aggregate_exprs =
-                    find_aggregate_exprs(std::slice::from_ref(&filter_expr));
-                if !aggregate_exprs.is_empty() {
+                if filter_expr
+                    .exists(|expr| Ok(matches!(expr, Expr::AggregateFunction(_))))?
+                {
                     return plan_err!(
                         "Aggregate functions are not allowed in the WHERE clause. Consider using HAVING instead"
                     );
                 }
 
+                let funding = self.funding();
                 let mut using_columns = HashSet::new();
                 expr_to_columns(&filter_expr, &mut using_columns)?;
-                let mut schema_stack: Vec<Vec<&DFSchema>> =
-                    vec![vec![plan.schema()], fallback_schemas];
+                let plan_schema = [plan.schema().as_ref()];
+                let outer_count = planner_context.outer_queries_schemas().len();
+                let mut outer_schemas: Held<Vec<&DFSchema>> = funding.held();
+                outer_schemas.reserve_exact(outer_count)?;
                 for sc in planner_context.outer_schemas_iter() {
-                    schema_stack.push(vec![sc.as_ref()]);
+                    outer_schemas.push(sc.as_ref())?;
+                }
+                let mut schema_stack: Held<Vec<&[&DFSchema]>> = funding.held();
+                schema_stack.reserve_exact(2 + outer_count)?;
+                schema_stack.push(&plan_schema)?;
+                schema_stack.push(fallback_schemas.as_slice())?;
+                for sc in outer_schemas.iter() {
+                    schema_stack.push(std::slice::from_ref(sc))?;
                 }
 
                 let filter_expr = normalize_col_with_schemas_and_ambiguity_check(
                     filter_expr,
-                    schema_stack
-                        .iter()
-                        .map(|sc| sc.as_slice())
-                        .collect::<Vec<&[&DFSchema]>>()
-                        .as_slice(),
+                    schema_stack.as_slice(),
                     &[using_columns],
                 )?;
+                drop(schema_stack);
+                drop(outer_schemas);
 
                 Ok(LogicalPlan::Filter(Filter::try_new(
                     filter_expr,
-                    Arc::new(plan),
+                    funding.arc(plan)?,
                 )?))
             }
             None => Ok(plan),
@@ -930,7 +1042,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
         match from.len() {
-            0 => Ok(LogicalPlanBuilder::empty(true).build()?),
+            // The shared empty schema: a count bumped, nothing allocated.
+            0 => Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: true,
+                schema: Arc::clone(DFSchema::empty_ref()),
+            })),
             1 => {
                 let input = from.remove(0);
                 self.plan_table_with_joins(input, planner_context)
@@ -938,10 +1054,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             _ => {
                 let mut from = from.into_iter();
 
-                let mut left = LogicalPlanBuilder::from({
+                let mut left = self.builder({
                     let input = from.next().unwrap();
                     self.plan_table_with_joins(input, planner_context)?
-                });
+                })?;
                 let old_outer_from_schema = {
                     let left_schema = Some(Arc::clone(left.schema()));
                     planner_context.set_outer_from_schema(left_schema)
@@ -968,12 +1084,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         empty_from: bool,
         planner_context: &mut PlannerContext,
     ) -> Result<Vec<SelectExpr>> {
-        let mut prepared_select_exprs = vec![];
+        let funding = self.funding();
+        let mut prepared_select_exprs = funding.vec_with_capacity(projection.len())?;
         let mut error_builder = DataFusionErrorBuilder::new();
 
         for expr in projection {
             match self.sql_select_to_rex(expr, plan, empty_from, planner_context) {
-                Ok(expr) => prepared_select_exprs.push(expr),
+                Ok(expr) => funding.push(&mut prepared_select_exprs, expr)?,
                 Err(err) => error_builder.add_error(err),
             }
         }
@@ -1097,28 +1214,26 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             rename: options.opt_rename,
         };
         if let Some(replace) = options.opt_replace {
-            let replace_expr = replace
-                .items
-                .iter()
-                .map(|item| {
-                    self.sql_select_to_rex(
-                        SelectItem::UnnamedExpr(item.expr.clone()),
-                        plan,
-                        empty_from,
-                        planner_context,
-                    )
-                })
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .filter_map(|expr| match expr {
-                    SelectExpr::Expression(expr) => Some(expr),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+            let funding = self.funding();
+            let mut planned_expressions =
+                funding.vec_with_capacity(replace.items.len())?;
+            for item in &replace.items {
+                let expr = self.sql_select_to_rex(
+                    SelectItem::UnnamedExpr(item.expr.clone()),
+                    plan,
+                    empty_from,
+                    planner_context,
+                )?;
+                if let SelectExpr::Expression(expr) = expr {
+                    planned_expressions.push(expr);
+                }
+            }
+            let mut items = funding.vec_with_capacity(replace.items.len())?;
+            items.extend(replace.items.into_iter().map(|i| *i));
 
             let planned_replace = PlannedReplaceSelectItem {
-                items: replace.items.into_iter().map(|i| *i).collect(),
-                planned_expressions: replace_expr,
+                items,
+                planned_expressions,
             };
             Ok(planned_option.with_replace(planned_replace))
         } else {
@@ -1126,34 +1241,48 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
     }
 
-    /// Wrap a plan in a projection
+    /// Wrap a plan in a projection. `expr` is a list [`Self::prepare_select_exprs`] made:
+    /// the projection takes its expressions, and the list and its wildcards' REPLACE lists
+    /// are freed, planned or not.
     pub(crate) fn project(
         &self,
         input: LogicalPlan,
         expr: Vec<SelectExpr>,
         set_expr_left_schema: Option<DFSchemaRef>,
     ) -> Result<LogicalPlan> {
-        // convert to Expr for validate_schema_satisfies_exprs
-        let plain_exprs = expr
-            .iter()
-            .filter_map(|e| match e {
-                SelectExpr::Expression(expr) => Some(expr.to_owned()),
+        let freed = expr.block_bytes()
+            + expr
+                .iter()
+                .map(|e| match e {
+                    SelectExpr::Wildcard(options)
+                    | SelectExpr::QualifiedWildcard(_, options) => {
+                        options.replace.as_ref().map_or(0, |replace| {
+                            replace.items.block_bytes()
+                                + replace.planned_expressions.block_bytes()
+                        })
+                    }
+                    SelectExpr::Expression(_) => 0,
+                })
+                .sum::<usize>();
+        let projected = self.validate_schema_satisfies_exprs(
+            input.schema(),
+            expr.iter().filter_map(|e| match e {
+                SelectExpr::Expression(expr) => Some(expr),
                 _ => None,
-            })
-            .collect::<Vec<_>>();
-        self.validate_schema_satisfies_exprs(input.schema(), &plain_exprs)?;
-
-        // When inside a set expression, pass the left-most schema so
-        // that expressions get aliased to match, avoiding duplicate
-        // name errors from expressions like `count(*), count(*)`.
-        let builder = LogicalPlanBuilder::from(input);
-        if let Some(left_schema) = set_expr_left_schema {
-            builder
-                .project_with_validation_and_schema(expr, &left_schema)?
-                .build()
-        } else {
-            builder.project(expr)?.build()
-        }
+            }),
+        );
+        let projected = projected.and_then(|()| {
+            // When inside a set expression, pass the left-most schema so
+            // that expressions get aliased to match, avoiding duplicate
+            // name errors from expressions like `count(*), count(*)`.
+            if let Some(left_schema) = set_expr_left_schema {
+                project_with_schema(input, expr, &left_schema, self.funding())
+            } else {
+                project(input, expr, self.funding())
+            }
+        });
+        self.funding().discharge(freed);
+        projected
     }
 
     /// Create an aggregate plan.
@@ -1189,7 +1318,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     #[expect(clippy::too_many_arguments)]
     fn aggregate(
         &self,
-        input: &LogicalPlan,
+        input: &Arc<LogicalPlan>,
         select_exprs: &[Expr],
         having_expr_opt: Option<&Expr>,
         qualify_expr_opt: Option<&Expr>,
@@ -1201,9 +1330,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // create the aggregate plan
         let options =
             LogicalPlanBuilderOptions::new().with_add_implicit_group_by_exprs(true);
-        let plan = LogicalPlanBuilder::from(input.clone())
+        let funding = self.funding();
+        let plan = LogicalPlanBuilder::new_from_arc(Arc::clone(input), funding)
             .with_options(options)
-            .aggregate(group_by_exprs.to_vec(), aggr_exprs.to_vec())?
+            .aggregate(funding.to_vec(group_by_exprs)?, funding.to_vec(aggr_exprs)?)?
             .build()?;
         let group_by_exprs = if let LogicalPlan::Aggregate(agg) = &plan {
             &agg.group_expr

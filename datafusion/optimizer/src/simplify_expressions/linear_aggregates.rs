@@ -17,10 +17,13 @@
 
 //! Simplification to refactor multiple aggregate functions to use the same aggregate function
 
-use datafusion_common::HashMap;
-use datafusion_expr::expr::AggregateFunctionParams;
+use datafusion_common::Result;
+use datafusion_common::funding::Funding;
+use datafusion_expr::expr::{AggregateFunction, AggregateFunctionParams};
 use datafusion_expr::{BinaryExpr, Expr};
 use datafusion_expr_common::operator::Operator;
+
+use crate::funded::{Freed, HashIndex, displays_as, freed};
 
 /// Threshold of the number of aggregates that share similar arguments before
 /// triggering rewrite.
@@ -53,50 +56,39 @@ const DUPLICATE_THRESHOLD: usize = 2;
 ///
 /// [`AggregateUDFImpl::simplify_expr_op_literal`]: datafusion_expr::AggregateUDFImpl::simplify_expr_op_literal
 pub(super) fn rewrite_multiple_linear_aggregates(
+    f: &Funding,
     agg_expr: &mut [Expr],
-) -> datafusion_common::Result<bool> {
-    // map <expr>: count of expressions that have a common argument
-    let mut common_args = HashMap::new();
-
-    // First pass -- figure out any aggregates that can be split and have common
-    // expressions.
-    for agg in agg_expr.iter() {
-        let Expr::AggregateFunction(agg_function) = agg else {
-            continue;
-        };
-
-        let Some(arg) = candidate_linear_param(&agg_function.params) else {
-            continue;
-        };
-
-        let Some(expr_literal) = ExprLiteral::try_new(arg) else {
-            continue;
-        };
-
-        let counter = common_args.entry(expr_literal.expr()).or_insert(0);
-        *counter += 1;
+) -> Result<bool> {
+    // The common case: too few candidates to rewrite, found without allocating.
+    let count = agg_expr.iter().filter_map(candidate).count();
+    if count < DUPLICATE_THRESHOLD {
+        return Ok(false);
     }
 
+    // The common argument of each candidate, found by its hash in place of a map of
+    // their counts.
+    let mut args = f.held::<Vec<&Expr>>();
+    args.reserve_exact(count)?;
+    args.extend(
+        agg_expr
+            .iter()
+            .filter_map(candidate)
+            .map(|(_, expr_literal)| expr_literal.expr()),
+    );
+    let common_args = HashIndex::new(f, &args)?;
+
     // (agg_index, new_expr)
-    let mut new_aggs = vec![];
+    let mut new_aggs = f.held::<Vec<(usize, Expr)>>();
 
     // Second pass, actually rewrite any aggregates that have a common
     // expression and enough duplicates.
     for (idx, agg) in agg_expr.iter().enumerate() {
-        let Expr::AggregateFunction(agg_function) = agg else {
-            continue;
-        };
-
-        let Some(arg) = candidate_linear_param(&agg_function.params) else {
-            continue;
-        };
-
-        let Some(expr_literal) = ExprLiteral::try_new(arg) else {
+        let Some((agg_function, expr_literal)) = candidate(agg) else {
             continue;
         };
 
         // Not enough common expressions to make it worth rewriting
-        if common_args.get(expr_literal.expr()).unwrap_or(&0) < &DUPLICATE_THRESHOLD {
+        if common_args.count(&expr_literal.expr()) < DUPLICATE_THRESHOLD {
             continue;
         }
 
@@ -107,7 +99,9 @@ pub(super) fn rewrite_multiple_linear_aggregates(
             expr_literal.lit(),
             expr_literal.arg_is_left(),
         )? {
-            new_aggs.push((idx, new_agg_function));
+            // Made by the function itself: charged once it is made.
+            f.charge(new_agg_function.freed_bytes())?;
+            new_aggs.push((idx, new_agg_function))?;
         }
     }
 
@@ -115,14 +109,32 @@ pub(super) fn rewrite_multiple_linear_aggregates(
         return Ok(false);
     }
 
-    // Otherwise replace the aggregate expressions
-    drop(common_args); // release borrow
-    for (idx, new_agg) in new_aggs {
-        let orig_name = agg_expr[idx].name_for_alias()?;
-        agg_expr[idx] = new_agg.alias_if_changed(orig_name)?
+    // Otherwise replace the aggregate expressions, keeping their names
+    drop(common_args);
+    drop(args);
+    for (idx, new_agg) in new_aggs.drain(..) {
+        let orig_name = f.format(format_args!("{}", agg_expr[idx].schema_name()))?;
+        let new_agg = if displays_as(new_agg.schema_name(), &orig_name) {
+            f.released(orig_name);
+            new_agg
+        } else {
+            f.charge(size_of::<Expr>())?;
+            new_agg.alias(orig_name)
+        };
+        freed(f, std::mem::replace(&mut agg_expr[idx], new_agg));
     }
 
     Ok(true)
+}
+
+/// The aggregate `agg` calls and its common linear argument, if it is a candidate for the
+/// linear rewrite.
+fn candidate(agg: &Expr) -> Option<(&AggregateFunction, ExprLiteral<'_>)> {
+    let Expr::AggregateFunction(agg_function) = agg else {
+        return None;
+    };
+    let arg = candidate_linear_param(&agg_function.params)?;
+    Some((agg_function, ExprLiteral::try_new(arg)?))
 }
 
 /// Returns Some(&Expr) with the single argument if this is a suitable candidate

@@ -71,7 +71,12 @@ pub fn scan_empty(
     let table_schema = Arc::new(table_schema.clone());
     let provider = Arc::new(EmptyTable::new(table_schema));
     let name = TableReference::bare(name.unwrap_or(UNNAMED_TABLE));
-    LogicalPlanBuilder::scan(name, provider_as_source(provider), projection)
+    LogicalPlanBuilder::scan(
+        name,
+        provider_as_source(provider),
+        projection,
+        &datafusion_common::funding::Funding::default(),
+    )
 }
 
 /// Scan an empty data source with configured partition, mainly used in tests.
@@ -84,7 +89,12 @@ pub fn scan_empty_with_partitions(
     let table_schema = Arc::new(table_schema.clone());
     let provider = Arc::new(EmptyTable::new(table_schema).with_partitions(partitions));
     let name = TableReference::bare(name.unwrap_or(UNNAMED_TABLE));
-    LogicalPlanBuilder::scan(name, provider_as_source(provider), projection)
+    LogicalPlanBuilder::scan(
+        name,
+        provider_as_source(provider),
+        projection,
+        &datafusion_common::funding::Funding::default(),
+    )
 }
 
 /// Get the schema for the aggregate_test_* csv files

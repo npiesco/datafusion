@@ -22,6 +22,7 @@ use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::{EmptyRelation, Expr, Filter, LogicalPlan};
 use std::sync::Arc;
 
+use crate::funded::{freed, unwrapped};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 
@@ -56,22 +57,31 @@ impl OptimizerRule for EliminateFilter {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         match plan {
             LogicalPlan::Filter(Filter {
                 predicate: Expr::Literal(ScalarValue::Boolean(v), _),
                 input,
                 ..
-            }) => match v {
-                Some(true) => Ok(Transformed::yes(Arc::unwrap_or_clone(input))),
-                Some(false) | None => Ok(Transformed::yes(LogicalPlan::EmptyRelation(
-                    EmptyRelation {
-                        produce_one_row: false,
-                        schema: Arc::clone(input.schema()),
-                    },
-                ))),
-            },
+            }) => {
+                let funding = config.funding();
+                match v {
+                    // The filter's block is given back; its input is moved out of it.
+                    Some(true) => Ok(Transformed::yes(unwrapped(&funding, input)?)),
+                    Some(false) | None => {
+                        let schema = Arc::clone(input.schema());
+                        // Its input is dropped: what it held alone is given back.
+                        freed(&funding, input);
+                        Ok(Transformed::yes(LogicalPlan::EmptyRelation(
+                            EmptyRelation {
+                                produce_one_row: false,
+                                schema,
+                            },
+                        )))
+                    }
+                }
+            }
             _ => Ok(Transformed::no(plan)),
         }
     }

@@ -399,7 +399,10 @@ fn from_table_source(
     target: Arc<dyn TableSource>,
     extension_codec: &dyn LogicalExtensionCodec,
 ) -> Result<LogicalPlanNode> {
-    let r = LogicalPlan::TableScan(TableScanBuilder::new(table_name, target).build()?);
+    let r = LogicalPlan::TableScan(
+        TableScanBuilder::new(table_name, target)
+            .build(&datafusion_common::funding::Funding::default())?,
+    );
 
     LogicalPlanNode::try_from_logical_plan(&r, extension_codec)
 }
@@ -534,7 +537,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let expr: Vec<Expr> =
                     from_proto::parse_exprs(&projection.expr, ctx, extension_codec)?;
 
-                let new_proj = project(input, expr)?;
+                let new_proj = project(
+                    input,
+                    expr,
+                    &datafusion_common::funding::Funding::default(),
+                )?;
                 match projection.optional_alias.as_ref() {
                     Some(a) => match a {
                         protobuf::projection_node::OptionalAlias::Alias(alias) => {
@@ -699,6 +706,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     provider_as_source(Arc::new(provider)),
                     projection,
                     filters,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -733,6 +741,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     provider_as_source(provider),
                     projection,
                     filters,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -1053,6 +1062,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     JoinConstraint::from(join_constraint),
                     NullEquality::from(null_equality),
                     join.null_aware,
+                    &datafusion_common::funding::Funding::default(),
                 )?))
             }
             LogicalPlanType::Union(union) => {
@@ -1145,6 +1155,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     table_name,
                     provider_as_source(Arc::new(provider)),
                     projection,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -1259,6 +1270,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     name.as_str(),
                     provider_as_source(Arc::new(cte_work_table)),
                     None,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }
@@ -1288,6 +1300,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     provider_as_source(provider),
                     projection,
                     filters,
+                    &datafusion_common::funding::Funding::default(),
                 )?
                 .build()
             }

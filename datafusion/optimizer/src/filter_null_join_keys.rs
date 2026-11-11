@@ -17,14 +17,14 @@
 
 //! [`FilterNullJoinKeys`] adds filters to join inputs when input isn't nullable
 
+use crate::funded::conjoined;
 use crate::optimizer::ApplyOrder;
 use crate::push_down_filter::on_lr_is_preserved;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::Transformed;
-use datafusion_common::{NullEquality, Result};
-use datafusion_expr::utils::conjunction;
+use datafusion_common::{DFSchema, NullEquality, Result};
 use datafusion_expr::{Expr, ExprSchemable, LogicalPlan, logical_plan::Filter};
-use std::sync::Arc;
 
 /// The FilterNullJoinKeys rule will identify joins with equi-join conditions
 /// where the join key is nullable and then insert an `IsNotNull` filter on the nullable side since null values
@@ -55,36 +55,38 @@ impl OptimizerRule for FilterNullJoinKeys {
                     && !join.null_aware
                     && join.null_equality == NullEquality::NullEqualsNothing =>
             {
+                let funding = config.funding();
                 let (left_preserved, right_preserved) =
                     on_lr_is_preserved(join.join_type);
 
-                let left_schema = join.left.schema();
-                let right_schema = join.right.schema();
+                let left_predicate = if left_preserved {
+                    create_not_null_predicate(
+                        &funding,
+                        join.on.iter().map(|(l, _)| l),
+                        join.left.schema(),
+                    )?
+                } else {
+                    None
+                };
+                let right_predicate = if right_preserved {
+                    create_not_null_predicate(
+                        &funding,
+                        join.on.iter().map(|(_, r)| r),
+                        join.right.schema(),
+                    )?
+                } else {
+                    None
+                };
 
-                let mut left_filters = vec![];
-                let mut right_filters = vec![];
-
-                for (l, r) in &join.on {
-                    if left_preserved && l.nullable(left_schema)? {
-                        left_filters.push(l.clone());
-                    }
-
-                    if right_preserved && r.nullable(right_schema)? {
-                        right_filters.push(r.clone());
-                    }
-                }
-
-                if !left_filters.is_empty() {
-                    let predicate = create_not_null_predicate(left_filters);
-                    join.left = Arc::new(LogicalPlan::Filter(Filter::try_new(
+                if let Some(predicate) = left_predicate {
+                    join.left = funding.arc(LogicalPlan::Filter(Filter::try_new(
                         predicate, join.left,
-                    )?));
+                    )?))?;
                 }
-                if !right_filters.is_empty() {
-                    let predicate = create_not_null_predicate(right_filters);
-                    join.right = Arc::new(LogicalPlan::Filter(Filter::try_new(
+                if let Some(predicate) = right_predicate {
+                    join.right = funding.arc(LogicalPlan::Filter(Filter::try_new(
                         predicate, join.right,
-                    )?));
+                    )?))?;
                 }
                 Ok(Transformed::yes(LogicalPlan::Join(join)))
             }
@@ -96,14 +98,25 @@ impl OptimizerRule for FilterNullJoinKeys {
     }
 }
 
-fn create_not_null_predicate(filters: Vec<Expr>) -> Expr {
-    let not_null_exprs: Vec<Expr> = filters
-        .into_iter()
-        .map(|c| Expr::IsNotNull(Box::new(c)))
-        .collect();
-
-    // directly unwrap since it should always have a value
-    conjunction(not_null_exprs).unwrap()
+/// `key IS NOT NULL` for each of `keys` nullable in `schema`, conjoined; copies and boxes
+/// charged to `funding`. None if no key is nullable.
+fn create_not_null_predicate<'a>(
+    funding: &Funding,
+    keys: impl Iterator<Item = &'a Expr>,
+    schema: &DFSchema,
+) -> Result<Option<Expr>> {
+    let mut predicate = None;
+    for key in keys {
+        if !key.nullable(schema)? {
+            continue;
+        }
+        let not_null = Expr::IsNotNull(funding.boxed(funding.cloned(key)?)?);
+        predicate = Some(match predicate {
+            None => not_null,
+            Some(predicate) => conjoined(funding, predicate, not_null)?,
+        });
+    }
+    Ok(predicate)
 }
 
 #[cfg(test)]
@@ -113,8 +126,11 @@ mod tests {
     use crate::assert_optimized_plan_eq_snapshot;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::Column;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_common::funding::PlanningFunding;
     use datafusion_expr::logical_plan::table_scan;
     use datafusion_expr::{JoinType, LogicalPlanBuilder, col, lit};
+    use std::sync::Arc;
 
     macro_rules! assert_optimized_plan_equal {
         (
@@ -405,5 +421,31 @@ mod tests {
                 true,
             )?
             .build()
+    }
+
+    /// Funding refusing everything.
+    struct Refusing;
+
+    impl PlanningFunding for Refusing {
+        fn charge(&self, _bytes: usize) -> bool {
+            false
+        }
+
+        fn discharge(&self, _bytes: usize) {}
+    }
+
+    #[test]
+    fn filtering_a_nullable_key_is_refused_unfunded() -> Result<()> {
+        let (t1, t2) = test_tables()?;
+        let plan = build_plan(t1, t2, "t1.optional_id", "t2.id", JoinType::Inner)?;
+        let mut options = ConfigOptions::default();
+        options.optimizer.filter_null_join_keys = true;
+        options.funding = Funding::new(Arc::new(Refusing));
+        let config = OptimizerContext::new_with_config_options(Arc::new(options));
+
+        let refused = FilterNullJoinKeys {}.rewrite(plan, &config).unwrap_err();
+
+        assert!(refused.refused().is_some());
+        Ok(())
     }
 }

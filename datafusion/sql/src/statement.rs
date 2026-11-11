@@ -32,6 +32,7 @@ use crate::utils::normalize_ident;
 use arrow::datatypes::{Field, FieldRef, Fields};
 use datafusion_common::error::_plan_err;
 use datafusion_common::format::ExplainStatementOptions;
+use datafusion_common::funding::Funding;
 use datafusion_common::parsers::CompressionTypeVariant;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
@@ -226,33 +227,43 @@ fn calc_inline_constraints_from_columns(columns: &[ColumnDef]) -> Vec<TableConst
 
 impl<S: ContextProvider> SqlToRel<'_, S> {
     /// Generate a logical plan from an DataFusion SQL statement
+    ///
+    /// What planning allocates is charged to [`SqlToRel::funding`] before it is made: the plan
+    /// holds what is charged since, and a failed planning keeps nothing charged.
     pub fn statement_to_plan(&self, statement: DFStatement) -> Result<LogicalPlan> {
-        match statement {
+        self.funded(|| match statement {
             DFStatement::CreateExternalTable(s) => self.external_table_to_plan(s),
-            DFStatement::Statement(s) => self.sql_statement_to_plan(*s),
+            DFStatement::Statement(s) => self
+                .sql_statement_to_plan_with_context_impl(*s, &mut PlannerContext::new()),
             DFStatement::CopyTo(s) => self.copy_to_plan(s),
             DFStatement::Explain(ExplainStatement { options, statement }) => {
                 self.explain_to_plan(options, *statement)
             }
             DFStatement::Reset(statement) => self.reset_statement_to_plan(statement),
-        }
+        })
     }
 
-    /// Generate a logical plan from an SQL statement
+    /// Generate a logical plan from an SQL statement, charged as
+    /// [`SqlToRel::statement_to_plan`] charges it.
     pub fn sql_statement_to_plan(&self, statement: Statement) -> Result<LogicalPlan> {
-        self.sql_statement_to_plan_with_context_impl(
-            statement,
-            &mut PlannerContext::new(),
-        )
+        self.funded(|| {
+            self.sql_statement_to_plan_with_context_impl(
+                statement,
+                &mut PlannerContext::new(),
+            )
+        })
     }
 
-    /// Generate a logical plan from an SQL statement
+    /// Generate a logical plan from an SQL statement, charged as
+    /// [`SqlToRel::statement_to_plan`] charges it.
     pub fn sql_statement_to_plan_with_context(
         &self,
         statement: Statement,
         planner_context: &mut PlannerContext,
     ) -> Result<LogicalPlan> {
-        self.sql_statement_to_plan_with_context_impl(statement, planner_context)
+        self.funded(|| {
+            self.sql_statement_to_plan_with_context_impl(statement, planner_context)
+        })
     }
 
     fn sql_statement_to_plan_with_context_impl(
@@ -572,9 +583,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 })
                                 .collect::<Vec<_>>();
 
-                            LogicalPlanBuilder::from(plan.clone())
-                                .project(project_exprs)?
-                                .build()?
+                            self.builder(plan)?.project(project_exprs)?.build()?
                         } else {
                             plan
                         };
@@ -829,10 +838,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     .collect::<Result<_>>()?;
 
                 // Create planner context with parameters
+                let mut param_data_types =
+                    self.funding().vec_with_capacity(fields.len())?;
+                param_data_types.extend(fields.iter().cloned().map(Some));
                 let mut planner_context = PlannerContext::new()
-                    .with_prepare_param_data_types(
-                        fields.iter().cloned().map(Some).collect(),
-                    );
+                    .with_prepare_param_data_types(param_data_types, self.funding())?;
 
                 // Build logical plan for inner statement of the prepare statement
                 let plan = self.sql_statement_to_plan_with_context_impl(
@@ -848,10 +858,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             map_types.get(&key).and_then(|opt| opt.clone())
                         })
                         .collect();
-                    fields.extend(param_types.iter().cloned());
-                    planner_context.with_prepare_param_data_types(
-                        param_types.into_iter().map(Some).collect(),
-                    );
+                    fields.extend(param_types);
                 }
 
                 Ok(LogicalPlan::Statement(PlanStatement::Prepare(Prepare {
@@ -1435,7 +1442,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             .into_iter()
                             .map(Some)
                             .collect(),
-                    );
+                        self.funding(),
+                    )?;
 
                 let function_body = match function_body {
                     Some(r) => Some(self.sql_to_expr(
@@ -1684,8 +1692,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let table_ref = self.object_name_to_table_reference(object_name)?;
                 let table_source =
                     self.context_provider.get_table_source(table_ref.clone())?;
-                let plan =
-                    LogicalPlanBuilder::scan(table_name, table_source, None)?.build()?;
+                let plan = LogicalPlanBuilder::scan(
+                    table_name,
+                    table_source,
+                    None,
+                    &Funding::default(),
+                )?
+                .build()?;
                 let input_schema = Arc::clone(plan.schema());
                 (plan, input_schema, Some(table_ref))
             }
@@ -2264,10 +2277,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let schema = DFSchema::try_from_qualified_schema(
             table_ref.clone(),
             &table_source.schema(),
+            &Funding::default(),
         )?;
-        let scan =
-            LogicalPlanBuilder::scan(table_ref.clone(), Arc::clone(&table_source), None)?
-                .build()?;
+        let scan = LogicalPlanBuilder::scan(
+            table_ref.clone(),
+            Arc::clone(&table_source),
+            None,
+            &Funding::default(),
+        )?
+        .build()?;
         let mut planner_context = PlannerContext::new();
 
         let mut source = match predicate_expr {
@@ -2290,7 +2308,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         if let Some(limit) = limit {
             let empty_schema = DFSchema::empty();
             let limit = self.sql_to_expr(limit, &empty_schema, &mut planner_context)?;
-            source = LogicalPlanBuilder::from(source)
+            source = self
+                .builder(source)?
                 .limit_by_expr(None, Some(limit))?
                 .build()?
         }
@@ -2322,6 +2341,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let table_schema = Arc::new(DFSchema::try_from_qualified_schema(
             table_name.clone(),
             &table_source.schema(),
+            &Funding::default(),
         )?);
 
         // Overwrite with assignment expressions
@@ -2408,7 +2428,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let source = project(source, exprs)?;
+        let source = project(source, exprs, self.funding())?;
 
         let plan = LogicalPlan::Dml(DmlStatement::new(
             table_name,
@@ -2497,6 +2517,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let target_schema = Arc::new(DFSchema::try_from_qualified_schema(
             target_qualifier.clone(),
             &target_table_source.schema(),
+            &Funding::default(),
         )?);
 
         // 2. Plan the source (USING clause) as a LogicalPlan
@@ -2925,8 +2946,8 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
 
         // Projection
-        let mut planner_context =
-            PlannerContext::new().with_prepare_param_data_types(prepare_param_data_types);
+        let mut planner_context = PlannerContext::new()
+            .with_prepare_param_data_types(prepare_param_data_types, self.funding())?;
         planner_context.set_table_schema(Some(DFSchemaRef::new(
             DFSchema::from_unqualified_fields(fields.clone(), Default::default())?,
         )));
@@ -2958,7 +2979,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 Ok(expr.alias(target_field.name()))
             })
             .collect::<Result<Vec<Expr>>>()?;
-        let source = project(source, exprs)?;
+        let source = project(source, exprs, self.funding())?;
 
         let insert_op = match (overwrite, replace_into) {
             (false, false) => InsertOp::Append,

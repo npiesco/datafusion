@@ -17,7 +17,7 @@
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_common::{Column, Result, not_impl_err, plan_datafusion_err};
-use datafusion_expr::{JoinType, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::{JoinType, LogicalPlan};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
 };
@@ -36,7 +36,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         };
         let old_outer_from_schema = planner_context.outer_from_schema();
         for join in t.joins {
-            planner_context.extend_outer_from_schema(left.schema())?;
+            planner_context.extend_outer_from_schema(left.schema(), self.funding())?;
             left = self.parse_relation_join(left, join, planner_context)?;
         }
         planner_context.set_outer_from_schema(old_outer_from_schema);
@@ -107,7 +107,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         left: LogicalPlan,
         right: LogicalPlan,
     ) -> Result<LogicalPlan> {
-        LogicalPlanBuilder::from(left).cross_join(right)?.build()
+        self.builder(left)?.cross_join(right)?.build()
     }
 
     fn parse_join(
@@ -124,7 +124,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 // parse ON expression
                 self.warn_on_null_equality_predicate(&sql_expr);
                 let expr = self.sql_to_expr(sql_expr, &join_schema, planner_context)?;
-                LogicalPlanBuilder::from(left)
+                self.builder(left)?
                     .join_on(right, join_type, Some(expr))?
                     .build()
             }
@@ -150,7 +150,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                LogicalPlanBuilder::from(left)
+                self.builder(left)?
                     .join_using(right, join_type, keys)?
                     .build()
             }
@@ -168,14 +168,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if keys.is_empty() {
                     self.parse_cross_join(left, right)
                 } else {
-                    LogicalPlanBuilder::from(left)
+                    self.builder(left)?
                         .join_using(right, join_type, keys)?
                         .build()
                 }
             }
-            JoinConstraint::None => LogicalPlanBuilder::from(left)
-                .join_on(right, join_type, [])?
-                .build(),
+            JoinConstraint::None => {
+                self.builder(left)?.join_on(right, join_type, [])?.build()
+            }
         }
     }
 }

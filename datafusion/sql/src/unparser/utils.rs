@@ -392,6 +392,7 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                 let filter_schema = DFSchema::try_from_qualified_schema(
                     table_scan.table_name.clone(),
                     table_schema.as_ref(),
+                    &datafusion_common::funding::Funding::default(),
                 )?;
                 // optional rewriter if table has an alias
                 let mut filter_alias_rewriter =
@@ -425,6 +426,7 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                     table_scan.table_name.clone(),
                     Arc::clone(&table_scan.source),
                     table_scan.projection.clone(),
+                    &datafusion_common::funding::Funding::default(),
                 )?;
 
                 if let Some(alias) = table_alias.take() {

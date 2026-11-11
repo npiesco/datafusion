@@ -54,7 +54,10 @@ impl ExprPlanner for AggregateFunctionPlanner {
             },
         });
 
-        let saved_name = NamePreserver::new_for_projection().save(&origin_expr);
+        let saved_name = NamePreserver::new_for_projection().save(
+            &origin_expr,
+            &datafusion_common::funding::Funding::default(),
+        )?;
 
         let Expr::AggregateFunction(AggregateFunction {
             func,
@@ -107,7 +110,8 @@ impl ExprPlanner for AggregateFunctionPlanner {
                 null_treatment,
             ));
 
-            let new_expr = saved_name.restore(new_expr);
+            let new_expr = saved_name
+                .restore(new_expr, &datafusion_common::funding::Funding::default())?;
             return Ok(PlannerResult::Planned(new_expr));
         }
 

@@ -477,6 +477,7 @@ fn rewrite_join(
             join.join_constraint,
             join.null_equality,
             join.null_aware,
+            &datafusion_common::funding::Funding::default(),
         )?)))
     } else {
         // Nothing changed; reassemble the join reusing its existing schema rather
@@ -1245,6 +1246,7 @@ mod tests {
                 name,
                 table_source_with_constraints(schema, constraints),
                 None,
+                &datafusion_common::funding::Funding::default(),
             )?
             .build()
         }

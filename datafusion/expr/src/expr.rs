@@ -214,7 +214,7 @@ impl From<sqlparser::ast::NullTreatment> for NullTreatment {
 ///     Field::new("c2", DataType::Float64, false),
 /// ]);
 /// // DFSchema is a an Arrow schema with optional relation name
-/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema).unwrap();
+/// let df_schema = DFSchema::try_from_qualified_schema("t1", &arrow_schema, &Funding::default()).unwrap();
 ///
 /// // Form Vec<Expr> with an expression for each column in the schema
 /// let exprs: Vec<_> = df_schema.iter().map(Expr::from).collect();
@@ -468,10 +468,12 @@ impl HigherOrderFunction {
             .args
             .iter()
             .map(|e| match e {
-                Expr::Lambda(lambda) => {
-                    Ok(ValueOrLambda::Lambda(Some(lambda.body.to_field(schema)?.1)))
-                }
-                _ => Ok(ValueOrLambda::Value(e.to_field(schema)?.1)),
+                Expr::Lambda(lambda) => Ok(ValueOrLambda::Lambda(Some(
+                    lambda.body.to_field(schema, &Funding::default())?.1,
+                ))),
+                _ => Ok(ValueOrLambda::Value(
+                    e.to_field(schema, &Funding::default())?.1,
+                )),
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -2940,7 +2942,7 @@ fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Resu
     if let Expr::Placeholder(Placeholder { id: _, field }) = expr
         && field.is_none()
     {
-        let other_field = other.to_field(schema);
+        let other_field = other.to_field(schema, &Funding::default());
         match other_field {
             Err(e) => {
                 Err(e.context(format!(

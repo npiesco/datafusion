@@ -1009,6 +1009,7 @@ impl DefaultPhysicalPlanner {
                 let target_schema = DFSchema::try_from_qualified_schema(
                     table_name.clone(),
                     &target.schema(),
+                    &Funding::default(),
                 )?;
                 let merge_schema = Arc::new(target_schema.join(input.schema())?);
                 provider
@@ -1593,6 +1594,7 @@ impl DefaultPhysicalPlanner {
                         let projection = LogicalPlan::Projection(Projection::try_new(
                             final_join_result,
                             Arc::new(new_join),
+                            &Funding::default(),
                         )?);
                         // LogicalPlan mutated
                         (Cow::Owned(projection), physical_left, physical_right)
@@ -1722,7 +1724,7 @@ impl DefaultPhysicalPlanner {
                             .map(|(qualifier, field)| {
                                 (qualifier.cloned(), Arc::clone(field))
                             })
-                            .collect();
+                            .collect::<Vec<_>>();
 
                         let metadata: HashMap<_, _> = left_df_schema
                             .metadata()
@@ -1734,8 +1736,9 @@ impl DefaultPhysicalPlanner {
                         // Construct intermediate schemas used for filtering data and
                         // convert logical expression to physical according to filter schema
                         let filter_df_schema = DFSchema::new_with_metadata(
-                            filter_df_fields,
+                            &filter_df_fields,
                             metadata.clone(),
+                            &Funding::default(),
                         )?;
                         let filter_schema =
                             Schema::new_with_metadata(filter_fields, metadata);
@@ -3962,12 +3965,13 @@ mod tests {
         )])?;
         let table = Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]])?);
         let source = Arc::new(DefaultTableSource::new(table));
-        let logical_plan = LogicalPlanBuilder::scan("test", source, None)?
-            .repartition(LogicalPartitioning::Range(RangePartitioning::try_new(
-                vec![col("a").sort(true, true)],
-                vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
-            )?))?
-            .build()?;
+        let logical_plan =
+            LogicalPlanBuilder::scan("test", source, None, &Funding::default())?
+                .repartition(LogicalPartitioning::Range(RangePartitioning::try_new(
+                    vec![col("a").sort(true, true)],
+                    vec![SplitPoint::new(vec![ScalarValue::Int32(Some(10))])],
+                )?))?
+                .build()?;
 
         let planner = DefaultPhysicalPlanner::default();
         let physical_plan = planner
@@ -4044,6 +4048,7 @@ mod tests {
         let projection = LogicalPlan::Projection(Projection::try_new(
             vec![col("value").alias_with_metadata("value", Some(metadata))],
             Arc::new(input),
+            &Funding::default(),
         )?);
         let aggregate = LogicalPlan::Aggregate(Aggregate::try_new(
             Arc::new(projection),
@@ -5776,8 +5781,10 @@ digraph {
         let source = DefaultTableSource::new(table);
         let source = Arc::new(source);
 
-        let left = LogicalPlanBuilder::scan("left", source.clone(), None)?;
-        let right = LogicalPlanBuilder::scan("right", source, None)?.build()?;
+        let left =
+            LogicalPlanBuilder::scan("left", source.clone(), None, &Funding::default())?;
+        let right = LogicalPlanBuilder::scan("right", source, None, &Funding::default())?
+            .build()?;
 
         let join_keys = (
             vec![Column::new(Some("left"), "a")],
@@ -6083,10 +6090,11 @@ digraph {
         let table_source = Arc::new(MockTableSource {
             schema: Arc::clone(&schema),
         });
-        let logical_plan = LogicalPlanBuilder::scan("test", table_source, None)
-            .unwrap()
-            .build()
-            .unwrap();
+        let logical_plan =
+            LogicalPlanBuilder::scan("test", table_source, None, &Funding::default())
+                .unwrap()
+                .build()
+                .unwrap();
 
         let plan = physical_planner
             .create_physical_plan(&logical_plan, &session_state)

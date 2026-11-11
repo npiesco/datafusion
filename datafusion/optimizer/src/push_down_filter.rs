@@ -4262,8 +4262,9 @@ mod tests {
             fn new() -> Self {
                 let schema = Arc::new(
                     DFSchema::new_with_metadata(
-                        vec![(None, Field::new("a", DataType::Int64, false).into())],
+                        &vec![(None, Field::new("a", DataType::Int64, false).into())],
                         Default::default(),
+                        &datafusion_common::funding::Funding::default(),
                     )
                     .unwrap(),
                 );

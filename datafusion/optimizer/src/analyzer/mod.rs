@@ -23,6 +23,7 @@ use std::sync::Arc;
 use log::debug;
 
 use datafusion_common::Result;
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::instant::Instant;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
@@ -30,6 +31,7 @@ use datafusion_expr::{InvariantLevel, LogicalPlan};
 
 use crate::analyzer::resolve_grouping_function::ResolveGroupingFunction;
 use crate::analyzer::type_coercion::TypeCoercion;
+use crate::funded::{Released, with_context};
 use crate::utils::log_plan;
 
 use self::function_rewrite::ApplyFunctionRewrites;
@@ -115,7 +117,27 @@ impl Analyzer {
 
     /// Analyze the logical plan by applying analyzer rules, and
     /// do necessary check and fail the invalid plans
+    ///
+    /// What analyzing allocates is charged to the options' funding before it is
+    /// allocated; failing, everything analyzing made is freed and given back.
     pub fn execute_and_check<F>(
+        &self,
+        plan: LogicalPlan,
+        config: &ConfigOptions,
+        observer: F,
+    ) -> Result<LogicalPlan>
+    where
+        F: FnMut(&LogicalPlan, &dyn AnalyzerRule),
+    {
+        let before = config.funding.outstanding();
+        let analyzed = self.analyze_with_rules(plan, config, observer);
+        if analyzed.is_err() {
+            config.funding.unwound(before);
+        }
+        analyzed
+    }
+
+    fn analyze_with_rules<F>(
         &self,
         plan: LogicalPlan,
         config: &ConfigOptions,
@@ -126,42 +148,54 @@ impl Analyzer {
     {
         // verify the logical plan required invariants at the start, before analyzer
         plan.check_invariants(InvariantLevel::Always)
-            .map_err(|e| e.context("Invalid input plan passed to Analyzer"))?;
+            .map_err(|e| with_context(e, || "Invalid input plan passed to Analyzer"))?;
 
         let start_time = Instant::now();
         let mut new_plan = plan;
 
         // Create an analyzer pass that rewrites `Expr`s to function_calls, as
-        // appropriate.
+        // appropriate: its list of rewrites copied, charged first, and freed with it.
         //
         // Note this is run before all other rules since it rewrites based on
         // the argument types (List or Scalar), and TypeCoercion may cast the
         // argument types from Scalar to List.
-        let expr_to_function: Option<Arc<dyn AnalyzerRule + Send + Sync>> =
-            if self.function_rewrites.is_empty() {
-                None
-            } else {
-                Some(Arc::new(ApplyFunctionRewrites::new(
-                    self.function_rewrites.clone(),
-                )))
-            };
-        let rules = expr_to_function.iter().chain(self.rules.iter());
+        let expr_to_function = if self.function_rewrites.is_empty() {
+            None
+        } else {
+            Some(Released::new(
+                &config.funding,
+                ApplyFunctionRewrites::new(
+                    config.funding.cloned(&self.function_rewrites)?,
+                ),
+                self.function_rewrites.clone_bytes(),
+            ))
+        };
+        let rules = expr_to_function
+            .iter()
+            .map(|rule| &**rule as &dyn AnalyzerRule)
+            .chain(
+                self.rules
+                    .iter()
+                    .map(|rule| rule.as_ref() as &dyn AnalyzerRule),
+            );
 
         // TODO add common rule executor for Analyzer and Optimizer
         for rule in rules {
             new_plan = rule
                 .analyze(new_plan, config)
-                .map_err(|e| e.context(rule.name()))?;
-            log_plan(rule.name(), &new_plan);
-            observer(&new_plan, rule.as_ref());
+                .map_err(|e| with_context(e, || rule.name()))?;
+            log_plan(format_args!("{}", rule.name()), &new_plan);
+            observer(&new_plan, rule);
         }
 
         // verify at the end, after the last LP analyzer pass, that the plan is executable.
         new_plan
             .check_invariants(InvariantLevel::Executable)
-            .map_err(|e| e.context("Invalid (non-executable) plan after Analyzer"))?;
+            .map_err(|e| {
+                with_context(e, || "Invalid (non-executable) plan after Analyzer")
+            })?;
 
-        log_plan("Final analyzed plan", &new_plan);
+        log_plan(format_args!("Final analyzed plan"), &new_plan);
         debug!("Analyzer took {} ms", start_time.elapsed().as_millis());
         Ok(new_plan)
     }

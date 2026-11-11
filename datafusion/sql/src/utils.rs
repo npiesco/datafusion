@@ -484,7 +484,12 @@ impl RecursiveUnnestRewriter<'_> {
         // This is due to the fact that unnest transformation should keep the original
         // column name as is, to comply with group by and order by
         let placeholder_column = Column::from_name(placeholder_name.clone());
-        let field = expr_in_unnest.to_field(self.input_schema)?.1;
+        let field = expr_in_unnest
+            .to_field(
+                self.input_schema,
+                &datafusion_common::funding::Funding::default(),
+            )?
+            .1;
         let data_type = field.data_type();
 
         match data_type {
@@ -545,7 +550,13 @@ impl TreeNodeRewriter for RecursiveUnnestRewriter<'_> {
     ///   is used to detect if some recursive unnest expr exists (e.g **unnest(unnest(unnest(3d column))))**
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         if let Expr::Unnest(ref unnest_expr) = expr {
-            let field = unnest_expr.expr.to_field(self.input_schema)?.1;
+            let field = unnest_expr
+                .expr
+                .to_field(
+                    self.input_schema,
+                    &datafusion_common::funding::Funding::default(),
+                )?
+                .1;
             let data_type = field.data_type();
             self.consecutive_unnest.push(Some(unnest_expr.clone()));
             // if expr inside unnest is a struct, do not consider

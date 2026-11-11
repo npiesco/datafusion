@@ -2179,6 +2179,7 @@ impl Unparser<'_> {
                 let filter_schema = DFSchema::try_from_qualified_schema(
                     table_scan.table_name.clone(),
                     table_schema.as_ref(),
+                    &datafusion_common::funding::Funding::default(),
                 )?;
                 let mut filter_alias_rewriter =
                     alias.as_ref().map(|alias_name| TableAliasRewriter {
@@ -2191,6 +2192,7 @@ impl Unparser<'_> {
                     table_scan.table_name.clone(),
                     Arc::clone(&table_scan.source),
                     None,
+                    &datafusion_common::funding::Funding::default(),
                 )?;
                 // We will rebase the column references to the new alias if it exists.
                 // If the projection or filters are empty, we will append alias to the table scan.
@@ -2315,6 +2317,7 @@ impl Unparser<'_> {
                         return Ok(Some(LogicalPlan::Projection(Projection::try_new(
                             exprs,
                             Arc::new(plan),
+                            &datafusion_common::funding::Funding::default(),
                         )?)));
                     }
 

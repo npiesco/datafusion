@@ -32,13 +32,16 @@ use arrow::compute::can_cast_types;
 use arrow::datatypes::FieldRef;
 use arrow::datatypes::{DataType, Field};
 use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
+use datafusion_common::cloned::CloneBytes;
 use datafusion_common::datatype::FieldExt;
+use datafusion_common::funding::Funding;
 use datafusion_common::{
     Column, DataFusionError, ExprSchema, Result, ScalarValue, Spans, TableReference,
     not_impl_err, plan_datafusion_err, plan_err,
 };
 use datafusion_expr_common::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Trait to allow expr to typable with respect to a schema
@@ -52,10 +55,12 @@ pub trait ExprSchemable {
     /// Given a schema, return the expr's optional metadata
     fn metadata(&self, schema: &dyn ExprSchema) -> Result<FieldMetadata>;
 
-    /// Convert to a field with respect to a schema
+    /// Convert to a field with respect to a schema, what it allocates charged to `funding`
+    /// first
     fn to_field(
         &self,
         input_schema: &dyn ExprSchema,
+        funding: &Funding,
     ) -> Result<(Option<TableReference>, Arc<Field>)>;
 
     /// Cast to a type with respect to a schema
@@ -88,12 +93,15 @@ fn cast_output_field(
     source_field: &FieldRef,
     target_field: &FieldRef,
     force_nullable: bool,
-) -> Arc<Field> {
+    name: String,
+    funding: &Funding,
+) -> Result<Arc<Field>> {
     // Check if this is a "type-only" cast (target_field == DataType::X.into_nullable_field())
     let is_type_only = target_field.name().is_empty()
         && target_field.is_nullable()
         && target_field.metadata().is_empty();
 
+    // A non-empty metadata map is copied uncharged: its table's size is not measured.
     let metadata = if is_type_only {
         // Type-only cast: propagate source metadata, stripping extension type keys
         let mut meta = source_field.metadata().clone();
@@ -105,15 +113,87 @@ fn cast_output_field(
         target_field.metadata().clone()
     };
 
-    let mut f = source_field
-        .as_ref()
-        .clone()
-        .with_data_type(target_field.data_type().clone())
-        .with_metadata(metadata);
+    // The source's name and type are copied with it, then freed as they are replaced.
+    let copied = source_field
+        .name()
+        .len()
+        .saturating_add(source_field.data_type().clone_bytes());
+    funding.charge(copied)?;
+    let mut f = Field::clone(source_field);
+    f.set_name(name);
+    f.set_data_type(funding.cloned(target_field.data_type())?);
+    funding.discharge(copied);
+    f.set_metadata(metadata);
     if force_nullable {
-        f = f.with_nullable(true);
+        f.set_nullable(true);
     }
-    Arc::new(f)
+    funding.arc(f)
+}
+
+/// The qualifier and name of the field `expr` is planned into, a name made for it charged
+/// to `funding` first.
+fn funded_qualified_name<'e>(
+    expr: &'e Expr,
+    funding: &Funding,
+) -> Result<(Option<TableReference>, Cow<'e, str>)> {
+    match expr {
+        Expr::Column(Column { relation, name, .. })
+        | Expr::Alias(Alias { relation, name, .. }) => {
+            // A qualifier shares its names' counted blocks.
+            Ok((relation.clone(), Cow::Borrowed(name.as_str())))
+        }
+        _ => Ok((
+            None,
+            Cow::Owned(funding.format(format_args!("{}", expr.schema_name()))?),
+        )),
+    }
+}
+
+/// `name` owned, copied through `funding` if it is borrowed.
+fn owned_name(name: Cow<'_, str>, funding: &Funding) -> Result<String> {
+    match name {
+        Cow::Owned(name) => Ok(name),
+        Cow::Borrowed(name) => funding.string(name),
+    }
+}
+
+/// `field` named `name`; a name made for it is freed and given back.
+fn renamed(field: FieldRef, name: Cow<'_, str>, funding: &Funding) -> Result<FieldRef> {
+    let field = funding.renamed_field(field, &name)?;
+    if let Cow::Owned(name) = name {
+        funding.released(name);
+    }
+    Ok(field)
+}
+
+/// The fields of `args`, listed through `funding`.
+fn arg_fields(
+    args: &[Expr],
+    schema: &dyn ExprSchema,
+    funding: &Funding,
+) -> Result<Vec<FieldRef>> {
+    let mut fields = funding.vec_with_capacity(args.len())?;
+    for arg in args {
+        let field = arg.to_field(schema, funding)?.1;
+        funding.push(&mut fields, field)?;
+    }
+    Ok(fields)
+}
+
+/// The literal values among `args`, listed through `funding`.
+fn scalar_arguments<'e>(
+    args: &'e [Expr],
+    funding: &Funding,
+) -> Result<Vec<Option<&'e ScalarValue>>> {
+    let mut arguments = funding.vec_with_capacity(args.len())?;
+    for arg in args {
+        let argument = match arg {
+            Expr::Literal(value, _) => Some(value),
+            _ => None,
+        };
+        funding.push(&mut arguments, argument)?;
+    }
+    Ok(arguments)
 }
 
 impl ExprSchemable for Expr {
@@ -208,9 +288,11 @@ impl ExprSchemable for Expr {
             }
             Expr::ScalarFunction(_)
             | Expr::WindowFunction(_)
-            | Expr::AggregateFunction(_) => {
-                Ok(self.to_field(schema)?.1.data_type().clone())
-            }
+            | Expr::AggregateFunction(_) => Ok(self
+                .to_field(schema, &Funding::default())?
+                .1
+                .data_type()
+                .clone()),
             Expr::Not(_)
             | Expr::IsNull(_)
             | Expr::Exists { .. }
@@ -250,9 +332,11 @@ impl ExprSchemable for Expr {
                 // Grouping sets do not really have a type and do not appear in projections
                 Ok(DataType::Null)
             }
-            Expr::HigherOrderFunction(_func) => {
-                Ok(self.to_field(schema)?.1.data_type().clone())
-            }
+            Expr::HigherOrderFunction(_func) => Ok(self
+                .to_field(schema, &Funding::default())?
+                .1
+                .data_type()
+                .clone()),
             Expr::Lambda(_lambda) => Ok(DataType::Null),
             Expr::LambdaVariable(LambdaVariable { field, .. }) => match field {
                 Some(f) => Ok(f.data_type().clone()),
@@ -382,7 +466,10 @@ impl ExprSchemable for Expr {
             Expr::Cast(Cast { expr, .. }) => expr.nullable(input_schema),
             Expr::ScalarFunction(_)
             | Expr::AggregateFunction(_)
-            | Expr::WindowFunction(_) => Ok(self.to_field(input_schema)?.1.is_nullable()),
+            | Expr::WindowFunction(_) => Ok(self
+                .to_field(input_schema, &Funding::default())?
+                .1
+                .is_nullable()),
             Expr::ScalarVariable(field, _) => Ok(field.is_nullable()),
             Expr::TryCast { .. } | Expr::Unnest(_) | Expr::Placeholder(_) => Ok(true),
             Expr::IsNull(_)
@@ -420,9 +507,10 @@ impl ExprSchemable for Expr {
                 // in projections
                 Ok(true)
             }
-            Expr::HigherOrderFunction(_func) => {
-                Ok(self.to_field(input_schema)?.1.is_nullable())
-            }
+            Expr::HigherOrderFunction(_func) => Ok(self
+                .to_field(input_schema, &Funding::default())?
+                .1
+                .is_nullable()),
             Expr::Lambda(_lambda) => Ok(true),
             Expr::LambdaVariable(LambdaVariable { field, .. }) => match field {
                 Some(f) => Ok(f.is_nullable()),
@@ -434,7 +522,7 @@ impl ExprSchemable for Expr {
     }
 
     fn metadata(&self, schema: &dyn ExprSchema) -> Result<FieldMetadata> {
-        self.to_field(schema)
+        self.to_field(schema, &Funding::default())
             .map(|(_, field)| FieldMetadata::from(field.metadata()))
     }
 
@@ -452,7 +540,7 @@ impl ExprSchemable for Expr {
         &self,
         schema: &dyn ExprSchema,
     ) -> Result<(DataType, bool)> {
-        let field = self.to_field(schema)?.1;
+        let field = self.to_field(schema, &Funding::default())?.1;
 
         Ok((field.data_type().clone(), field.is_nullable()))
     }
@@ -511,36 +599,50 @@ impl ExprSchemable for Expr {
     fn to_field(
         &self,
         schema: &dyn ExprSchema,
+        funding: &Funding,
     ) -> Result<(Option<TableReference>, Arc<Field>)> {
-        let (relation, schema_name) = self.qualified_name();
+        let (relation, name) = funded_qualified_name(self, funding)?;
         #[expect(deprecated)]
         let field = match self {
-            Expr::Alias(Alias {
-                expr,
-                name: _,
-                metadata,
-                ..
-            }) => {
-                let mut combined_metadata = expr.metadata(schema)?;
-                if let Some(metadata) = metadata {
-                    combined_metadata.extend(metadata.clone());
-                }
-
-                Ok(expr
-                    .to_field(schema)
-                    .map(|(_, f)| f)?
-                    .with_field_metadata(&combined_metadata))
+            Expr::Alias(Alias { expr, metadata, .. }) => {
+                let inner = expr.to_field(schema, funding)?.1;
+                let field = match metadata {
+                    Some(metadata) if !metadata.is_empty() => {
+                        // The combined metadata maps are copied uncharged: their tables'
+                        // sizes are not measured.
+                        let mut combined = FieldMetadata::from(inner.metadata());
+                        combined.extend(metadata.clone());
+                        inner.with_field_metadata(&combined)
+                    }
+                    _ => inner,
+                };
+                renamed(field, name, funding)
             }
-            Expr::Negative(expr) => expr.to_field(schema).map(|(_, f)| f),
-            Expr::Column(c) => schema.field_from_column(c).map(Arc::clone),
-            Expr::OuterReferenceColumn(field, _) => {
-                Ok(Arc::clone(field).renamed(&schema_name))
+            Expr::Negative(expr) => {
+                renamed(expr.to_field(schema, funding)?.1, name, funding)
             }
-            Expr::ScalarVariable(field, _) => Ok(Arc::clone(field).renamed(&schema_name)),
-            Expr::Literal(l, metadata) => Ok(Arc::new(
-                Field::new(&schema_name, l.data_type(), l.is_null())
-                    .with_field_metadata_opt(metadata.as_ref()),
-            )),
+            Expr::Column(c) => {
+                renamed(Arc::clone(schema.field_from_column(c)?), name, funding)
+            }
+            Expr::OuterReferenceColumn(field, _)
+            | Expr::ScalarVariable(field, _)
+            | Expr::Placeholder(Placeholder {
+                id: _,
+                field: Some(field),
+            })
+            | Expr::LambdaVariable(LambdaVariable {
+                field: Some(field), ..
+            }) => renamed(Arc::clone(field), name, funding),
+            Expr::Literal(l, metadata) => {
+                let field = Field::new(
+                    owned_name(name, funding)?,
+                    funding.scalar_type(l)?,
+                    l.is_null(),
+                );
+                // A non-empty metadata map is copied uncharged: its table's size is not
+                // measured.
+                funding.arc(field.with_field_metadata_opt(metadata.as_ref()))
+            }
             Expr::IsNull(_)
             | Expr::IsNotNull(_)
             | Expr::IsTrue(_)
@@ -549,28 +651,43 @@ impl ExprSchemable for Expr {
             | Expr::IsNotTrue(_)
             | Expr::IsNotFalse(_)
             | Expr::IsNotUnknown(_)
-            | Expr::Exists { .. } => {
-                Ok(Arc::new(Field::new(&schema_name, DataType::Boolean, false)))
-            }
-            Expr::ScalarSubquery(subquery) => {
-                Ok(Arc::clone(&subquery.subquery.schema().fields()[0]))
-            }
+            | Expr::Exists { .. } => funding.arc(Field::new(
+                owned_name(name, funding)?,
+                DataType::Boolean,
+                false,
+            )),
+            Expr::ScalarSubquery(subquery) => renamed(
+                Arc::clone(&subquery.subquery.schema().fields()[0]),
+                name,
+                funding,
+            ),
             Expr::BinaryExpr(BinaryExpr { left, right, op }) => {
-                let (left_field, right_field) =
-                    (left.to_field(schema)?.1, right.to_field(schema)?.1);
+                let (left_field, right_field) = (
+                    left.to_field(schema, funding)?.1,
+                    right.to_field(schema, funding)?.1,
+                );
 
                 let (lhs_type, lhs_nullable) =
                     (left_field.data_type(), left_field.is_nullable());
                 let (rhs_type, rhs_nullable) =
                     (right_field.data_type(), right_field.is_nullable());
+                let lhs_spans = funding.cloned(left.spans().unwrap_or(&Spans::new()))?;
+                let rhs_spans = funding.cloned(right.spans().unwrap_or(&Spans::new()))?;
+                let spans_bytes = lhs_spans
+                    .clone_bytes()
+                    .saturating_add(rhs_spans.clone_bytes());
                 let mut coercer = BinaryTypeCoercer::new(lhs_type, op, rhs_type);
-                coercer.set_lhs_spans(left.spans().cloned().unwrap_or_default());
-                coercer.set_rhs_spans(right.spans().cloned().unwrap_or_default());
-                Ok(Arc::new(Field::new(
-                    &schema_name,
-                    coercer.get_result_type()?,
+                coercer.set_lhs_spans(lhs_spans);
+                coercer.set_rhs_spans(rhs_spans);
+                let result_type = coercer.get_result_type();
+                // The coercer's copied spans are freed with it.
+                drop(coercer);
+                funding.discharge(spans_bytes);
+                funding.arc(Field::new(
+                    owned_name(name, funding)?,
+                    result_type?,
                     lhs_nullable || rhs_nullable,
-                )))
+                ))
             }
             Expr::WindowFunction(window_function) => {
                 let WindowFunction {
@@ -579,72 +696,65 @@ impl ExprSchemable for Expr {
                     ..
                 } = window_function.as_ref();
 
-                let fields = args
-                    .iter()
-                    .map(|e| e.to_field(schema).map(|(_, f)| f))
-                    .collect::<Result<Vec<_>>>()?;
-                match fun {
+                let fields = arg_fields(args, schema, funding)?;
+                let return_field = match fun {
                     WindowFunctionDefinition::AggregateUDF(udaf) => {
                         let new_fields =
                             verify_function_arguments(udaf.as_ref(), &fields)?;
-                        let return_field = udaf.return_field(&new_fields)?;
-                        Ok(return_field)
+                        udaf.return_field(&new_fields)?
                     }
                     WindowFunctionDefinition::WindowUDF(udwf) => {
                         let new_fields =
                             verify_function_arguments(udwf.as_ref(), &fields)?;
-                        let return_field = udwf
-                            .field(WindowUDFFieldArgs::new(&new_fields, &schema_name))?;
-                        Ok(return_field)
+                        udwf.field(WindowUDFFieldArgs::new(&new_fields, &name))?
                     }
-                }
+                };
+                funding.released(fields);
+                renamed(return_field, name, funding)
             }
             Expr::AggregateFunction(AggregateFunction {
                 func,
                 params: AggregateFunctionParams { args, .. },
             }) => {
-                let fields = args
-                    .iter()
-                    .map(|e| e.to_field(schema).map(|(_, f)| f))
-                    .collect::<Result<Vec<_>>>()?;
+                let fields = arg_fields(args, schema, funding)?;
                 let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
-                func.return_field(&new_fields)
+                let return_field = func.return_field(&new_fields)?;
+                funding.released(fields);
+                renamed(return_field, name, funding)
             }
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                let fields = args
-                    .iter()
-                    .map(|e| e.to_field(schema).map(|(_, f)| f))
-                    .collect::<Result<Vec<_>>>()?;
+                let fields = arg_fields(args, schema, funding)?;
                 let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
+                funding.released(fields);
 
-                let arguments = args
-                    .iter()
-                    .map(|e| match e {
-                        Expr::Literal(sv, _) => Some(sv),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                let args = ReturnFieldArgs {
+                let arguments = scalar_arguments(args, funding)?;
+                let return_field = func.return_field_from_args(ReturnFieldArgs {
                     arg_fields: &new_fields,
                     scalar_arguments: &arguments,
-                };
-
-                func.return_field_from_args(args)
+                })?;
+                funding.released(arguments);
+                renamed(return_field, name, funding)
             }
-            // _ => Ok((self.get_type(schema)?, self.nullable(schema)?)),
-            Expr::Cast(Cast { expr, field }) => expr
-                .to_field(schema)
-                .map(|(_table_ref, src)| cast_output_field(&src, field, false)),
-            Expr::Placeholder(Placeholder {
-                id: _,
-                field: Some(field),
-            }) => Ok(Arc::clone(field).renamed(&schema_name)),
-            Expr::TryCast(TryCast { expr, field }) => expr
-                .to_field(schema)
-                .map(|(_table_ref, src)| cast_output_field(&src, field, true)),
-            Expr::LambdaVariable(LambdaVariable {
-                field: Some(field), ..
-            }) => Ok(Arc::clone(field).renamed(&schema_name)),
+            Expr::Cast(Cast { expr, field }) => {
+                let source = expr.to_field(schema, funding)?.1;
+                cast_output_field(
+                    &source,
+                    field,
+                    false,
+                    owned_name(name, funding)?,
+                    funding,
+                )
+            }
+            Expr::TryCast(TryCast { expr, field }) => {
+                let source = expr.to_field(schema, funding)?.1;
+                cast_output_field(
+                    &source,
+                    field,
+                    true,
+                    owned_name(name, funding)?,
+                    funding,
+                )
+            }
             Expr::Like(_)
             | Expr::SimilarTo(_)
             | Expr::Not(_)
@@ -658,56 +768,50 @@ impl ExprSchemable for Expr {
             | Expr::Placeholder(_)
             | Expr::Unnest(_)
             | Expr::Lambda(_)
-            | Expr::LambdaVariable(_) => Ok(Arc::new(Field::new(
-                &schema_name,
-                self.get_type(schema)?,
-                self.nullable(schema)?,
-            ))),
+            | Expr::LambdaVariable(_) => {
+                let data_type = self.get_type(schema)?;
+                let nullable = self.nullable(schema)?;
+                funding.arc(Field::new(owned_name(name, funding)?, data_type, nullable))
+            }
             Expr::HigherOrderFunction(func) => {
-                let arg_fields = func
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
+                let mut arg_fields = funding.vec_with_capacity(func.args.len())?;
+                for arg in &func.args {
+                    let arg_field = match arg {
                         Expr::Lambda(Lambda { params: _, body }) => {
                             // use the name of the lambda instead of just the body to help with debugging
-                            Ok(ValueOrLambda::Lambda(Arc::new(Field::new(
-                                arg.qualified_name().1,
-                                body.get_type(schema)?,
-                                body.nullable(schema)?,
-                            ))))
+                            let (_, lambda_name) = funded_qualified_name(arg, funding)?;
+                            let data_type = body.get_type(schema)?;
+                            let nullable = body.nullable(schema)?;
+                            ValueOrLambda::Lambda(funding.arc(Field::new(
+                                owned_name(lambda_name, funding)?,
+                                data_type,
+                                nullable,
+                            ))?)
                         }
-                        _ => Ok(ValueOrLambda::Value(arg.to_field(schema)?.1)),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                        _ => ValueOrLambda::Value(arg.to_field(schema, funding)?.1),
+                    };
+                    funding.push(&mut arg_fields, arg_field)?;
+                }
 
                 let new_fields = value_fields_with_higher_order_udf_and_lambdas(
                     &arg_fields,
                     func.func.as_ref(),
                 )?;
+                funding.released(arg_fields);
 
-                let arguments = func
-                    .args
-                    .iter()
-                    .map(|e| match e {
-                        Expr::Literal(sv, _) => Some(sv),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-
-                let args = HigherOrderReturnFieldArgs {
-                    arg_fields: &new_fields,
-                    scalar_arguments: &arguments,
-                };
-
-                func.func.return_field_from_args(args)
+                let arguments = scalar_arguments(&func.args, funding)?;
+                let return_field =
+                    func.func
+                        .return_field_from_args(HigherOrderReturnFieldArgs {
+                            arg_fields: &new_fields,
+                            scalar_arguments: &arguments,
+                        })?;
+                funding.released(arguments);
+                renamed(return_field, name, funding)
             }
         }?;
 
-        Ok((
-            relation,
-            // todo avoid this rename / use the name above
-            field.renamed(&schema_name),
-        ))
+        Ok((relation, field))
     }
 
     /// Wraps this expression in a cast to a target [arrow::datatypes::DataType].
@@ -806,6 +910,7 @@ pub fn cast_subquery(subquery: Subquery, cast_to_type: &DataType) -> Result<Subq
             LogicalPlan::Projection(Projection::try_new(
                 vec![cast_expr],
                 Arc::clone(&projection.input),
+                &Funding::default(),
             )?)
         }
         _ => {
@@ -814,6 +919,7 @@ pub fn cast_subquery(subquery: Subquery, cast_to_type: &DataType) -> Result<Subq
             LogicalPlan::Projection(Projection::try_new(
                 vec![cast_expr],
                 subquery.subquery,
+                &Funding::default(),
             )?)
         }
     };
@@ -1124,7 +1230,7 @@ mod tests {
         };
         let expr = Expr::Alias(alias.with_metadata(Some(alias_metadata.clone())));
 
-        let field = expr.to_field(&schema).unwrap().1;
+        let field = expr.to_field(&schema, &Funding::default()).unwrap().1;
         assert_eq!(
             field.metadata().get("some_key"),
             Some(&"some_value".to_string())
@@ -1149,7 +1255,7 @@ mod tests {
             ),
         ));
 
-        let field = expr.to_field(&schema).unwrap().1;
+        let field = expr.to_field(&schema, &Funding::default()).unwrap().1;
         assert_eq!(
             (field.data_type(), field.is_nullable()),
             (&DataType::Utf8, true)
@@ -1157,7 +1263,8 @@ mod tests {
         assert_eq!(placeholder_meta, expr.metadata(&schema).unwrap());
 
         let expr_alias = expr.alias("a placeholder by any other name");
-        let expr_alias_field = expr_alias.to_field(&schema).unwrap().1;
+        let expr_alias_field =
+            expr_alias.to_field(&schema, &Funding::default()).unwrap().1;
         assert_eq!(
             (expr_alias_field.data_type(), expr_alias_field.is_nullable()),
             (&DataType::Utf8, true)
@@ -1169,14 +1276,15 @@ mod tests {
             "".to_string(),
             Some(Field::new("", DataType::Utf8, false).into()),
         ));
-        let expr_field = expr.to_field(&schema).unwrap().1;
+        let expr_field = expr.to_field(&schema, &Funding::default()).unwrap().1;
         assert_eq!(
             (expr_field.data_type(), expr_field.is_nullable()),
             (&DataType::Utf8, false)
         );
 
         let expr_alias = expr.alias("a placeholder by any other name");
-        let expr_alias_field = expr_alias.to_field(&schema).unwrap().1;
+        let expr_alias_field =
+            expr_alias.to_field(&schema, &Funding::default()).unwrap().1;
         assert_eq!(
             (expr_alias_field.data_type(), expr_alias_field.is_nullable()),
             (&DataType::Utf8, false)
@@ -1234,7 +1342,7 @@ mod tests {
     fn scan_t(a_nullable: bool) -> LogicalPlanBuilder {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, a_nullable)]);
         let source = Arc::new(LogicalTableSource::new(Arc::new(schema)));
-        LogicalPlanBuilder::scan("t", source, None).unwrap()
+        LogicalPlanBuilder::scan("t", source, None, &Funding::default()).unwrap()
     }
 
     #[test]
@@ -1370,7 +1478,8 @@ mod tests {
                 use_try_cast,
             );
 
-            let (_, result_field) = cast_expr.to_field(&schema).unwrap();
+            let (_, result_field) =
+                cast_expr.to_field(&schema, &Funding::default()).unwrap();
             assert!(
                 result_field
                     .metadata()
@@ -1404,7 +1513,8 @@ mod tests {
             let cast_expr =
                 make_cast_expr(col("foo"), Arc::new(target_field), use_try_cast);
 
-            let (_, result_field) = cast_expr.to_field(&schema).unwrap();
+            let (_, result_field) =
+                cast_expr.to_field(&schema, &Funding::default()).unwrap();
             assert_eq!(
                 result_field.metadata().get(EXTENSION_TYPE_NAME_KEY),
                 Some(&"arrow.json".to_string()),

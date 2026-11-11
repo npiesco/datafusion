@@ -19,15 +19,19 @@
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
+use crate::funded::{
+    apply_plan, binary, equijoin_sides, freed, hashable, map_inputs_mut,
+    map_subqueries_mut, recomputed, schema_columns, unwrapped, vacated,
+};
 use crate::join_key_set::JoinKeySet;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::funding::{Funding, Held};
+use datafusion_common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion_common::{NullEquality, Result};
 use datafusion_expr::expr::{BinaryExpr, Expr};
 use datafusion_expr::logical_plan::{
     Filter, Join, JoinConstraint, JoinType, LogicalPlan, Projection,
 };
-use datafusion_expr::utils::{can_hash, find_valid_equijoin_key_pair};
-use datafusion_expr::{ExprSchemable, Operator, and, build_join_schema};
+use datafusion_expr::{Operator, build_join_schema};
 
 #[derive(Default, Debug)]
 pub struct EliminateCrossJoin;
@@ -88,18 +92,19 @@ impl OptimizerRule for EliminateCrossJoin {
         // Fast path: nothing to do if the plan contains no `Join` nodes.
         // Without this guard the rule still falls through to
         // `rewrite_children`, which walks the entire plan, processes
-        // uncorrelated subqueries, and rewrites every direct child via
-        // `map_children` (clone-on-write) — paid by every query in the
+        // uncorrelated subqueries, and rewrites every direct child in place
+        // (copy-on-write) — paid by every query in the
         // logical optimizer pipeline. Same shape as the
         // `plan_has_subqueries` fast-path landed in #22298.
-        if !plan_has_joins(&plan) {
+        let funding = config.funding();
+        if !plan_has_joins(&funding, &plan)? {
             return Ok(Transformed::no(plan));
         }
 
         let plan_schema = Arc::clone(plan.schema());
-        let mut possible_join_keys = JoinKeySet::new();
-        let mut all_inputs: Vec<LogicalPlan> = vec![];
-        let mut all_filters: Vec<Expr> = vec![];
+        let mut possible_join_keys = JoinKeySet::new(&funding);
+        let mut all_inputs: Held<Vec<LogicalPlan>> = funding.held();
+        let mut all_filters: Held<Vec<Expr>> = funding.held();
         let mut null_equality = NullEquality::NullEqualsNothing;
 
         let parent_predicate = if let LogicalPlan::Filter(filter) = plan {
@@ -132,13 +137,14 @@ impl OptimizerRule for EliminateCrossJoin {
             }
 
             flatten_join_inputs(
-                Arc::unwrap_or_clone(input),
+                &funding,
+                unwrapped(&funding, input)?,
                 &mut possible_join_keys,
                 &mut all_inputs,
                 &mut all_filters,
             )?;
 
-            extract_possible_join_keys(&predicate, &mut possible_join_keys);
+            extract_possible_join_keys(&predicate, &mut possible_join_keys)?;
             Some(predicate)
         } else {
             match plan {
@@ -151,6 +157,7 @@ impl OptimizerRule for EliminateCrossJoin {
                         return Ok(Transformed::no(plan));
                     }
                     flatten_join_inputs(
+                        &funding,
                         plan,
                         &mut possible_join_keys,
                         &mut all_inputs,
@@ -166,11 +173,15 @@ impl OptimizerRule for EliminateCrossJoin {
             }
         };
 
-        // Join keys are handled locally:
-        let mut all_join_keys = JoinKeySet::new();
+        // Join keys are handled locally: whether each possible key joins two inputs.
+        let mut all_join_keys: Held<Vec<bool>> = funding.held();
+        all_join_keys.reserve_exact(possible_join_keys.len())?;
+        // Room for each is charged: extending allocates nothing.
+        all_join_keys.extend(std::iter::repeat_n(false, possible_join_keys.len()));
         let mut left = all_inputs.remove(0);
         while !all_inputs.is_empty() {
             left = find_inner_join(
+                &funding,
                 left,
                 &mut all_inputs,
                 &possible_join_keys,
@@ -182,17 +193,20 @@ impl OptimizerRule for EliminateCrossJoin {
         left = rewrite_children(self, left, config)?.data;
 
         if &plan_schema != left.schema() {
-            left = LogicalPlan::Projection(Projection::new_from_schema(
-                Arc::new(left),
+            left = LogicalPlan::Projection(Projection::try_new_with_schema(
+                schema_columns(&funding, &plan_schema)?,
+                funding.arc(left)?,
                 Arc::clone(&plan_schema),
-            ));
+            )?);
         }
 
         if !all_filters.is_empty() {
             // Add any filters on top - PushDownFilter can push filters down to applicable join
-            let first = all_filters.swap_remove(0);
-            let predicate = all_filters.into_iter().fold(first, and);
-            left = LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(left))?);
+            let mut predicate = all_filters.swap_remove(0);
+            for filter in all_filters.drain(..) {
+                predicate = binary(&funding, predicate, Operator::And, filter)?;
+            }
+            left = LogicalPlan::Filter(Filter::try_new(predicate, funding.arc(left)?)?);
         }
 
         let Some(predicate) = parent_predicate else {
@@ -200,13 +214,18 @@ impl OptimizerRule for EliminateCrossJoin {
         };
 
         // If there are no join keys then do nothing:
-        if all_join_keys.is_empty() {
-            Filter::try_new(predicate, Arc::new(left))
+        if !all_join_keys.contains(&true) {
+            Filter::try_new(predicate, funding.arc(left)?)
                 .map(|filter| Transformed::yes(LogicalPlan::Filter(filter)))
         } else {
             // Remove join expressions from filter:
-            match remove_join_expressions(predicate, &all_join_keys) {
-                Some(filter_expr) => Filter::try_new(filter_expr, Arc::new(left))
+            match remove_join_expressions(
+                &funding,
+                predicate,
+                &possible_join_keys,
+                &all_join_keys,
+            )? {
+                Some(filter_expr) => Filter::try_new(filter_expr, funding.arc(left)?)
                     .map(|filter| Transformed::yes(LogicalPlan::Filter(filter))),
                 _ => Ok(Transformed::yes(left)),
             }
@@ -226,44 +245,61 @@ impl OptimizerRule for EliminateCrossJoin {
 /// Used as a fast-path gate at the top of [`EliminateCrossJoin::rewrite`]
 /// so that join-free plans skip the full recursive rewrite. Subquery
 /// traversal matters because `rewrite_children` also dives into
-/// uncorrelated subqueries via `map_uncorrelated_subqueries`; ignoring
+/// uncorrelated subqueries; ignoring
 /// them here would skip optimizing a `CROSS JOIN` that sits only inside
 /// an `IN (SELECT ... FROM a, b)`-style predicate.
 ///
-/// `LogicalPlan::apply_with_subqueries` already implements the
-/// "walk this node + every child + every subquery plan" traversal we
-/// need, so the helper is a thin wrapper around it.
-fn plan_has_joins(plan: &LogicalPlan) -> bool {
+/// [`apply_plan`] walks this node, every child and every subquery plan, as
+/// `LogicalPlan::apply_with_subqueries` does, without listing any node's inputs.
+fn plan_has_joins(funding: &Funding, plan: &LogicalPlan) -> Result<bool> {
     let mut found = false;
-    let _ = plan.apply_with_subqueries(|node| {
+    apply_plan(funding, plan, true, &mut |node| {
         if matches!(node, LogicalPlan::Join(_)) {
             found = true;
             Ok(TreeNodeRecursion::Stop)
         } else {
             Ok(TreeNodeRecursion::Continue)
         }
-    });
-    found
+    })?;
+    Ok(found)
+}
+
+/// `plan` rewritten by `optimizer` in place.
+fn rewritten_in_place(
+    optimizer: &EliminateCrossJoin,
+    plan: &mut LogicalPlan,
+    config: &dyn OptimizerConfig,
+) -> Result<bool> {
+    let rewritten = optimizer.rewrite(std::mem::take(plan), config)?;
+    *plan = rewritten.data;
+    Ok(rewritten.transformed)
 }
 
 fn rewrite_children(
-    optimizer: &impl OptimizerRule,
-    plan: LogicalPlan,
+    optimizer: &EliminateCrossJoin,
+    mut plan: LogicalPlan,
     config: &dyn OptimizerConfig,
 ) -> Result<Transformed<LogicalPlan>> {
     // Process uncorrelated subqueries in expressions, then direct children.
-    let transformed_plan = plan
-        .map_uncorrelated_subqueries(|input| optimizer.rewrite(input, config))?
-        .transform_sibling(|plan| {
-            plan.map_children(|input| optimizer.rewrite(input, config))
-        })?;
+    let mut changed = map_subqueries_mut(&mut plan, &mut |subquery| {
+        if matches!(
+            subquery,
+            LogicalPlan::Subquery(sq) if sq.outer_ref_columns.is_empty()
+        ) {
+            rewritten_in_place(optimizer, subquery, config)
+        } else {
+            Ok(false)
+        }
+    })?;
+    changed |= map_inputs_mut(&config.funding(), &mut plan, &mut |input| {
+        rewritten_in_place(optimizer, input, config)
+    })?;
 
     // recompute schema if the plan was transformed
-    if transformed_plan.transformed {
-        transformed_plan.map_data(|plan| plan.recompute_schema())
-    } else {
-        Ok(transformed_plan)
+    if changed {
+        plan = recomputed(&config.funding(), plan)?;
     }
+    Ok(Transformed::new_transformed(plan, changed))
 }
 
 /// Recursively accumulate possible_join_keys and inputs from inner joins
@@ -271,34 +307,46 @@ fn rewrite_children(
 ///
 /// Assumes can_flatten_join_inputs has returned true and thus the plan can be
 /// flattened. Adds all leaf inputs to `all_inputs` and join_keys to
-/// possible_join_keys
+/// possible_join_keys, each list charged as it grows, each join's list of keys given back
 fn flatten_join_inputs(
+    funding: &Funding,
     plan: LogicalPlan,
     possible_join_keys: &mut JoinKeySet,
-    all_inputs: &mut Vec<LogicalPlan>,
-    all_filters: &mut Vec<Expr>,
+    all_inputs: &mut Held<Vec<LogicalPlan>>,
+    all_filters: &mut Held<Vec<Expr>>,
 ) -> Result<()> {
     match plan {
         LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {
-            if let Some(filter) = join.filter {
-                all_filters.push(filter);
+            let Join {
+                left,
+                right,
+                mut on,
+                filter,
+                schema,
+                ..
+            } = join;
+            if let Some(filter) = filter {
+                all_filters.push(filter)?;
             }
-            possible_join_keys.insert_all_owned(join.on);
+            possible_join_keys.insert_all_owned(on.drain(..))?;
+            freed(funding, (on, schema));
             flatten_join_inputs(
-                Arc::unwrap_or_clone(join.left),
+                funding,
+                unwrapped(funding, left)?,
                 possible_join_keys,
                 all_inputs,
                 all_filters,
             )?;
             flatten_join_inputs(
-                Arc::unwrap_or_clone(join.right),
+                funding,
+                unwrapped(funding, right)?,
                 possible_join_keys,
                 all_inputs,
                 all_filters,
             )?;
         }
         _ => {
-            all_inputs.push(plan);
+            all_inputs.push(plan)?;
         }
     };
     Ok(())
@@ -310,22 +358,22 @@ fn flatten_join_inputs(
 /// Must stay in sync with `flatten_join_inputs`
 fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
     // can only flatten inner / cross joins
-    match plan {
-        LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {}
-        _ => return false,
+    let LogicalPlan::Join(join) = plan else {
+        return false;
     };
-
-    for child in plan.inputs() {
-        if let LogicalPlan::Join(Join {
-            join_type: JoinType::Inner,
-            ..
-        }) = child
-            && !can_flatten_join_inputs(child)
-        {
-            return false;
-        }
+    if join.join_type != JoinType::Inner {
+        return false;
     }
-    true
+
+    [&join.left, &join.right].into_iter().all(|child| {
+        !matches!(
+            child.as_ref(),
+            LogicalPlan::Join(Join {
+                join_type: JoinType::Inner,
+                ..
+            })
+        ) || can_flatten_join_inputs(child)
+    })
 }
 
 /// Finds the next to join with the left input plan,
@@ -334,157 +382,181 @@ fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
 /// plan based on the join keys in `possible_join_keys`.
 ///
 /// If such a matching `right` is found:
-/// 1. Adds the matching join keys to `all_join_keys`.
-/// 2. Returns `left_input JOIN right ON (all join keys)`.
+/// 1. Marks the matching join keys in `all_join_keys`.
+/// 2. Returns `left_input JOIN right ON (all join keys)`, the keys copied.
 ///
 /// If no matching `right` is found:
 /// 1. Removes the first plan from `rights`
 /// 2. Returns `left_input CROSS JOIN right`.
 fn find_inner_join(
+    funding: &Funding,
     left_input: LogicalPlan,
-    rights: &mut Vec<LogicalPlan>,
+    rights: &mut Held<Vec<LogicalPlan>>,
     possible_join_keys: &JoinKeySet,
-    all_join_keys: &mut JoinKeySet,
+    all_join_keys: &mut [bool],
     null_equality: NullEquality,
 ) -> Result<LogicalPlan> {
-    for (i, right_input) in rights.iter().enumerate() {
+    for i in 0..rights.len() {
+        let right_input = &rights[i];
         let mut join_keys = vec![];
 
-        for (l, r) in possible_join_keys.iter() {
-            let key_pair = find_valid_equijoin_key_pair(
-                l,
-                r,
-                left_input.schema(),
-                right_input.schema(),
-            )?;
+        for (at, (l, r)) in possible_join_keys.iter().enumerate() {
+            let Some(swapped) =
+                equijoin_sides(l, r, left_input.schema(), right_input.schema())?
+            else {
+                continue;
+            };
+            let (valid_l, valid_r) = if swapped { (r, l) } else { (l, r) };
 
             // Save join keys
-            if let Some((valid_l, valid_r)) = key_pair
-                && can_hash(&valid_l.get_type(left_input.schema())?)
-            {
-                join_keys.push((valid_l, valid_r));
+            if hashable(valid_l, left_input.schema())? {
+                let key = (funding.cloned(valid_l)?, funding.cloned(valid_r)?);
+                funding.push(&mut join_keys, key)?;
+                all_join_keys[at] = true;
             }
         }
 
         // Found one or more matching join keys
         if !join_keys.is_empty() {
-            all_join_keys.insert_all(join_keys.iter());
             let right_input = rights.remove(i);
-            let join_schema = Arc::new(build_join_schema(
-                left_input.schema(),
-                right_input.schema(),
-                &JoinType::Inner,
-            )?);
-
-            return Ok(LogicalPlan::Join(Join {
-                left: Arc::new(left_input),
-                right: Arc::new(right_input),
-                join_type: JoinType::Inner,
-                join_constraint: JoinConstraint::On,
-                on: join_keys,
-                filter: None,
-                schema: join_schema,
+            return inner_join(
+                funding,
+                left_input,
+                right_input,
+                join_keys,
                 null_equality,
-                null_aware: false,
-            }));
+            );
         }
     }
 
     // no matching right plan had any join keys, cross join with the first right
     // plan
     let right = rights.remove(0);
-    let join_schema = Arc::new(build_join_schema(
-        left_input.schema(),
+    inner_join(funding, left_input, right, vec![], null_equality)
+}
+
+/// `left` joined to `right` on `on`, the join's schema and inputs' blocks charged before
+/// they are made.
+fn inner_join(
+    funding: &Funding,
+    left: LogicalPlan,
+    right: LogicalPlan,
+    on: Vec<(Expr, Expr)>,
+    null_equality: NullEquality,
+) -> Result<LogicalPlan> {
+    let join_schema = funding.arc(build_join_schema(
+        left.schema(),
         right.schema(),
         &JoinType::Inner,
-    )?);
+        funding,
+    )?)?;
 
     Ok(LogicalPlan::Join(Join {
-        left: Arc::new(left_input),
-        right: Arc::new(right),
-        schema: join_schema,
-        on: vec![],
-        filter: None,
+        left: funding.arc(left)?,
+        right: funding.arc(right)?,
         join_type: JoinType::Inner,
         join_constraint: JoinConstraint::On,
+        on,
+        filter: None,
+        schema: join_schema,
         null_equality,
         null_aware: false,
     }))
 }
 
 /// Extract join keys from a WHERE clause
-fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
+fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) -> Result<()> {
     if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr {
         match op {
             Operator::Eq => {
                 // insert handles ensuring  we don't add the same Join keys multiple times
-                join_keys.insert(left, right);
+                join_keys.insert(left, right)?;
             }
             Operator::And => {
-                extract_possible_join_keys(left, join_keys);
-                extract_possible_join_keys(right, join_keys)
+                extract_possible_join_keys(left, join_keys)?;
+                extract_possible_join_keys(right, join_keys)?;
             }
             // Fix for issue#78 join predicates from inside of OR expr also pulled up properly.
             Operator::Or => {
-                let mut left_join_keys = JoinKeySet::new();
-                let mut right_join_keys = JoinKeySet::new();
+                let mut left_join_keys = JoinKeySet::new(join_keys.funding());
+                let mut right_join_keys = JoinKeySet::new(join_keys.funding());
 
-                extract_possible_join_keys(left, &mut left_join_keys);
-                extract_possible_join_keys(right, &mut right_join_keys);
+                extract_possible_join_keys(left, &mut left_join_keys)?;
+                extract_possible_join_keys(right, &mut right_join_keys)?;
 
-                join_keys.insert_intersection(&left_join_keys, &right_join_keys)
+                join_keys.insert_intersection(&left_join_keys, &right_join_keys)?;
             }
             _ => (),
         };
     }
+    Ok(())
 }
 
-/// Remove join expressions from a filter expression
+/// Remove join expressions from a filter expression, each removed freed and given back
 ///
 /// # Returns
 /// * `Some()` when there are few remaining predicates in filter_expr
 /// * `None` otherwise
-fn remove_join_expressions(expr: Expr, join_keys: &JoinKeySet) -> Option<Expr> {
-    match expr {
+fn remove_join_expressions(
+    funding: &Funding,
+    expr: Expr,
+    possible_join_keys: &JoinKeySet,
+    all_join_keys: &[bool],
+) -> Result<Option<Expr>> {
+    let is_join_key = |left: &Expr, right: &Expr| {
+        possible_join_keys
+            .position(left, right)
+            .is_some_and(|at| all_join_keys[at])
+    };
+    Ok(match expr {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: Operator::Eq,
             right,
-        }) if join_keys.contains(&left, &right) => {
+        }) if is_join_key(left.as_ref(), right.as_ref()) => {
             // was a join key, so remove it
+            freed(funding, (left, right));
             None
         }
         // Fix for issue#78 join predicates from inside of OR expr also pulled up properly.
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == Operator::And => {
-            let l = remove_join_expressions(*left, join_keys);
-            let r = remove_join_expressions(*right, join_keys);
+        Expr::BinaryExpr(BinaryExpr {
+            mut left,
+            op,
+            mut right,
+        }) if matches!(op, Operator::And | Operator::Or) => {
+            let l = remove_join_expressions(
+                funding,
+                std::mem::replace(left.as_mut(), vacated()),
+                possible_join_keys,
+                all_join_keys,
+            )?;
+            let r = remove_join_expressions(
+                funding,
+                std::mem::replace(right.as_mut(), vacated()),
+                possible_join_keys,
+                all_join_keys,
+            )?;
             match (l, r) {
-                (Some(ll), Some(rr)) => Some(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(ll),
-                    op,
-                    Box::new(rr),
-                ))),
-                (Some(ll), _) => Some(ll),
-                (_, Some(rr)) => Some(rr),
-                _ => None,
-            }
-        }
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == Operator::Or => {
-            let l = remove_join_expressions(*left, join_keys);
-            let r = remove_join_expressions(*right, join_keys);
-            match (l, r) {
-                (Some(ll), Some(rr)) => Some(Expr::BinaryExpr(BinaryExpr::new(
-                    Box::new(ll),
-                    op,
-                    Box::new(rr),
-                ))),
+                (Some(ll), Some(rr)) => {
+                    *left = ll;
+                    *right = rr;
+                    Some(Expr::BinaryExpr(BinaryExpr::new(left, op, right)))
+                }
+                (Some(kept), None) | (None, Some(kept)) if op == Operator::And => {
+                    freed(funding, (left, right));
+                    Some(kept)
+                }
                 // When either `left` or `right` is empty, it means they are `true`
                 // so OR'ing anything with them will also be true
-                _ => None,
+                (l, r) => {
+                    freed(funding, (left, right));
+                    freed(funding, (l, r));
+                    None
+                }
             }
         }
         _ => Some(expr),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1402,6 +1474,7 @@ mod tests {
             t1.schema(),
             t2.schema(),
             &JoinType::Inner,
+            &Funding::default(),
         )?);
 
         let inner_join = LogicalPlan::Join(Join {
@@ -1466,7 +1539,7 @@ mod tests {
         let plan = LogicalPlanBuilder::from(test_table_scan_with_name("t1")?)
             .cross_join(test_table_scan_with_name("t2")?)?
             .build()?;
-        assert!(plan_has_joins(&plan));
+        assert!(plan_has_joins(&Funding::default(), &plan)?);
         Ok(())
     }
 
@@ -1478,7 +1551,7 @@ mod tests {
             .filter(col("t1.a").eq(col("t2.a")))?
             .project(vec![col("t1.a")])?
             .build()?;
-        assert!(plan_has_joins(&plan));
+        assert!(plan_has_joins(&Funding::default(), &plan)?);
         Ok(())
     }
 
@@ -1490,7 +1563,7 @@ mod tests {
             .filter(col("a").gt(lit(0_i32)))?
             .project(vec![col("a"), col("b")])?
             .build()?;
-        assert!(!plan_has_joins(&plan));
+        assert!(!plan_has_joins(&Funding::default(), &plan)?);
         Ok(())
     }
 
@@ -1518,7 +1591,7 @@ mod tests {
             .build()?;
 
         assert!(
-            plan_has_joins(&outer),
+            plan_has_joins(&Funding::default(), &outer)?,
             "plan_has_joins must descend into subquery plans"
         );
         Ok(())
@@ -1553,6 +1626,23 @@ mod tests {
             starting_display,
             optimized_plan.display_indent_schema().to_string()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn eliminating_a_cross_join_is_refused_unfunded() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+        let plan = LogicalPlanBuilder::from(t1)
+            .cross_join(t2)?
+            .filter(col("t1.a").eq(col("t2.a")))?
+            .build()?;
+
+        let refused = EliminateCrossJoin::new()
+            .rewrite(plan, &refusing_context())
+            .unwrap_err();
+
+        assert!(refused.refused().is_some());
         Ok(())
     }
 }

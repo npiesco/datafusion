@@ -55,6 +55,7 @@
 //! ```
 
 use arrow::datatypes::DataType;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_expr::{BinaryExpr, lit};
@@ -64,7 +65,12 @@ use datafusion_expr_common::casts::{
     try_cast_literal_to_type,
 };
 
+use crate::funded::{Freed, freed};
+
+/// The literal's cast made by the cast kernels, which take no funding: what it holds is
+/// charged to `f` as soon as it is made. The cast's box and the literal are given back.
 pub(super) fn unwrap_cast_in_comparison_for_binary(
+    f: &Funding,
     info: &SimplifyContext,
     cast_expr: Expr,
     literal: Expr,
@@ -73,34 +79,34 @@ pub(super) fn unwrap_cast_in_comparison_for_binary(
     match (cast_expr, literal) {
         (
             Expr::TryCast(TryCast { expr, .. }) | Expr::Cast(Cast { expr, .. }),
-            Expr::Literal(lit_value, _),
+            Expr::Literal(lit_value, metadata),
         ) => {
             let Ok(expr_type) = info.get_data_type(&expr) else {
                 return internal_err!("Can't get the data type of the expr {:?}", &expr);
             };
 
-            if let Some(value) = cast_literal_to_type_with_op(&lit_value, &expr_type, op)
-            {
-                return Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr {
-                    left: expr,
-                    op,
-                    right: Box::new(lit(value)),
-                })));
+            let value = match cast_literal_to_type_with_op(&lit_value, &expr_type, op) {
+                Some(value) => value,
+                // if the lit_value can be casted to the type of internal_left_expr
+                // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
+                None => {
+                    let Some(value) = try_cast_literal_to_type(&lit_value, &expr_type)
+                    else {
+                        return internal_err!(
+                            "Can't cast the literal expr {:?} to type {}",
+                            &lit_value,
+                            &expr_type
+                        );
+                    };
+                    value
+                }
             };
-
-            // if the lit_value can be casted to the type of internal_left_expr
-            // we need to unwrap the cast for cast/try_cast expr, and add cast to the literal
-            let Some(value) = try_cast_literal_to_type(&lit_value, &expr_type) else {
-                return internal_err!(
-                    "Can't cast the literal expr {:?} to type {}",
-                    &lit_value,
-                    &expr_type
-                );
-            };
+            f.charge(value.freed_bytes())?;
+            freed(f, Expr::Literal(lit_value, metadata));
             Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr {
                 left: expr,
                 op,
-                right: Box::new(lit(value)),
+                right: f.boxed(lit(value))?,
             })))
         }
         _ => internal_err!("Expect cast expr and literal"),

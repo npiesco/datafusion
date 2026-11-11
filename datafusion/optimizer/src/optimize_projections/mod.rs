@@ -19,6 +19,7 @@
 
 mod required_indices;
 
+use crate::funded::{freed, recomputed};
 use crate::optimizer::ApplyOrder;
 use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
@@ -35,6 +36,7 @@ use datafusion_expr::{
 
 use crate::optimize_projections::required_indices::RequiredIndices;
 use crate::utils::NamePreserver;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeContainer};
 
 /// Optimizer rule to prune unnecessary columns from intermediate schemas
@@ -133,7 +135,7 @@ fn optimize_projections(
     // their parents' required indices.
     match plan {
         LogicalPlan::Projection(proj) => {
-            return merge_consecutive_projections(proj)?
+            return merge_consecutive_projections(proj, &config.funding())?
                 .transform_data(|proj| {
                     rewrite_projection_given_requirements(proj, config, &indices)
                 })?
@@ -211,7 +213,11 @@ fn optimize_projections(
                 // that its input only contains absolutely necessary columns for
                 // the aggregate expressions. Note that necessary_indices refer to
                 // fields in `aggregate.input.schema()`.
-                add_projection_on_top_if_helpful(aggregate_input, necessary_exprs)
+                add_projection_on_top_if_helpful(
+                    aggregate_input,
+                    necessary_exprs,
+                    &config.funding(),
+                )
             })?
             .map_data(|aggregate_input| {
                 // Create a new aggregate plan with the updated input and only the
@@ -256,9 +262,12 @@ fn optimize_projections(
                     // refers to that schema
                     let required_exprs =
                         required_indices.get_required_exprs(&input_schema);
-                    let window_child =
-                        add_projection_on_top_if_helpful(window_child, required_exprs)?
-                            .data;
+                    let window_child = add_projection_on_top_if_helpful(
+                        window_child,
+                        required_exprs,
+                        &config.funding(),
+                    )?
+                    .data;
                     Window::try_new(new_window_expr, Arc::new(window_child))
                         .map(LogicalPlan::Window)
                         .map(Transformed::yes)
@@ -266,16 +275,21 @@ fn optimize_projections(
             })?
             .transform_data(|plan| optimize_subqueries(plan, config));
         }
-        LogicalPlan::TableScan(table_scan) => {
+        LogicalPlan::TableScan(mut table_scan) => {
+            let funding = config.funding();
             // Get indices referred to in the original (schema with all fields)
             // given projected indices.
-            let projection = match &table_scan.projection {
-                Some(projection) => indices.into_mapped_indices(|idx| projection[idx]),
+            let projection = match table_scan.projection.take() {
+                Some(projection) => {
+                    let mapped = indices.into_mapped_indices(|idx| projection[idx]);
+                    freed(&funding, projection);
+                    mapped
+                }
                 None => indices.into_inner(),
             };
             let new_scan = TableScanBuilder::from(table_scan)
                 .with_projection(Some(projection))
-                .build()?;
+                .build(&funding)?;
 
             return Transformed::yes(LogicalPlan::TableScan(new_scan))
                 .transform_data(|plan| optimize_subqueries(plan, config));
@@ -459,7 +473,11 @@ fn optimize_projections(
         optimize_projections(child, config, required_indices)?.transform_data(
             |new_input| {
                 if projection_beneficial {
-                    add_projection_on_top_if_helpful(new_input, project_exprs)
+                    add_projection_on_top_if_helpful(
+                        new_input,
+                        project_exprs,
+                        &config.funding(),
+                    )
                 } else {
                     Ok(Transformed::no(new_input))
                 }
@@ -472,7 +490,7 @@ fn optimize_projections(
 
     // If any of the children are transformed, we need to potentially update the plan's schema
     if transformed_plan.transformed {
-        transformed_plan.map_data(|plan| plan.recompute_schema())
+        transformed_plan.map_data(|plan| recomputed(&config.funding(), plan))
     } else {
         Ok(transformed_plan)
     }
@@ -521,7 +539,10 @@ fn optimize_subqueries(
 ///   merged projection.
 /// - `Ok(None)`: Signals that merge is not beneficial (and has not taken place).
 /// - `Err(error)`: An error occurred during the function call.
-fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Projection>> {
+fn merge_consecutive_projections(
+    proj: Projection,
+    funding: &Funding,
+) -> Result<Transformed<Projection>> {
     // Collapse the whole chain in one pass; otherwise an N-deep chain needs
     // N outer optimizer passes to fully fold.
     let mut current = proj;
@@ -529,7 +550,7 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
     loop {
         let Transformed {
             data, transformed, ..
-        } = merge_consecutive_projections_one_level(current)?;
+        } = merge_consecutive_projections_one_level(current, funding)?;
         current = data;
         if !transformed {
             break;
@@ -545,6 +566,7 @@ fn merge_consecutive_projections(proj: Projection) -> Result<Transformed<Project
 
 fn merge_consecutive_projections_one_level(
     proj: Projection,
+    funding: &Funding,
 ) -> Result<Transformed<Projection>> {
     let Projection {
         expr,
@@ -595,7 +617,7 @@ fn merge_consecutive_projections_one_level(
     let name_preserver = NamePreserver::new_for_projection();
     let mut original_names = vec![];
     let new_exprs = expr.map_elements(|expr| {
-        original_names.push(name_preserver.save(&expr));
+        original_names.push(name_preserver.save(&expr, funding)?);
 
         // do not rewrite top level Aliases (rewriter will remove all aliases within exprs)
         match expr {
@@ -636,9 +658,10 @@ fn merge_consecutive_projections_one_level(
             .data
             .into_iter()
             .zip(original_names)
-            .map(|(expr, original_name)| original_name.restore(expr))
-            .collect::<Vec<_>>();
-        Projection::try_new(new_exprs, prev_projection.input).map(Transformed::yes)
+            .map(|(expr, original_name)| original_name.restore(expr, funding))
+            .collect::<Result<Vec<_>>>()?;
+        Projection::try_new(new_exprs, prev_projection.input, funding)
+            .map(Transformed::yes)
     } else {
         // not rewritten, so put the projection back together
         let input = Arc::new(LogicalPlan::Projection(prev_projection));
@@ -809,12 +832,13 @@ fn split_join_requirements(
 fn add_projection_on_top_if_helpful(
     plan: LogicalPlan,
     project_exprs: Vec<Expr>,
+    funding: &Funding,
 ) -> Result<Transformed<LogicalPlan>> {
     // Make sure projection decreases the number of columns, otherwise it is unnecessary.
     if project_exprs.len() >= plan.schema().fields().len() {
         Ok(Transformed::no(plan))
     } else {
-        Projection::try_new(project_exprs, Arc::new(plan))
+        Projection::try_new(project_exprs, funding.arc(plan)?, funding)
             .map(LogicalPlan::Projection)
             .map(Transformed::yes)
     }
@@ -856,7 +880,8 @@ fn rewrite_projection_given_requirements(
             if is_projection_unnecessary(&input, &exprs_used)? {
                 Ok(Transformed::yes(input))
             } else {
-                Projection::try_new(exprs_used, Arc::new(input))
+                let funding = config.funding();
+                Projection::try_new(exprs_used, funding.arc(input)?, &funding)
                     .map(LogicalPlan::Projection)
                     .map(Transformed::yes)
             }
@@ -1034,7 +1059,13 @@ mod tests {
             let left_schema = left_child.schema();
             let right_schema = right_child.schema();
             let schema = Arc::new(
-                build_join_schema(left_schema, right_schema, &JoinType::Inner).unwrap(),
+                build_join_schema(
+                    left_schema,
+                    right_schema,
+                    &JoinType::Inner,
+                    &datafusion_common::funding::Funding::default(),
+                )
+                .unwrap(),
             );
             Self {
                 exprs: vec![],
@@ -1866,7 +1897,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                vec![
+                &vec![
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1880,7 +1911,8 @@ mod tests {
                         Arc::new(Field::new("c1", DataType::UInt32, true))
                     ),
                 ],
-                HashMap::new()
+                HashMap::new(),
+                &datafusion_common::funding::Funding::default()
             )?,
         );
 
@@ -1921,7 +1953,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                vec![
+                &vec![
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1935,7 +1967,8 @@ mod tests {
                         Arc::new(Field::new("c1", DataType::UInt32, true))
                     ),
                 ],
-                HashMap::new()
+                HashMap::new(),
+                &datafusion_common::funding::Funding::default()
             )?,
         );
 
@@ -1974,7 +2007,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                vec![
+                &vec![
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1988,7 +2021,8 @@ mod tests {
                         Arc::new(Field::new("a", DataType::UInt32, true))
                     ),
                 ],
-                HashMap::new()
+                HashMap::new(),
+                &datafusion_common::funding::Funding::default()
             )?,
         );
 
@@ -2043,8 +2077,11 @@ mod tests {
         // that the Column references are unqualified (e.g. their
         // relation is `None`). PlanBuilder resolves the expressions
         let expr = vec![col("test.a"), col("test.b")];
-        let plan =
-            LogicalPlan::Projection(Projection::try_new(expr, Arc::new(table_scan))?);
+        let plan = LogicalPlan::Projection(Projection::try_new(
+            expr,
+            Arc::new(table_scan),
+            &datafusion_common::funding::Funding::default(),
+        )?);
 
         assert_fields_eq(&plan, vec!["a", "b"]);
 

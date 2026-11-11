@@ -16,7 +16,7 @@
 // under the License.
 
 //! [`SqlToRel`]: SQL Query Planner (produces [`LogicalPlan`] from SQL AST)
-use std::collections::HashMap;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::vec;
@@ -27,15 +27,15 @@ use datafusion_common::TableReference;
 use datafusion_common::config::SqlParserOptions;
 use datafusion_common::datatype::{DataTypeExt, FieldExt};
 use datafusion_common::error::add_possible_columns_to_diag;
-use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
+use datafusion_common::funding::{Funding, Held};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
-    DFSchemaRef, Diagnostic, SchemaError, field_not_found, internal_err,
-    plan_datafusion_err,
+    Column, DFSchemaRef, Diagnostic, SchemaError, field_not_found, plan_datafusion_err,
 };
+use datafusion_common::{DFSchema, DataFusionError, Result, not_impl_err, plan_err};
 use datafusion_expr::Expr;
 use datafusion_expr::logical_plan::{LogicalPlan, LogicalPlanBuilder};
 pub use datafusion_expr::planner::ContextProvider;
-use datafusion_expr::utils::find_column_exprs;
 use sqlparser::ast::{ArrayElemTypeDef, ExactNumberInfo, TimezoneInfo};
 use sqlparser::ast::{ColumnDef as SQLColumnDef, ColumnOption};
 use sqlparser::ast::{DataType as SQLDataType, Ident, ObjectName, TableAlias};
@@ -247,24 +247,26 @@ impl IdentNormalizer {
 /// Parameter Data Types provided with PREPARE statement and the query schema of the
 /// outer query plan.
 ///
-/// # Cloning
+/// # Scoping
 ///
-/// Only the `ctes` are truly cloned when the `PlannerContext` is cloned.
-/// This helps resolve scoping issues of CTEs.
-/// By using cloning, a subquery can inherit CTEs from the outer query
-/// and can also define its own private CTEs without affecting the outer query.
-#[derive(Debug, Clone)]
+/// A subquery plans within its own context ([`PlannerContext::try_clone`]): it inherits the
+/// CTEs of the outer query and can define its own private CTEs without affecting the outer
+/// query.
+///
+/// The lists it grows are charged to the funding of the planner growing them, and given
+/// back as the context is freed.
+#[derive(Default)]
 pub struct PlannerContext {
     /// Data types for numbered parameters ($1, $2, etc), if supplied
-    /// in `PREPARE` statement
-    prepare_param_data_types: Arc<Vec<Option<FieldRef>>>,
-    /// Map of CTE name to logical plan of the WITH clause.
-    /// Use `Arc<LogicalPlan>` to allow cheap cloning
-    ctes: HashMap<String, Arc<LogicalPlan>>,
+    /// in `PREPARE` statement: none, without allocating for them
+    prepare_param_data_types: Option<Arc<Vec<Option<FieldRef>>>>,
+    /// The logical plan of each CTE of the WITH clause, by name: a later one of a name
+    /// shadows an earlier.
+    ctes: HeldList<(Arc<str>, Arc<LogicalPlan>)>,
 
     /// The queries schemas of outer query relations, used to resolve the outer referenced
     /// columns in subquery (recursive aware)
-    outer_queries_schemas_stack: Vec<DFSchemaRef>,
+    outer_queries_schemas_stack: HeldList<DFSchemaRef>,
     /// The joined schemas of all FROM clauses planned so far. When planning LATERAL
     /// FROM clauses, this should become a suffix of the `outer_query_schema`.
     outer_from_schema: Option<DFSchemaRef>,
@@ -274,43 +276,110 @@ pub struct PlannerContext {
     /// (UNION/INTERSECT/EXCEPT), holds the schema of the left-most query.
     /// Used to alias duplicate expressions to match the left side's field names.
     set_expr_left_schema: Option<DFSchemaRef>,
-    /// The parameters of all lambdas seen so far
-    lambda_parameters: HashMap<String, FieldRef>,
+    /// The parameters of all lambdas seen so far: a later one of a name shadows an earlier.
+    lambda_parameters: HeldList<FieldRef>,
 }
 
-impl Default for PlannerContext {
+impl fmt::Debug for PlannerContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlannerContext")
+            .field("prepare_param_data_types", &self.prepare_param_data_types)
+            .field("ctes", &self.ctes.as_slice())
+            .field(
+                "outer_queries_schemas_stack",
+                &self.outer_queries_schemas_stack.as_slice(),
+            )
+            .field("outer_from_schema", &self.outer_from_schema)
+            .field("create_table_schema", &self.create_table_schema)
+            .field("set_expr_left_schema", &self.set_expr_left_schema)
+            .field("lambda_parameters", &self.lambda_parameters.as_slice())
+            .finish()
+    }
+}
+
+/// A list a [`PlannerContext`] grows, allocating nothing until it does: its room charged to
+/// the funding of whoever grows it, and given back as it is freed.
+struct HeldList<T>(Option<Held<Vec<T>>>);
+
+impl<T> Default for HeldList<T> {
     fn default() -> Self {
-        Self::new()
+        Self(None)
+    }
+}
+
+impl<T> HeldList<T> {
+    fn as_slice(&self) -> &[T] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    fn push(&mut self, funding: &Funding, item: T) -> Result<()> {
+        self.0.get_or_insert_with(|| funding.held()).push(item)
+    }
+
+    fn pop(&mut self) -> Option<T> {
+        self.0.as_deref_mut().and_then(Vec::pop)
+    }
+
+    fn remove(&mut self, index: usize) -> T {
+        match self.0.as_deref_mut() {
+            Some(list) => list.remove(index),
+            None => unreachable!("an empty list has nothing to remove"),
+        }
+    }
+
+    /// A copy, in room for exactly its items, charged to `funding`.
+    fn try_clone(&self, funding: &Funding) -> Result<Self>
+    where
+        T: Clone,
+    {
+        let items = self.as_slice();
+        if items.is_empty() {
+            return Ok(Self(None));
+        }
+        let mut copy = funding.held::<Vec<T>>();
+        copy.reserve_exact(items.len())?;
+        copy.extend_from_slice(items);
+        Ok(Self(Some(copy)))
     }
 }
 
 impl PlannerContext {
     /// Create an empty PlannerContext
     pub fn new() -> Self {
-        Self {
-            prepare_param_data_types: Arc::new(vec![]),
-            ctes: HashMap::new(),
-            outer_queries_schemas_stack: vec![],
-            outer_from_schema: None,
-            create_table_schema: None,
-            set_expr_left_schema: None,
-            lambda_parameters: HashMap::new(),
-        }
+        Self::default()
     }
 
-    /// Update the PlannerContext with provided prepare_param_data_types
+    /// A context for a subquery: the outer query's CTEs, parameters and schemas, in lists
+    /// of its own charged to `funding`.
+    pub fn try_clone(&self, funding: &Funding) -> Result<Self> {
+        Ok(Self {
+            prepare_param_data_types: self.prepare_param_data_types.clone(),
+            ctes: self.ctes.try_clone(funding)?,
+            outer_queries_schemas_stack: self
+                .outer_queries_schemas_stack
+                .try_clone(funding)?,
+            outer_from_schema: self.outer_from_schema.clone(),
+            create_table_schema: self.create_table_schema.clone(),
+            set_expr_left_schema: self.set_expr_left_schema.clone(),
+            lambda_parameters: self.lambda_parameters.try_clone(funding)?,
+        })
+    }
+
+    /// Update the PlannerContext with provided prepare_param_data_types, held in a counted
+    /// block charged to `funding`
     pub fn with_prepare_param_data_types(
         mut self,
         prepare_param_data_types: Vec<Option<FieldRef>>,
-    ) -> Self {
-        self.prepare_param_data_types = prepare_param_data_types.into();
-        self
+        funding: &Funding,
+    ) -> Result<Self> {
+        self.prepare_param_data_types = Some(funding.arc(prepare_param_data_types)?);
+        Ok(self)
     }
 
     /// Return the stack of outer relations' schemas, the outer most
     /// relation are at the first entry
     pub fn outer_queries_schemas(&self) -> &[DFSchemaRef] {
-        &self.outer_queries_schemas_stack
+        self.outer_queries_schemas_stack.as_slice()
     }
 
     /// Return an iterator of the subquery relations' schemas, innermost
@@ -326,18 +395,21 @@ impl PlannerContext {
     /// This is useful to resolve the column reference in the subquery by
     /// looking up the outer query schemas one by one.
     pub fn outer_schemas_iter(&self) -> impl Iterator<Item = &DFSchemaRef> {
-        self.outer_queries_schemas_stack.iter().rev()
+        self.outer_queries_schemas().iter().rev()
     }
 
-    /// Sets the outer query schema, returning the existing one, if
-    /// any
-    pub fn append_outer_query_schema(&mut self, schema: DFSchemaRef) {
-        self.outer_queries_schemas_stack.push(schema);
+    /// Pushes the schema of an outer query, the stack's growth charged to `funding`
+    pub fn append_outer_query_schema(
+        &mut self,
+        schema: DFSchemaRef,
+        funding: &Funding,
+    ) -> Result<()> {
+        self.outer_queries_schemas_stack.push(funding, schema)
     }
 
     /// The schema of the adjacent outer relation
     pub fn latest_outer_query_schema(&self) -> Option<&DFSchemaRef> {
-        self.outer_queries_schemas_stack.last()
+        self.outer_queries_schemas().last()
     }
 
     /// Remove the schema of the adjacent outer relation
@@ -371,56 +443,88 @@ impl PlannerContext {
         schema
     }
 
-    /// Extends the FROM schema, returning the existing one, if any
-    pub fn extend_outer_from_schema(&mut self, schema: &DFSchemaRef) -> Result<()> {
-        match self.outer_from_schema.as_mut() {
-            Some(from_schema) => Arc::make_mut(from_schema).merge(schema),
-            None => self.outer_from_schema = Some(Arc::clone(schema)),
+    /// Extends the FROM schema with `schema`, what that makes charged to `funding`
+    pub fn extend_outer_from_schema(
+        &mut self,
+        schema: &DFSchemaRef,
+        funding: &Funding,
+    ) -> Result<()> {
+        let extended = match &self.outer_from_schema {
+            Some(from_schema) => funding.arc(from_schema.merge(schema, funding)?)?,
+            None => Arc::clone(schema),
         };
+        self.outer_from_schema = Some(extended);
         Ok(())
     }
 
     /// Return the types of parameters (`$1`, `$2`, etc) if known
     pub fn prepare_param_data_types(&self) -> &[Option<FieldRef>] {
-        &self.prepare_param_data_types
+        self.prepare_param_data_types
+            .as_deref()
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Returns true if there is a Common Table Expression (CTE) /
     /// Subquery for the specified name
     pub fn contains_cte(&self, cte_name: &str) -> bool {
-        self.ctes.contains_key(cte_name)
+        self.get_cte(cte_name).is_some()
     }
 
     /// Inserts a LogicalPlan for the Common Table Expression (CTE) /
-    /// Subquery for the specified name
-    pub fn insert_cte(&mut self, cte_name: impl Into<String>, plan: LogicalPlan) {
-        let cte_name = cte_name.into();
-        self.ctes.insert(cte_name, Arc::new(plan));
+    /// Subquery for the specified name, what that makes charged to `funding`
+    pub fn insert_cte(
+        &mut self,
+        cte_name: &str,
+        plan: LogicalPlan,
+        funding: &Funding,
+    ) -> Result<()> {
+        let cte = (funding.arc_str(cte_name)?, funding.arc(plan)?);
+        self.ctes.push(funding, cte)
     }
 
     /// Return a plan for the Common Table Expression (CTE) / Subquery for the
     /// specified name
-    pub fn get_cte(&self, cte_name: &str) -> Option<&LogicalPlan> {
-        self.ctes.get(cte_name).map(|cte| cte.as_ref())
+    pub fn get_cte(&self, cte_name: &str) -> Option<&Arc<LogicalPlan>> {
+        self.ctes
+            .as_slice()
+            .iter()
+            .rev()
+            .find(|(name, _)| name.as_ref() == cte_name)
+            .map(|(_, plan)| plan)
     }
 
-    pub fn lambda_parameters(&self) -> &HashMap<String, FieldRef> {
-        &self.lambda_parameters
+    /// The parameter of the lambdas seen so far named `name`
+    pub fn lambda_parameter(&self, name: &str) -> Option<&FieldRef> {
+        self.lambda_parameters
+            .as_slice()
+            .iter()
+            .rev()
+            .find(|field| field.name() == name)
     }
 
+    /// The context with the parameters of a lambda, the list's growth charged to `funding`
     pub fn with_lambda_parameters(
         mut self,
         parameters: impl IntoIterator<Item = FieldRef>,
-    ) -> Self {
-        self.lambda_parameters
-            .extend(parameters.into_iter().map(|f| (f.name().clone(), f)));
-
-        self
+        funding: &Funding,
+    ) -> Result<Self> {
+        for parameter in parameters {
+            self.lambda_parameters.push(funding, parameter)?;
+        }
+        Ok(self)
     }
 
-    /// Remove the plan of CTE / Subquery for the specified name
-    pub(super) fn remove_cte(&mut self, cte_name: &str) {
-        self.ctes.remove(cte_name);
+    /// Remove the plan of CTE / Subquery for the specified name, returning it
+    pub(super) fn remove_cte(
+        &mut self,
+        cte_name: &str,
+    ) -> Option<(Arc<str>, Arc<LogicalPlan>)> {
+        let index = self
+            .ctes
+            .as_slice()
+            .iter()
+            .rposition(|(name, _)| name.as_ref() == cte_name)?;
+        Some(self.ctes.remove(index))
     }
 
     /// Sets the left-most set expression schema, returning the previous value
@@ -483,8 +587,31 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// The funding what this planner allocates is charged to ([`ContextProvider::funding`]).
-    pub fn funding(&self) -> &datafusion_common::funding::Funding {
+    pub fn funding(&self) -> &Funding {
         self.context_provider.funding()
+    }
+
+    /// A builder over `plan`, planning within [`SqlToRel::funding`]: the plan's block and
+    /// every node it builds are charged to it.
+    pub(crate) fn builder(&self, plan: LogicalPlan) -> Result<LogicalPlanBuilder> {
+        let funding = self.funding();
+        Ok(LogicalPlanBuilder::new_from_arc(
+            funding.arc(plan)?,
+            funding,
+        ))
+    }
+
+    /// What `plan` makes, charged to [`SqlToRel::funding`]. Planned, the plan holds what the
+    /// funding has outstanding since; failed, all it made has been freed with the attempt,
+    /// and is given back.
+    pub(crate) fn funded<T>(&self, plan: impl FnOnce() -> Result<T>) -> Result<T> {
+        let funding = self.funding();
+        let before = funding.outstanding();
+        let planned = plan();
+        if planned.is_err() {
+            funding.unwound(before);
+        }
+        planned
     }
 
     pub(crate) fn add_warning(&self, warning: Diagnostic) {
@@ -574,7 +701,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let idents = alias.columns.into_iter().map(|c| c.name).collect();
         let plan = self.apply_expr_alias(plan, idents)?;
 
-        LogicalPlanBuilder::from(plan)
+        self.builder(plan)?
             .alias(TableReference::bare(
                 self.ident_normalizer.normalize(alias.name),
             ))?
@@ -597,7 +724,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             )
         } else {
             let columns = plan.schema().columns();
-            LogicalPlanBuilder::from(plan)
+            self.builder(plan)?
                 .project(columns.into_iter().zip(idents).map(|(col, ident)| {
                     Expr::Column(col).alias(self.ident_normalizer.normalize(ident))
                 }))?
@@ -606,67 +733,79 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
     }
 
     /// Validate the schema provides all of the columns referenced in the expressions.
-    pub(crate) fn validate_schema_satisfies_exprs(
+    /// Checks every column `exprs` reference resolves in `schema`, walking them without
+    /// allocating.
+    pub(crate) fn validate_schema_satisfies_exprs<'e>(
         &self,
         schema: &DFSchema,
-        exprs: &[Expr],
+        exprs: impl IntoIterator<Item = &'e Expr>,
     ) -> Result<()> {
-        find_column_exprs(exprs)
-            .iter()
-            .try_for_each(|col| match col {
-                Expr::Column(col) => match &col.relation {
-                    Some(r) => schema.field_with_qualified_name(r, &col.name).map(|_| ()),
-                    None => {
-                        if !schema.fields_with_unqualified_name(&col.name).is_empty() {
-                            Ok(())
-                        } else {
-                            Err(field_not_found(
-                                col.relation.clone(),
-                                col.name.as_str(),
-                                schema,
-                            ))
-                        }
+        for expr in exprs {
+            let mut resolved = Ok(());
+            expr.apply(|expr| {
+                if let Expr::Column(col) = expr {
+                    resolved = self.validate_schema_satisfies_column(schema, col);
+                    if resolved.is_err() {
+                        return Ok(TreeNodeRecursion::Stop);
                     }
                 }
-                .map_err(|err: DataFusionError| match &err {
-                    DataFusionError::SchemaError(inner, _)
-                        if matches!(
-                            inner.as_ref(),
-                            SchemaError::FieldNotFound { .. }
-                        ) =>
-                    {
-                        let SchemaError::FieldNotFound {
-                            field,
-                            valid_fields,
-                        } = inner.as_ref()
-                        else {
-                            unreachable!()
-                        };
-                        let mut diagnostic = if let Some(relation) = &col.relation {
-                            Diagnostic::new_error(
-                                format!(
-                                    "column '{}' not found in '{}'",
-                                    col.name, relation
-                                ),
-                                col.spans().first(),
-                            )
-                        } else {
-                            Diagnostic::new_error(
-                                format!("column '{}' not found", col.name),
-                                col.spans().first(),
-                            )
-                        };
-                        add_possible_columns_to_diag(
-                            &mut diagnostic,
-                            field,
-                            valid_fields,
-                        );
-                        err.with_diagnostic(diagnostic)
-                    }
-                    _ => err,
-                }),
-                _ => internal_err!("Not a column"),
-            })
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            resolved?;
+        }
+        Ok(())
+    }
+
+    fn validate_schema_satisfies_column(
+        &self,
+        schema: &DFSchema,
+        col: &Column,
+    ) -> Result<()> {
+        match &col.relation {
+            Some(r) => schema.field_with_qualified_name(r, &col.name).map(|_| ()),
+            None => {
+                if schema
+                    .fields()
+                    .iter()
+                    .any(|field| field.name() == &col.name)
+                {
+                    Ok(())
+                } else {
+                    Err(field_not_found(
+                        col.relation.clone(),
+                        col.name.as_str(),
+                        schema,
+                    ))
+                }
+            }
+        }
+        .map_err(|err: DataFusionError| match &err {
+            DataFusionError::SchemaError(inner, _)
+                if matches!(inner.as_ref(), SchemaError::FieldNotFound { .. }) =>
+            {
+                let SchemaError::FieldNotFound {
+                    field,
+                    valid_fields,
+                } = inner.as_ref()
+                else {
+                    unreachable!()
+                };
+                let mut diagnostic = if let Some(relation) = &col.relation {
+                    Diagnostic::new_error(
+                        format!("column '{}' not found in '{}'", col.name, relation),
+                        col.spans().first(),
+                    )
+                } else {
+                    Diagnostic::new_error(
+                        format!("column '{}' not found", col.name),
+                        col.spans().first(),
+                    )
+                };
+                add_possible_columns_to_diag(&mut diagnostic, field, valid_fields);
+                err.with_diagnostic(diagnostic)
+            }
+            _ => err,
+        })
     }
 
     pub(crate) fn convert_data_type_to_field(
@@ -987,8 +1126,8 @@ impl IdentTaker {
 }
 
 // impl Display for a nicer error message
-impl std::fmt::Display for IdentTaker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for IdentTaker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
         for ident in self.idents.iter() {
             if !first {

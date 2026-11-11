@@ -472,10 +472,13 @@ pub fn create_physical_expr(
                             ))?;
                         }
 
+                        let new_fields = new_fields.keep();
                         let lambda_schema = DFSchema::new_with_metadata(
-                            new_fields.keep(),
+                            &new_fields,
                             input_dfschema.metadata().clone(),
+                            funding,
                         )?;
+                        funding.released(new_fields);
 
                         let planning_ctx = planning_ctx
                             .clone()
@@ -654,7 +657,11 @@ mod tests {
         let expr = col("letter").eq(lit("A"));
 
         let schema = Schema::new(vec![Field::new("letter", DataType::Utf8, false)]);
-        let df_schema = DFSchema::try_from_qualified_schema("data", &schema)?;
+        let df_schema = DFSchema::try_from_qualified_schema(
+            "data",
+            &schema,
+            &datafusion_common::funding::Funding::default(),
+        )?;
         let p = create_physical_expr(
             &expr,
             &df_schema,

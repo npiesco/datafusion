@@ -24,15 +24,16 @@ use std::sync::Arc;
 use crate::expr::{Alias, Sort, WildcardOptions, WindowFunctionParams};
 use crate::expr_rewriter::strip_outer_reference;
 use crate::{
-    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, LogicalPlan, Operator, and,
+    BinaryExpr, Expr, ExprSchemable, Filter, GroupingSet, Join, JoinConstraint,
+    LogicalPlan, Operator, and,
 };
 use datafusion_expr_common::signature::{Signature, TypeSignature};
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field, FieldRef};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
-use datafusion_common::utils::get_at_indices;
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, Diagnostic, HashMap, Result, Span,
     TableReference, internal_err, plan_datafusion_err, plan_err,
@@ -326,188 +327,262 @@ pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
     .map(|_| ())
 }
 
-/// Find excluded columns in the schema, if any
-/// SELECT * EXCLUDE(col1, col2), would return `vec![col1, col2]`
-fn get_excluded_columns(
+/// The columns `SELECT * EXCLUDE(col1, col2)` (or `EXCEPT`) leaves out, resolved in
+/// `schema`: the qualifier and field of each, borrowed from it, in a list made through
+/// `funding` that the caller frees.
+fn get_excluded_columns<'a>(
     opt_exclude: Option<&ExcludeSelectItem>,
     opt_except: Option<&ExceptSelectItem>,
-    schema: &DFSchema,
+    schema: &'a DFSchema,
     qualifier: Option<&TableReference>,
-) -> Result<Vec<Column>> {
-    let mut idents = vec![];
-    if let Some(excepts) = opt_except {
-        idents.push(&excepts.first_element);
-        idents.extend(&excepts.additional_elements);
+    funding: &Funding,
+) -> Result<Vec<(Option<&'a TableReference>, &'a FieldRef)>> {
+    fn object_name_to_ident(name: &ObjectName) -> Result<&Ident> {
+        if name.0.len() != 1 {
+            return plan_err!(
+                "EXCLUDE with multi-part identifiers is not supported: {name}"
+            );
+        }
+        let part = &name.0[0];
+        let Some(ident) = part.as_ident() else {
+            return plan_err!(
+                "EXCLUDE with non-identifier name part is not supported: {part}"
+            );
+        };
+        Ok(ident)
     }
-    // Declared outside the `if let` so `idents.extend(exclude_owned.iter())`
-    // below can borrow references that outlive the inner scope.
-    let exclude_owned: Vec<Ident>;
-    if let Some(exclude) = opt_exclude {
-        let object_name_to_ident = |name: &ObjectName| -> Result<Ident> {
-            if name.0.len() != 1 {
-                return plan_err!(
-                    "EXCLUDE with multi-part identifiers is not supported: {name}"
-                );
+    let mut idents: Vec<&Ident> = Vec::new();
+    let named = (|| {
+        if let Some(excepts) = opt_except {
+            funding.reserve_exact(&mut idents, 1 + excepts.additional_elements.len())?;
+            idents.push(&excepts.first_element);
+            idents.extend(&excepts.additional_elements);
+        }
+        match opt_exclude {
+            Some(ExcludeSelectItem::Single(name)) => {
+                funding.push(&mut idents, object_name_to_ident(name)?)?;
             }
-            let part = &name.0[0];
-            let Some(ident) = part.as_ident() else {
-                return plan_err!(
-                    "EXCLUDE with non-identifier name part is not supported: {part}"
-                );
-            };
-            Ok(ident.clone())
-        };
-        exclude_owned = match exclude {
-            ExcludeSelectItem::Single(name) => vec![object_name_to_ident(name)?],
-            ExcludeSelectItem::Multiple(names) => names
-                .iter()
-                .map(object_name_to_ident)
-                .collect::<Result<Vec<_>>>()?,
-        };
-        idents.extend(exclude_owned.iter());
-    }
-    // Excluded columns should be unique
-    let n_elem = idents.len();
-    let unique_idents = idents.into_iter().collect::<HashSet<_>>();
-    // If HashSet size, and vector length are different, this means that some of the excluded columns
-    // are not unique. In this case return error.
-    if n_elem != unique_idents.len() {
-        return plan_err!("EXCLUDE or EXCEPT contains duplicate column names");
-    }
+            Some(ExcludeSelectItem::Multiple(names)) => {
+                funding.reserve_exact(&mut idents, names.len())?;
+                for name in names {
+                    idents.push(object_name_to_ident(name)?);
+                }
+            }
+            None => {}
+        }
+        // Excluded columns should be unique
+        if idents
+            .iter()
+            .enumerate()
+            .any(|(position, ident)| idents[..position].contains(ident))
+        {
+            return plan_err!("EXCLUDE or EXCEPT contains duplicate column names");
+        }
 
-    let mut result = vec![];
-    for ident in unique_idents.into_iter() {
-        let col_name = ident.value.as_str();
-        let (qualifier, field) = schema.qualified_field_with_name(qualifier, col_name)?;
-        result.push(Column::from((qualifier, field)));
-    }
-    Ok(result)
+        let mut result = funding.vec_with_capacity(idents.len())?;
+        for ident in &idents {
+            match schema.qualified_field_with_name(qualifier, ident.value.as_str()) {
+                Ok(column) => result.push(column),
+                Err(e) => {
+                    funding.released(result);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(result)
+    })();
+    funding.released(idents);
+    named
 }
 
-/// Returns all `Expr`s in the schema, except the `Column`s in the `columns_to_skip`
-fn get_exprs_except_skipped(
-    schema: &DFSchema,
-    columns_to_skip: &HashSet<Column>,
-) -> Vec<Expr> {
-    if columns_to_skip.is_empty() {
-        schema.iter().map(Expr::from).collect::<Vec<Expr>>()
-    } else {
-        schema
-            .columns()
-            .iter()
-            .filter_map(|c| {
-                if !columns_to_skip.contains(c) {
-                    Some(Expr::Column(c.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<Expr>>()
-    }
+/// Whether `excluded` holds the column of `qualifier` named `name`.
+fn excludes(
+    excluded: &[(Option<&TableReference>, &FieldRef)],
+    qualifier: Option<&TableReference>,
+    name: &str,
+) -> bool {
+    excluded
+        .iter()
+        .any(|(q, field)| *q == qualifier && field.name() == name)
 }
 
 /// When a JOIN has a USING clause, the join columns appear in the output
 /// schema once per side (for inner/outer joins) or once total (for semi/anti
 /// joins). An unqualified wildcard should include each USING column only once.
-/// This function returns the duplicate columns that should be excluded.
-fn exclude_using_columns(plan: &LogicalPlan) -> Result<HashSet<Column>> {
-    let output_columns: HashSet<_> = plan.schema().columns().iter().cloned().collect();
-    let mut excluded = HashSet::new();
-    for cols in plan.using_columns()? {
-        // `using_columns()` returns join columns from both sides regardless of
-        // the join type. For semi/anti joins, only one side's columns appear in
-        // the output schema. Filter to output columns so that columns from the
-        // non-output side don't participate in the deduplication process below
-        // and displace real output columns.
-        let mut cols: Vec<_> = cols
-            .into_iter()
-            .filter(|c| output_columns.contains(c))
-            .collect();
+/// This function returns the duplicate columns that should be excluded: copies made
+/// through `funding`, in a list made through it, both the caller's to free.
+fn exclude_using_columns(plan: &LogicalPlan, funding: &Funding) -> Result<Vec<Column>> {
+    let output = plan.schema();
+    let in_output = |c: &Column| {
+        output
+            .iter()
+            .any(|(q, field)| q == c.relation.as_ref() && field.name() == &c.name)
+    };
+    let mut excluded: Vec<Column> = Vec::new();
+    let found = plan.apply_with_subqueries(|plan| {
+        if let LogicalPlan::Join(Join {
+            join_constraint: JoinConstraint::Using,
+            on,
+            ..
+        }) = plan
+        {
+            // The join keys in using-join must be columns. Both sides' keys are listed
+            // regardless of the join type: for semi/anti joins, only one side's columns
+            // appear in the output schema, so the others are left out and don't displace
+            // real output columns.
+            for (l, r) in on {
+                for key in [l, r] {
+                    if key.get_as_join_column().is_none() {
+                        return internal_err!(
+                            "Invalid join key. Expected column, found {key:?}"
+                        );
+                    }
+                }
+            }
+            let columns = || {
+                on.iter()
+                    .flat_map(|(l, r)| [l, r])
+                    .filter_map(Expr::get_as_join_column)
+                    .filter(|c| in_output(*c))
+            };
+            // Of the columns of one name the least is kept, regardless of the order the
+            // keys are listed in; any other is excluded.
+            for c in columns() {
+                if columns().any(|other| other.name == c.name && other < c)
+                    && !excluded.contains(c)
+                {
+                    let copy = funding.cloned(c)?;
+                    funding.push(&mut excluded, copy)?;
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    match found {
+        Ok(_) => Ok(excluded),
+        Err(e) => {
+            released_columns(excluded, funding);
+            Err(e)
+        }
+    }
+}
 
-        // Sort so we keep the same qualified column, regardless of HashSet
-        // iteration order.
-        cols.sort();
+/// `columns`, copies made through `funding` in a list made through it, freed.
+fn released_columns(mut columns: Vec<Column>, funding: &Funding) {
+    for column in columns.drain(..) {
+        funding.released_clone(column);
+    }
+    funding.released(columns);
+}
 
-        // Keep only one column per name from the columns set, adding any
-        // duplicates to the excluded set.
-        let mut seen_names = HashSet::new();
-        for col in cols {
-            if seen_names.contains(col.name.as_str()) {
-                excluded.insert(col); // exclude columns with already seen name
-            } else {
-                seen_names.insert(col.name.clone()); // mark column name as seen
+/// The column of each field of `schema` that `keep` keeps, as an `Expr`, in a list made
+/// through `funding`, their names copied through it.
+fn columns_of(
+    schema: &DFSchema,
+    keep: impl Fn(Option<&TableReference>, &FieldRef) -> bool,
+    funding: &Funding,
+) -> Result<Vec<Expr>> {
+    let kept = schema
+        .iter()
+        .filter(|(qualifier, field)| keep(*qualifier, field))
+        .count();
+    let mut exprs = funding.vec_with_capacity(kept)?;
+    for (qualifier, field) in schema.iter() {
+        if keep(qualifier, field) {
+            match funding.string(field.name()) {
+                Ok(name) => {
+                    exprs.push(Expr::Column(Column::new(qualifier.cloned(), name)))
+                }
+                Err(e) => {
+                    for expr in exprs.drain(..) {
+                        if let Expr::Column(column) = expr {
+                            funding.released_clone(column);
+                        }
+                    }
+                    funding.released(exprs);
+                    return Err(e);
+                }
             }
         }
     }
-    Ok(excluded)
+    Ok(exprs)
 }
 
-/// Resolves an `Expr::Wildcard` to a collection of `Expr::Column`'s.
+/// Resolves an `Expr::Wildcard` to a collection of `Expr::Column`'s, in a list made through
+/// `funding`, their names copied through it.
 pub fn expand_wildcard(
     schema: &DFSchema,
     plan: &LogicalPlan,
     wildcard_options: Option<&WildcardOptions>,
+    funding: &Funding,
 ) -> Result<Vec<Expr>> {
-    let mut columns_to_skip = exclude_using_columns(plan)?;
-    let excluded_columns = if let Some(WildcardOptions {
-        exclude: opt_exclude,
-        except: opt_except,
-        ..
-    }) = wildcard_options
-    {
-        get_excluded_columns(opt_exclude.as_ref(), opt_except.as_ref(), schema, None)?
-    } else {
-        vec![]
-    };
-    // Add each excluded `Column` to columns_to_skip
-    columns_to_skip.extend(excluded_columns);
-    Ok(get_exprs_except_skipped(schema, &columns_to_skip))
+    let using_columns = exclude_using_columns(plan, funding)?;
+    let expanded = match wildcard_options {
+        Some(WildcardOptions {
+            exclude: opt_exclude,
+            except: opt_except,
+            ..
+        }) => get_excluded_columns(
+            opt_exclude.as_ref(),
+            opt_except.as_ref(),
+            schema,
+            None,
+            funding,
+        ),
+        None => Ok(Vec::new()),
+    }
+    .and_then(|excluded| {
+        let expanded = columns_of(
+            schema,
+            |qualifier, field| {
+                !using_columns
+                    .iter()
+                    .any(|c| c.relation.as_ref() == qualifier && &c.name == field.name())
+                    && !excludes(&excluded, qualifier, field.name())
+            },
+            funding,
+        );
+        funding.released(excluded);
+        expanded
+    });
+    released_columns(using_columns, funding);
+    expanded
 }
 
-/// Resolves an `Expr::Wildcard` to a collection of qualified `Expr::Column`'s.
+/// Resolves an `Expr::Wildcard` to a collection of qualified `Expr::Column`'s, in a list
+/// made through `funding`, their names copied through it.
 pub fn expand_qualified_wildcard(
     qualifier: &TableReference,
     schema: &DFSchema,
     wildcard_options: Option<&WildcardOptions>,
+    funding: &Funding,
 ) -> Result<Vec<Expr>> {
-    let qualified_indices = schema.fields_indices_with_qualified(qualifier);
-    let projected_func_dependencies = schema
-        .functional_dependencies()
-        .project_functional_dependencies(&qualified_indices, qualified_indices.len());
-    let fields_with_qualified = get_at_indices(schema.fields(), &qualified_indices)?;
-    if fields_with_qualified.is_empty() {
+    let qualified = |q: Option<&TableReference>| q.is_some_and(|q| q.eq(qualifier));
+    if !schema.iter().any(|(q, _)| qualified(q)) {
         return plan_err!("Invalid qualifier {qualifier}");
     }
 
-    let qualified_schema = Arc::new(Schema::new_with_metadata(
-        fields_with_qualified,
-        schema.metadata().clone(),
-    ));
-    let qualified_dfschema =
-        DFSchema::try_from_qualified_schema(qualifier.clone(), &qualified_schema)?
-            .with_functional_dependencies(projected_func_dependencies)?;
-    let excluded_columns = if let Some(WildcardOptions {
-        exclude: opt_exclude,
-        except: opt_except,
-        ..
-    }) = wildcard_options
-    {
-        get_excluded_columns(
+    let excluded = match wildcard_options {
+        Some(WildcardOptions {
+            exclude: opt_exclude,
+            except: opt_except,
+            ..
+        }) => get_excluded_columns(
             opt_exclude.as_ref(),
             opt_except.as_ref(),
             schema,
             Some(qualifier),
-        )?
-    } else {
-        vec![]
+            funding,
+        )?,
+        None => Vec::new(),
     };
-    // Add each excluded `Column` to columns_to_skip
-    let mut columns_to_skip = HashSet::new();
-    columns_to_skip.extend(excluded_columns);
-    Ok(get_exprs_except_skipped(
-        &qualified_dfschema,
-        &columns_to_skip,
-    ))
+    let expanded = columns_of(
+        schema,
+        |q, field| qualified(q) && !excludes(&excluded, q, field.name()),
+        funding,
+    );
+    funding.released(excluded);
+    expanded
 }
 
 /// (expr, "is the SortExpr for window (either comes from PARTITION BY or ORDER BY columns)")
@@ -855,13 +930,17 @@ where
 pub fn exprlist_to_fields<'a>(
     exprs: impl IntoIterator<Item = &'a Expr>,
     plan: &LogicalPlan,
+    funding: &Funding,
 ) -> Result<Vec<(Option<TableReference>, Arc<Field>)>> {
     // Look for exact match in plan's output schema
     let input_schema = plan.schema();
-    exprs
-        .into_iter()
-        .map(|e| e.to_field(input_schema))
-        .collect()
+    let exprs = exprs.into_iter();
+    let mut fields = funding.vec_with_capacity(exprs.size_hint().0)?;
+    for expr in exprs {
+        let field = expr.to_field(input_schema, funding)?;
+        funding.push(&mut fields, field)?;
+    }
+    Ok(fields)
 }
 
 /// Convert an expression into Column expression if it's already provided as input plan.
@@ -1400,17 +1479,14 @@ pub fn only_or_err<T>(slice: &[T]) -> Result<&T> {
 ///
 /// This function merges schemas from multiple logical plan inputs using [`DFSchema::merge`].
 /// Refer to that documentation for details on precedence and metadata handling.
-pub fn merge_schema(inputs: &[&LogicalPlan]) -> DFSchema {
-    if inputs.len() == 1 {
-        inputs[0].schema().as_ref().clone()
-    } else {
-        inputs.iter().map(|input| input.schema()).fold(
-            DFSchema::empty(),
-            |mut lhs, rhs| {
-                lhs.merge(rhs);
-                lhs
-            },
-        )
+///
+/// What the merged schema allocates is charged to `funding`.
+pub fn merge_schema(inputs: &[&LogicalPlan], funding: &Funding) -> Result<DFSchema> {
+    match inputs {
+        [input] => funding.cloned(input.schema().as_ref()),
+        _ => inputs.iter().try_fold(DFSchema::empty(), |lhs, rhs| {
+            lhs.merge(rhs.schema(), funding)
+        }),
     }
 }
 
