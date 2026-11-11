@@ -71,6 +71,7 @@
 //! duplicate-sensitivity (projection, aggregate, sort, ...) adjust it first.
 use crate::utils::for_each_referenced_index;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
     DFSchema, Dependency, HashSet, NullEquality, Result, ScalarValue,
@@ -176,10 +177,10 @@ impl OptimizerRule for EliminateJoin {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         let live = LiveColumns::all(plan.schema());
-        rewrite_subtree(plan, live, false)
+        rewrite_subtree(plan, live, false, &config.funding())
     }
 }
 
@@ -194,11 +195,12 @@ fn rewrite_subtree(
     plan: LogicalPlan,
     live: LiveColumns,
     duplicate_insensitive: bool,
+    funding: &Funding,
 ) -> Result<Transformed<LogicalPlan>> {
-    rewrite_node(plan, live, duplicate_insensitive)?.transform_data(|plan| {
+    rewrite_node(plan, live, duplicate_insensitive, funding)?.transform_data(|plan| {
         plan.map_subqueries(|subquery| {
             let live = LiveColumns::all(subquery.schema());
-            rewrite_subtree(subquery, live, false)
+            rewrite_subtree(subquery, live, false, funding)
         })
     })
 }
@@ -207,10 +209,13 @@ fn rewrite_node(
     plan: LogicalPlan,
     live: LiveColumns,
     duplicate_insensitive: bool,
+    funding: &Funding,
 ) -> Result<Transformed<LogicalPlan>> {
     match plan {
         // The only arm that rewrites a join; the rest just thread context down to one.
-        LogicalPlan::Join(join) => rewrite_join(join, &live, duplicate_insensitive),
+        LogicalPlan::Join(join) => {
+            rewrite_join(join, &live, duplicate_insensitive, funding)
+        }
         LogicalPlan::Projection(Projection {
             expr,
             input,
@@ -219,11 +224,17 @@ fn rewrite_node(
         }) => {
             // Narrows `live` to the columns the projection's expressions reference.
             let child_live = LiveColumns::try_new(&expr, input.schema())?;
-            rewrite_single_input(input, child_live, duplicate_insensitive, |input| {
-                Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
-                    expr, input, schema,
-                )?))
-            })
+            rewrite_single_input(
+                input,
+                child_live,
+                duplicate_insensitive,
+                funding,
+                |input| {
+                    Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+                        expr, input, schema,
+                    )?))
+                },
+            )
         }
         LogicalPlan::Filter(Filter {
             predicate, input, ..
@@ -231,9 +242,13 @@ fn rewrite_node(
             // Adds the predicate's columns to `live` (a side used only by the filter stays live).
             let mut child_live = live;
             child_live.extend_from([&predicate], input.schema())?;
-            rewrite_single_input(input, child_live, duplicate_insensitive, |input| {
-                Ok(LogicalPlan::Filter(Filter::new(predicate, input)))
-            })
+            rewrite_single_input(
+                input,
+                child_live,
+                duplicate_insensitive,
+                funding,
+                |input| Ok(LogicalPlan::Filter(Filter::new(predicate, input))),
+            )
         }
         LogicalPlan::Aggregate(Aggregate {
             input,
@@ -259,6 +274,7 @@ fn rewrite_node(
                 input,
                 child_live,
                 child_duplicate_insensitive,
+                funding,
                 |input| {
                     Ok(LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
                         input, group_expr, aggr_expr, schema,
@@ -271,7 +287,7 @@ fn rewrite_node(
             // over every input column, so the input is duplicate-insensitive,
             // but every column is part of the dedup key.
             let child_live = LiveColumns::all(input.schema());
-            rewrite_single_input(input, child_live, true, |input| {
+            rewrite_single_input(input, child_live, true, funding, |input| {
                 Ok(LogicalPlan::Distinct(Distinct::All(input)))
             })
         }
@@ -293,7 +309,7 @@ fn rewrite_node(
                     .extend_from(sort_expr.iter().map(|s| &s.expr), input.schema())?;
             }
 
-            rewrite_single_input(input, child_live, true, |input| {
+            rewrite_single_input(input, child_live, true, funding, |input| {
                 Ok(LogicalPlan::Distinct(Distinct::On(DistinctOn {
                     on_expr,
                     select_expr,
@@ -315,20 +331,21 @@ fn rewrite_node(
                 input,
                 child_live,
                 child_duplicate_insensitive,
+                funding,
                 |input| Ok(LogicalPlan::Sort(Sort { expr, input, fetch })),
             )
         }
         LogicalPlan::Limit(Limit { skip, fetch, input }) => {
             // LIMIT makes the row count observable, so it clears duplicate-insensitivity.
-            rewrite_single_input(input, live, false, |input| {
+            rewrite_single_input(input, live, false, funding, |input| {
                 Ok(LogicalPlan::Limit(Limit { skip, fetch, input }))
             })
         }
         LogicalPlan::SubqueryAlias(SubqueryAlias { input, alias, .. }) => {
             // Re-aliases columns 1:1, so `live` and duplicate-sensitivity pass through unchanged.
-            rewrite_single_input(input, live, duplicate_insensitive, |input| {
+            rewrite_single_input(input, live, duplicate_insensitive, funding, |input| {
                 Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                    input, alias,
+                    input, alias, funding,
                 )?))
             })
         }
@@ -350,18 +367,24 @@ fn rewrite_node(
                 }
                 Partitioning::RoundRobinBatch(_) => {}
             }
-            rewrite_single_input(input, child_live, duplicate_insensitive, |input| {
-                Ok(LogicalPlan::Repartition(Repartition {
-                    input,
-                    partitioning_scheme,
-                }))
-            })
+            rewrite_single_input(
+                input,
+                child_live,
+                duplicate_insensitive,
+                funding,
+                |input| {
+                    Ok(LogicalPlan::Repartition(Repartition {
+                        input,
+                        partitioning_scheme,
+                    }))
+                },
+            )
         }
         // Conservatively treat any other plan node as a fresh root, since we are
         // not sure of its semantics with respect to duplicates or live columns.
         _ => plan.map_children(|child| {
             let live = LiveColumns::all(child.schema());
-            rewrite_subtree(child, live, false)
+            rewrite_subtree(child, live, false, funding)
         }),
     }
 }
@@ -374,6 +397,7 @@ fn rewrite_single_input<F>(
     input: Arc<LogicalPlan>,
     child_live: LiveColumns,
     duplicate_insensitive: bool,
+    funding: &Funding,
     rebuild: F,
 ) -> Result<Transformed<LogicalPlan>>
 where
@@ -383,6 +407,7 @@ where
         Arc::unwrap_or_clone(input),
         child_live,
         duplicate_insensitive,
+        funding,
     )?
     .map_data(|input| rebuild(Arc::new(input)))
 }
@@ -391,6 +416,7 @@ fn rewrite_join(
     join: Join,
     live: &LiveColumns,
     duplicate_insensitive: bool,
+    funding: &Funding,
 ) -> Result<Transformed<LogicalPlan>> {
     if join.join_type == JoinType::Inner
         && join.on.is_empty()
@@ -420,6 +446,7 @@ fn rewrite_join(
                 Arc::unwrap_or_clone(join.left),
                 visible_left,
                 duplicate_insensitive,
+                funding,
             )?;
             return Ok(Transformed::yes(left.data));
         }
@@ -428,6 +455,7 @@ fn rewrite_join(
                 Arc::unwrap_or_clone(join.right),
                 visible_right,
                 duplicate_insensitive,
+                funding,
             )?;
             return Ok(Transformed::yes(right.data));
         }
@@ -453,11 +481,13 @@ fn rewrite_join(
         Arc::unwrap_or_clone(join.left),
         left_live,
         left_dup_insensitive,
+        funding,
     )?;
     let right = rewrite_subtree(
         Arc::unwrap_or_clone(join.right),
         right_live,
         right_dup_insensitive,
+        funding,
     )?;
 
     let changed =
@@ -477,7 +507,7 @@ fn rewrite_join(
             join.join_constraint,
             join.null_equality,
             join.null_aware,
-            &datafusion_common::funding::Funding::default(),
+            funding,
         )?)))
     } else {
         // Nothing changed; reassemble the join reusing its existing schema rather

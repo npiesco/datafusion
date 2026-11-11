@@ -2549,7 +2549,11 @@ fn test_unparse_left_anti_join() -> Result<()> {
 
     let table_scan1 = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
     let table_scan2 = table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?;
-    let subquery = subquery_alias(table_scan2, "__correlated_sq_1")?;
+    let subquery = subquery_alias(
+        table_scan2,
+        "__correlated_sq_1",
+        &datafusion_common::funding::Funding::default(),
+    )?;
     let plan = LogicalPlanBuilder::from(table_scan1)
         .project(vec![col("t1.d")])?
         .join_on(
@@ -2583,7 +2587,11 @@ fn test_unparse_left_semi_join() -> Result<()> {
 
     let table_scan1 = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
     let table_scan2 = table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?;
-    let subquery = subquery_alias(table_scan2, "__correlated_sq_1")?;
+    let subquery = subquery_alias(
+        table_scan2,
+        "__correlated_sq_1",
+        &datafusion_common::funding::Funding::default(),
+    )?;
     let plan = LogicalPlanBuilder::from(table_scan1)
         .project(vec![col("t1.d")])?
         .join_on(
@@ -2617,7 +2625,11 @@ fn test_unparse_left_mark_join() -> Result<()> {
     //         TableScan: t2 projection=[c]
     let table_scan1 = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
     let table_scan2 = table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?;
-    let subquery = subquery_alias(table_scan2, "__correlated_sq_1")?;
+    let subquery = subquery_alias(
+        table_scan2,
+        "__correlated_sq_1",
+        &datafusion_common::funding::Funding::default(),
+    )?;
     let plan = LogicalPlanBuilder::from(table_scan1)
         .join_on(
             subquery,
@@ -2726,9 +2738,17 @@ fn test_unparse_cross_join_with_table_scan_projection() -> Result<()> {
     //     TableScan: test projection=[v]
     let table_scan1 = table_scan(Some("test"), &schema, Some(vec![1]))?.build()?;
     let table_scan2 = table_scan(Some("test"), &schema, Some(vec![1]))?.build()?;
-    let plan = LogicalPlanBuilder::from(subquery_alias(table_scan1, "t1")?)
-        .cross_join(subquery_alias(table_scan2, "t2")?)?
-        .build()?;
+    let plan = LogicalPlanBuilder::from(subquery_alias(
+        table_scan1,
+        "t1",
+        &datafusion_common::funding::Funding::default(),
+    )?)
+    .cross_join(subquery_alias(
+        table_scan2,
+        "t2",
+        &datafusion_common::funding::Funding::default(),
+    )?)?
+    .build()?;
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     let sql = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
@@ -2751,13 +2771,21 @@ fn test_unparse_inner_join_with_table_scan_projection() -> Result<()> {
     //     TableScan: test projection=[v]
     let table_scan1 = table_scan(Some("test"), &schema, Some(vec![1]))?.build()?;
     let table_scan2 = table_scan(Some("test"), &schema, Some(vec![1]))?.build()?;
-    let plan = LogicalPlanBuilder::from(subquery_alias(table_scan1, "t1")?)
-        .join_on(
-            subquery_alias(table_scan2, "t2")?,
-            datafusion_expr::JoinType::Inner,
-            vec![col("t1.v").eq(col("t2.v"))],
-        )?
-        .build()?;
+    let plan = LogicalPlanBuilder::from(subquery_alias(
+        table_scan1,
+        "t1",
+        &datafusion_common::funding::Funding::default(),
+    )?)
+    .join_on(
+        subquery_alias(
+            table_scan2,
+            "t2",
+            &datafusion_common::funding::Funding::default(),
+        )?,
+        datafusion_expr::JoinType::Inner,
+        vec![col("t1.v").eq(col("t2.v"))],
+    )?
+    .build()?;
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     let sql = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
@@ -2890,13 +2918,21 @@ fn test_unparse_left_semi_join_with_table_scan_projection() -> Result<()> {
     //     TableScan: test projection=[v]
     let table_scan1 = table_scan(Some("test"), &schema, Some(vec![1]))?.build()?;
     let table_scan2 = table_scan(Some("test"), &schema, Some(vec![1]))?.build()?;
-    let plan = LogicalPlanBuilder::from(subquery_alias(table_scan1, "t1")?)
-        .join_on(
-            subquery_alias(table_scan2, "t2")?,
-            datafusion_expr::JoinType::LeftSemi,
-            vec![col("t1.v").eq(col("t2.v"))],
-        )?
-        .build()?;
+    let plan = LogicalPlanBuilder::from(subquery_alias(
+        table_scan1,
+        "t1",
+        &datafusion_common::funding::Funding::default(),
+    )?)
+    .join_on(
+        subquery_alias(
+            table_scan2,
+            "t2",
+            &datafusion_common::funding::Funding::default(),
+        )?,
+        datafusion_expr::JoinType::LeftSemi,
+        vec![col("t1.v").eq(col("t2.v"))],
+    )?
+    .build()?;
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     let sql = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
@@ -3861,7 +3897,11 @@ fn test_unparse_manual_join_with_subquery_aggregate() -> Result<()> {
             vec![max(col("j2.j2_id")).alias("max_id")],
         )?
         .build()?;
-    let right_subquery = subquery_alias(right_agg, "b")?;
+    let right_subquery = subquery_alias(
+        right_agg,
+        "b",
+        &datafusion_common::funding::Funding::default(),
+    )?;
 
     // Build the full plan: SELECT j1.j1_string FROM j1 JOIN (...) AS b ON j1.j1_id = b.max_id
     let left_scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;

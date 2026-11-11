@@ -359,6 +359,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                         spans: Spans::new(),
                     }),
                     alias,
+                    self.funding(),
                 )
             }
             plan => Ok(LogicalPlan::Subquery(Subquery {

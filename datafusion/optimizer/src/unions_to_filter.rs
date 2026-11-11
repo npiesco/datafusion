@@ -20,6 +20,7 @@
 
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
@@ -66,19 +67,22 @@ impl OptimizerRule for UnionsToFilter {
             return Ok(Transformed::no(plan));
         }
 
-        plan.rewrite_with_subqueries(&mut UnionsToFilterRewriter)
+        let funding = config.funding();
+        plan.rewrite_with_subqueries(&mut UnionsToFilterRewriter { funding: &funding })
     }
 }
 
-struct UnionsToFilterRewriter;
+struct UnionsToFilterRewriter<'a> {
+    funding: &'a Funding,
+}
 
-impl TreeNodeRewriter for UnionsToFilterRewriter {
+impl TreeNodeRewriter for UnionsToFilterRewriter<'_> {
     type Node = LogicalPlan;
 
     fn f_up(&mut self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         match &plan {
             LogicalPlan::Distinct(Distinct::All(input)) => {
-                match try_rewrite_distinct_union(input.as_ref().clone())? {
+                match try_rewrite_distinct_union(input.as_ref().clone(), self.funding)? {
                     Some(rewritten) => Ok(Transformed::yes(rewritten)),
                     None => Ok(Transformed::no(plan)),
                 }
@@ -88,7 +92,10 @@ impl TreeNodeRewriter for UnionsToFilterRewriter {
     }
 }
 
-fn try_rewrite_distinct_union(plan: LogicalPlan) -> Result<Option<LogicalPlan>> {
+fn try_rewrite_distinct_union(
+    plan: LogicalPlan,
+    funding: &Funding,
+) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Union(Union { inputs, schema }) = plan else {
         debug!("unions_to_filter skipped: input is not a UNION");
         return Ok(None);
@@ -137,7 +144,7 @@ fn try_rewrite_distinct_union(plan: LogicalPlan) -> Result<Option<LogicalPlan>> 
         let branch = LogicalPlanBuilder::from(key.source)
             .filter(combined)?
             .build()?;
-        let branch = wrap_branch(branch, &key.wrappers)?;
+        let branch = wrap_branch(branch, &key.wrappers, funding)?;
         let branch = coerce_plan_expr_for_schema(branch, &schema)?;
         let branch = align_plan_to_schema(branch, Arc::clone(&schema))?;
         builder = Some(match builder {
@@ -256,7 +263,11 @@ fn peel_wrappers(mut plan: LogicalPlan) -> (Vec<Wrapper>, LogicalPlan) {
     }
 }
 
-fn wrap_branch(mut plan: LogicalPlan, wrappers: &[Wrapper]) -> Result<LogicalPlan> {
+fn wrap_branch(
+    mut plan: LogicalPlan,
+    wrappers: &[Wrapper],
+    funding: &Funding,
+) -> Result<LogicalPlan> {
     for wrapper in wrappers.iter().rev() {
         plan = match wrapper {
             Wrapper::Projection { expr, schema } => {
@@ -271,7 +282,7 @@ fn wrap_branch(mut plan: LogicalPlan, wrappers: &[Wrapper]) -> Result<LogicalPla
             // filter predicate differs, so the recomputed schema matches the
             // original one stored in peel_wrappers.
             Wrapper::SubqueryAlias { alias, .. } => LogicalPlan::SubqueryAlias(
-                SubqueryAlias::try_new(Arc::new(plan), alias.clone())?,
+                SubqueryAlias::try_new(Arc::new(plan), alias.clone(), funding)?,
             ),
         };
     }

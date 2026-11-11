@@ -5793,7 +5793,11 @@ digraph {
 
         let join = left.join(right, JoinType::Full, join_keys, None)?.build()?;
 
-        let alias = subquery_alias(join, "alias")?;
+        let alias = subquery_alias(
+            join,
+            "alias",
+            &datafusion_common::funding::Funding::default(),
+        )?;
 
         let planner = DefaultPhysicalPlanner::default();
 

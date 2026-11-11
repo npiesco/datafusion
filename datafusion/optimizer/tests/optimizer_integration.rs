@@ -54,6 +54,71 @@ fn init() {
     let _ = env_logger::try_init();
 }
 
+struct RefusePlanning;
+
+impl datafusion_common::funding::PlanningFunding for RefusePlanning {
+    fn charge(&self, _: usize) -> bool {
+        false
+    }
+
+    fn discharge(&self, _: usize) {}
+}
+
+fn assert_alias_rule_uses_optimizer_funding(
+    rule: &dyn OptimizerRule,
+    sql: &str,
+) -> Result<()> {
+    let provider = MyContextProvider::default().with_schema(
+        "t",
+        Schema::new(vec![Field::new("id", DataType::Int32, false)]),
+    );
+    let statement = Parser::parse_sql(&GenericDialect {}, sql)
+        .unwrap()
+        .remove(0);
+    let plan = SqlToRel::new(&provider).sql_statement_to_plan(statement)?;
+    let plan = match plan {
+        LogicalPlan::Projection(projection) => Arc::unwrap_or_clone(projection.input),
+        plan => plan,
+    };
+    let funding = datafusion_common::funding::Funding::new(Arc::new(RefusePlanning));
+    let mut options = ConfigOptions::default();
+    options.funding = funding.clone();
+    options.optimizer.enable_unions_to_filter = true;
+    let config = OptimizerContext::new_with_config_options(Arc::new(options));
+    let error = rule
+        .rewrite(plan, &config)
+        .expect_err("rebuilding an alias must use the optimizer's refusing source");
+    assert!(error.refused().is_some(), "{error}");
+    assert_eq!(funding.outstanding(), 0);
+    Ok(())
+}
+
+#[test]
+fn eliminate_join_alias_uses_optimizer_funding() -> Result<()> {
+    assert_alias_rule_uses_optimizer_funding(
+        &datafusion_optimizer::eliminate_join::EliminateJoin::new(),
+        "SELECT * FROM t AS a",
+    )
+}
+
+#[test]
+fn union_alias_uses_optimizer_funding() -> Result<()> {
+    assert_alias_rule_uses_optimizer_funding(
+        &datafusion_optimizer::unions_to_filter::UnionsToFilter::new(),
+        "SELECT * FROM (SELECT * FROM t WHERE id = 1) AS a \
+         UNION SELECT * FROM (SELECT * FROM t WHERE id = 2) AS a",
+    )
+}
+
+#[test]
+fn lateral_alias_uses_optimizer_funding() -> Result<()> {
+    assert_alias_rule_uses_optimizer_funding(
+        &datafusion_optimizer::decorrelate_lateral_join::DecorrelateLateralJoin::new(),
+        "SELECT * FROM t AS a \
+         JOIN LATERAL (SELECT id FROM t WHERE id = a.id) AS b ON true",
+    )
+}
+
 #[test]
 fn recursive_cte_with_nested_subquery() -> Result<()> {
     // projection optimization is applied to recursive CTEs even with nested subqueries

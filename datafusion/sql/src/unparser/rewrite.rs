@@ -148,8 +148,11 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
                         .project(project_exprs)?
                         .build()?;
 
-                let subquery_alias =
-                    datafusion_expr::SubqueryAlias::try_new(Arc::new(input), qualifier)?;
+                let subquery_alias = datafusion_expr::SubqueryAlias::try_new(
+                    Arc::new(input),
+                    qualifier,
+                    &datafusion_common::funding::Funding::default(),
+                )?;
 
                 filter.input = Arc::new(LogicalPlan::SubqueryAlias(subquery_alias));
                 Ok(Transformed::yes(LogicalPlan::Filter(filter)))

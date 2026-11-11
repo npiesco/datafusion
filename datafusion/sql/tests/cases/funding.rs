@@ -128,6 +128,21 @@ fn select_table_alias_is_funded() {
 }
 
 #[test]
+fn subquery_alias_is_funded_and_failure_frees_it() {
+    assert_funded("SELECT a.id FROM (SELECT id FROM person) AS a");
+    assert_funded("SELECT * FROM (SELECT * FROM j1 AS a CROSS JOIN j1 AS b) AS c");
+    assert_failure_freed("SELECT a.no_such_column FROM (SELECT id FROM person) AS a");
+}
+
+#[test]
+fn unnest_is_funded_and_failure_frees_it() {
+    assert_funded("SELECT UNNEST(array_col) FROM unnest_table");
+    assert_failure_freed(
+        "SELECT no_such_column FROM (SELECT UNNEST(array_col) AS item FROM unnest_table) AS u",
+    );
+}
+
+#[test]
 fn select_joins_are_funded() {
     assert_funded("SELECT j1_id, j2_string FROM j1 JOIN j2 ON j1_id = j2_id");
     assert_funded("SELECT j1_id FROM j1 LEFT JOIN j2 ON j1_id = j2_id AND j2_id > 1");
