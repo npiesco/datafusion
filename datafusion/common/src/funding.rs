@@ -518,12 +518,49 @@ impl<B: Buffer> Held<B> {
     pub fn keep(mut self) -> B {
         std::mem::take(&mut self.buffer)
     }
+
+    /// The buffer, its charge given back now: it leaves planning's account.
+    pub fn unheld(mut self) -> B {
+        let buffer = std::mem::take(&mut self.buffer);
+        self.funding.discharge(buffer.block_bytes());
+        buffer
+    }
+
+    /// The funding its room is charged to.
+    pub fn funding(&self) -> &Funding {
+        &self.funding
+    }
+
+    /// Its room charged to `next` instead: charged there first, then given back here.
+    pub fn rebind(&mut self, next: &Funding) -> Result<()> {
+        let bytes = self.buffer.block_bytes();
+        next.charge(bytes)?;
+        self.funding.discharge(bytes);
+        self.funding = next.clone();
+        Ok(())
+    }
 }
 
 impl<T> Held<Vec<T>> {
     /// `item` pushed, its growth charged first.
     pub fn push(&mut self, item: T) -> Result<()> {
         self.funding.push(&mut self.buffer, item)
+    }
+}
+
+impl<T: Clone> Held<Vec<T>> {
+    /// A copy whose exact room is charged to `funding` before it is allocated.
+    pub fn clone_funded(&self, funding: &Funding) -> Result<Self> {
+        let mut copy = funding.held();
+        copy.reserve_exact(self.buffer.len())?;
+        copy.buffer.extend_from_slice(&self.buffer);
+        Ok(copy)
+    }
+}
+
+impl<B: Buffer + fmt::Debug> fmt::Debug for Held<B> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.buffer.fmt(f)
     }
 }
 

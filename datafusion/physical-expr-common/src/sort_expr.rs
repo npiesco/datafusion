@@ -30,9 +30,9 @@ use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cloned::{CloneBytes, slice_clone_bytes};
+use datafusion_common::funding::{FundedSet, Funding, Held};
 use datafusion_common::{HashSet, Result};
 use datafusion_expr_common::columnar_value::ColumnarValue;
-use indexmap::IndexSet;
 /// Represents Sort operation for a column in a RecordBatch
 ///
 /// Example:
@@ -469,48 +469,135 @@ impl From<PhysicalSortRequirement> for PhysicalSortExpr {
 /// 1. It is non-degenerate, meaning it contains at least one element.
 /// 2. It is duplicate-free, meaning it does not contain multiple entries for
 ///    the same column.
-#[derive(Clone, Debug)]
+///
+/// Its storage is charged to the [`Funding`] it was built with ([`LexOrdering::try_new`])
+/// for as long as it is held, and given back as it is dropped. Clones and orderings built
+/// with [`LexOrdering::new`] are unfunded.
 pub struct LexOrdering {
     /// Vector of sort expressions representing the lexicographical ordering.
-    exprs: Vec<PhysicalSortExpr>,
+    exprs: Held<Vec<PhysicalSortExpr>>,
     /// Set of expressions in the lexicographical ordering, used to ensure
     /// that the ordering is duplicate-free. Note that the elements in this
     /// set are the same underlying physical expressions as in `exprs`.
-    set: IndexSet<Arc<dyn PhysicalExpr>>,
+    set: FundedSet<Arc<dyn PhysicalExpr>>,
+}
+
+impl Clone for LexOrdering {
+    /// An unfunded copy.
+    fn clone(&self) -> Self {
+        let unfunded = Funding::default();
+        Self {
+            exprs: self
+                .exprs
+                .clone_funded(&unfunded)
+                .expect("unfunded planning never refuses"),
+            set: self
+                .set
+                .clone_funded(&unfunded)
+                .expect("unfunded planning never refuses"),
+        }
+    }
+}
+
+impl fmt::Debug for LexOrdering {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LexOrdering")
+            .field("exprs", &self.exprs)
+            .field("set", &self.set)
+            .finish()
+    }
 }
 
 impl LexOrdering {
     /// Creates a new [`LexOrdering`] from the given vector of sort expressions.
     /// If the vector is empty, returns `None`.
     pub fn new(exprs: impl IntoIterator<Item = PhysicalSortExpr>) -> Option<Self> {
-        let exprs = exprs.into_iter();
+        Self::try_new(exprs, &Funding::default()).expect("unfunded planning never refuses")
+    }
+
+    /// Creates a new [`LexOrdering`] from the given sort expressions, its storage charged
+    /// to `funding` before it is allocated and held until it is dropped. If there are no
+    /// sort expressions, returns `Ok(None)`. On refusal, nothing stays charged.
+    pub fn try_new(
+        exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+        funding: &Funding,
+    ) -> Result<Option<Self>> {
         let mut candidate = Self {
             // not valid yet; valid publicly-returned instance must be non-empty
-            exprs: Vec::new(),
-            set: IndexSet::new(),
+            exprs: funding.held(),
+            set: FundedSet::with_funding(funding),
         };
-        for expr in exprs {
-            candidate.push(expr);
-        }
-        if candidate.exprs.is_empty() {
-            None
-        } else {
-            Some(candidate)
-        }
+        candidate.try_extend(exprs)?;
+        Ok((!candidate.exprs.is_empty()).then_some(candidate))
     }
 
-    /// Appends an element to the back of the `LexOrdering`.
+    /// The funding its storage is charged to.
+    pub fn funding(&self) -> &Funding {
+        self.exprs.funding()
+    }
+
+    /// Its storage charged to `funding` instead.
+    pub fn rebind(&mut self, funding: &Funding) -> Result<()> {
+        let before = self.exprs.funding().clone();
+        self.exprs.rebind(funding)?;
+        if let Err(error) = self.set.rebind(funding) {
+            self.exprs
+                .rebind(&before)
+                .expect("the previous funding had this charge");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Its storage given back to its funding: it is unfunded from here on.
+    fn unfund(&mut self) {
+        if !self.funding().is_funded() {
+            return;
+        }
+        let unfunded = Funding::default();
+        self.exprs
+            .rebind(&unfunded)
+            .expect("unfunded planning never refuses");
+        self.set
+            .rebind(&unfunded)
+            .expect("unfunded planning never refuses");
+    }
+
+    /// Appends an element to the back of the `LexOrdering`. A funded ordering grown this
+    /// way stops being funded; use [`LexOrdering::try_push`] to keep it funded.
     pub fn push(&mut self, sort_expr: PhysicalSortExpr) {
-        if self.set.insert(Arc::clone(&sort_expr.expr)) {
-            self.exprs.push(sort_expr);
-        }
+        self.unfund();
+        self.try_push(sort_expr)
+            .expect("unfunded planning never refuses");
     }
 
-    /// Add all elements from `iter` to the `LexOrdering`.
-    pub fn extend(&mut self, sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>) {
-        for sort_expr in sort_exprs {
-            self.push(sort_expr);
+    /// Appends an element to the back of the `LexOrdering`, its growth charged first.
+    pub fn try_push(&mut self, sort_expr: PhysicalSortExpr) -> Result<()> {
+        if self.set.contains(&sort_expr.expr) {
+            return Ok(());
         }
+        self.exprs.reserve(1)?;
+        self.set.try_insert(Arc::clone(&sort_expr.expr))?;
+        self.exprs.push(sort_expr)
+    }
+
+    /// Add all elements from `iter` to the `LexOrdering`. A funded ordering grown this way
+    /// stops being funded; use [`LexOrdering::try_extend`] to keep it funded.
+    pub fn extend(&mut self, sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>) {
+        self.unfund();
+        self.try_extend(sort_exprs)
+            .expect("unfunded planning never refuses");
+    }
+
+    /// Add all elements from `iter` to the `LexOrdering`, each growth charged first.
+    pub fn try_extend(
+        &mut self,
+        sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+    ) -> Result<()> {
+        for sort_expr in sort_exprs {
+            self.try_push(sort_expr)?;
+        }
+        Ok(())
     }
 
     /// Returns the leading `PhysicalSortExpr` of the `LexOrdering`. Note that
@@ -618,7 +705,7 @@ impl PartialEq for LexOrdering {
             set: _, // derived from `exprs`
         } = self;
         // PartialEq must be consistent with PartialOrd
-        exprs == &other.exprs
+        exprs.as_slice() == other.exprs.as_slice()
     }
 }
 impl Eq for LexOrdering {}
@@ -674,7 +761,7 @@ impl IntoIterator for LexOrdering {
     type IntoIter = IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.exprs.into_iter()
+        self.exprs.unheld().into_iter()
     }
 }
 
@@ -689,7 +776,7 @@ impl<'a> IntoIterator for &'a LexOrdering {
 
 impl From<LexOrdering> for Vec<PhysicalSortExpr> {
     fn from(ordering: LexOrdering) -> Self {
-        ordering.exprs
+        ordering.exprs.unheld()
     }
 }
 

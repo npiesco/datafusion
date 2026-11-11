@@ -25,7 +25,7 @@ use crate::{LexOrdering, PhysicalExpr, add_offset_to_physical_sort_exprs};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{Funding, Held};
 use datafusion_common::{HashSet, Result};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
@@ -52,10 +52,42 @@ use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 /// ordering in the equivalence class is a prefix of another ordering in the
 /// equivalence class. The set can be empty, which means that there are no
 /// orderings that describe the table.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// Its storage is charged to the [`Funding`] it was built with
+/// ([`OrderingEquivalenceClass::try_new`]) for as long as it is held, and given back as it
+/// is dropped. Clones and classes built without funding are unfunded.
+#[derive(Debug)]
 pub struct OrderingEquivalenceClass {
-    orderings: Vec<LexOrdering>,
+    orderings: Held<Vec<LexOrdering>>,
 }
+
+impl Default for OrderingEquivalenceClass {
+    fn default() -> Self {
+        Self {
+            orderings: Funding::default().held(),
+        }
+    }
+}
+
+impl Clone for OrderingEquivalenceClass {
+    /// An unfunded copy.
+    fn clone(&self) -> Self {
+        Self {
+            orderings: self
+                .orderings
+                .clone_funded(&Funding::default())
+                .expect("unfunded planning never refuses"),
+        }
+    }
+}
+
+impl PartialEq for OrderingEquivalenceClass {
+    fn eq(&self, other: &Self) -> bool {
+        self.orderings.as_slice() == other.orderings.as_slice()
+    }
+}
+
+impl Eq for OrderingEquivalenceClass {}
 
 impl OrderingEquivalenceClass {
     /// Clears (empties) this ordering equivalence class.
@@ -68,29 +100,92 @@ impl OrderingEquivalenceClass {
     pub fn new(
         orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
     ) -> Self {
+        Self::try_new(orderings, &Funding::default())
+            .expect("unfunded planning never refuses")
+    }
+
+    /// Creates a new ordering equivalence class from the given orderings, removing any
+    /// redundant entries. Its storage, and that of each ordering, is charged to `funding`
+    /// before it is allocated and held until it is dropped. On refusal, nothing stays
+    /// charged.
+    pub fn try_new(
+        orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
+        funding: &Funding,
+    ) -> Result<Self> {
         let mut result = Self {
-            orderings: orderings.into_iter().filter_map(LexOrdering::new).collect(),
+            orderings: funding.held(),
         };
-        result.remove_redundant_entries();
+        result.try_add_orderings(orderings)?;
+        Ok(result)
+    }
+
+    /// The funding its storage is charged to.
+    pub fn funding(&self) -> &Funding {
+        self.orderings.funding()
+    }
+
+    /// Its own storage given back to its funding: it is unfunded from here on. The
+    /// orderings it holds keep their own funding.
+    fn unfund(&mut self) {
+        if self.funding().is_funded() {
+            self.orderings
+                .rebind(&Funding::default())
+                .expect("unfunded planning never refuses");
+        }
+    }
+
+    /// Extend this ordering equivalence class with the given orderings. A funded class
+    /// grown this way stops being funded; use [`Self::try_extend`] to keep it funded.
+    pub fn extend(&mut self, orderings: impl IntoIterator<Item = LexOrdering>) {
+        self.unfund();
+        self.try_extend(orderings)
+            .expect("unfunded planning never refuses");
+    }
+
+    /// Extend this ordering equivalence class with the given orderings, each growth
+    /// charged to its funding first.
+    pub fn try_extend(
+        &mut self,
+        orderings: impl IntoIterator<Item = LexOrdering>,
+    ) -> Result<()> {
+        let result = orderings
+            .into_iter()
+            .try_for_each(|ordering| self.orderings.push(ordering));
+        // Make sure that there are no redundant orderings:
+        self.remove_redundant_entries();
         result
     }
 
-    /// Extend this ordering equivalence class with the given orderings.
-    pub fn extend(&mut self, orderings: impl IntoIterator<Item = LexOrdering>) {
-        self.orderings.extend(orderings);
-        // Make sure that there are no redundant orderings:
-        self.remove_redundant_entries();
-    }
-
-    /// Adds new orderings into this ordering equivalence class.
+    /// Adds new orderings into this ordering equivalence class. A funded class grown this
+    /// way stops being funded; use [`Self::try_add_orderings`] to keep it funded.
     pub fn add_orderings(
         &mut self,
         sort_exprs: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
     ) {
-        self.orderings
-            .extend(sort_exprs.into_iter().filter_map(LexOrdering::new));
+        self.unfund();
+        self.try_add_orderings(sort_exprs)
+            .expect("unfunded planning never refuses");
+    }
+
+    /// Adds new orderings into this ordering equivalence class, each built and stored
+    /// through its funding.
+    pub fn try_add_orderings(
+        &mut self,
+        sort_exprs: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
+    ) -> Result<()> {
+        let funding = self.funding().clone();
+        let result =
+            sort_exprs
+                .into_iter()
+                .try_for_each(|sort_exprs| {
+                    match LexOrdering::try_new(sort_exprs, &funding)? {
+                        Some(ordering) => self.orderings.push(ordering),
+                        None => Ok(()),
+                    }
+                });
         // Make sure that there are no redundant orderings:
         self.remove_redundant_entries();
+        result
     }
 
     /// Removes redundant orderings from this ordering equivalence class.
@@ -162,7 +257,9 @@ impl OrderingEquivalenceClass {
         let n_ordering = self.orderings.len();
         // Replicate entries before cross product:
         let n_cross = std::cmp::max(n_ordering, other.len() * n_ordering);
-        self.orderings = self.orderings.into_iter().cycle().take(n_cross).collect();
+        self.unfund();
+        let orderings = std::mem::take(&mut *self.orderings);
+        *self.orderings = orderings.into_iter().cycle().take(n_cross).collect();
         // Append sort expressions of `other` to the current orderings:
         for (outer_idx, ordering) in other.iter().enumerate() {
             let base = outer_idx * n_ordering;
@@ -178,13 +275,15 @@ impl OrderingEquivalenceClass {
     /// ordering equivalence class, the rewritten expressions charged to
     /// `funding` before they are allocated.
     pub fn add_offset(&mut self, offset: isize, funding: &Funding) -> Result<()> {
-        let orderings = std::mem::take(&mut self.orderings);
-        for ordering_result in orderings
-            .into_iter()
-            .map(|o| add_offset_to_physical_sort_exprs(o, offset, funding))
-        {
-            self.orderings.extend(LexOrdering::new(ordering_result?));
+        let mut orderings = funding.held::<Vec<LexOrdering>>();
+        orderings.reserve_exact(self.orderings.len())?;
+        for ordering in self.orderings.drain(..) {
+            let offset_exprs =
+                add_offset_to_physical_sort_exprs(ordering, offset, funding)?;
+            let offset_ordering = LexOrdering::try_new(offset_exprs, funding)?;
+            orderings.extend(offset_ordering);
         }
+        self.orderings = orderings;
         Ok(())
     }
 
@@ -203,23 +302,21 @@ impl OrderingEquivalenceClass {
     }
 
     fn rewrite_schema(mut self, schema: &SchemaRef, funding: &Funding) -> Result<Self> {
-        self.orderings = self
-            .orderings
-            .into_iter()
-            .map(|ordering| {
-                ordering
-                    .into_iter()
-                    .map(|mut sort_expr| {
-                        sort_expr.expr =
-                            with_new_schema(sort_expr.expr, schema, funding)?;
-                        Ok(sort_expr)
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    // The following `unwrap` is safe because the vector will always
-                    // be non-empty.
-                    .map(|v| LexOrdering::new(v).unwrap())
-            })
-            .collect::<Result<_>>()?;
+        let mut orderings = funding.held::<Vec<LexOrdering>>();
+        orderings.reserve_exact(self.orderings.len())?;
+        for ordering in self.orderings.drain(..) {
+            let mut sort_exprs = funding.held::<Vec<PhysicalSortExpr>>();
+            sort_exprs.reserve_exact(ordering.len())?;
+            for mut sort_expr in ordering {
+                sort_expr.expr = with_new_schema(sort_expr.expr, schema, funding)?;
+                sort_exprs.push(sort_expr)?;
+            }
+            // The rewritten ordering is never empty: its source was not.
+            if let Some(ordering) = LexOrdering::try_new(sort_exprs.drain(..), funding)? {
+                orderings.push(ordering)?;
+            }
+        }
+        self.orderings = orderings;
         Ok(self)
     }
 
@@ -296,7 +393,8 @@ impl Deref for OrderingEquivalenceClass {
 
 impl From<Vec<LexOrdering>> for OrderingEquivalenceClass {
     fn from(orderings: Vec<LexOrdering>) -> Self {
-        let mut result = Self { orderings };
+        let mut result = Self::default();
+        *result.orderings = orderings;
         result.remove_redundant_entries();
         result
     }
@@ -308,7 +406,7 @@ impl IntoIterator for OrderingEquivalenceClass {
     type IntoIter = IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.orderings.into_iter()
+        self.orderings.unheld().into_iter()
     }
 }
 
@@ -328,7 +426,7 @@ impl Display for OrderingEquivalenceClass {
 
 impl From<OrderingEquivalenceClass> for Vec<LexOrdering> {
     fn from(oeq_class: OrderingEquivalenceClass) -> Self {
-        oeq_class.orderings
+        oeq_class.orderings.unheld()
     }
 }
 
@@ -346,14 +444,14 @@ mod tests {
     use crate::expressions::{BinaryExpr, CastExpr, Column, col};
     use crate::utils::tests::TestScalarUDF;
     use crate::{
-        AcrossPartitions, ConstExpr, PhysicalExpr, PhysicalExprRef, PhysicalSortExpr,
-        ScalarFunctionExpr,
+        AcrossPartitions, ConstExpr, LexOrdering, PhysicalExpr, PhysicalExprRef,
+        PhysicalSortExpr, ScalarFunctionExpr,
     };
 
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::Result;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::{DataFusionError, Result};
     use datafusion_expr::{Operator, ScalarUDF};
 
     #[test]
@@ -1007,6 +1105,102 @@ mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    struct Ceiling {
+        limit: usize,
+        held: std::sync::atomic::AtomicUsize,
+    }
+
+    impl datafusion_common::funding::PlanningFunding for Ceiling {
+        fn charge(&self, bytes: usize) -> bool {
+            use std::sync::atomic::Ordering;
+            self.held
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                    held.checked_add(bytes).filter(|total| *total <= self.limit)
+                })
+                .is_ok()
+        }
+
+        fn discharge(&self, bytes: usize) {
+            self.held
+                .fetch_sub(bytes, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    fn ceiling(limit: usize) -> (Arc<Ceiling>, Funding) {
+        let source = Arc::new(Ceiling {
+            limit,
+            held: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        (source, funding)
+    }
+
+    fn held(source: &Ceiling) -> usize {
+        source.held.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn funded_orderings() -> Vec<Vec<PhysicalSortExpr>> {
+        let [a, b, c] = ["a", "b", "c"].map(|name| {
+            PhysicalSortExpr::new_default(Arc::new(Column::new(name, 0)) as _)
+        });
+        vec![vec![a, b], vec![c]]
+    }
+
+    #[test]
+    fn funded_orderings_are_held_until_dropped() -> Result<()> {
+        let (source, funding) = ceiling(usize::MAX);
+        let class = OrderingEquivalenceClass::try_new(funded_orderings(), &funding)?;
+        assert_eq!(class.len(), 2);
+        let needed = funding.outstanding();
+        assert!(needed > 0, "orderings were stored unfunded");
+        assert_eq!(held(&source), needed);
+        let copy = class.clone();
+        assert_eq!(copy, class);
+        assert_eq!(funding.outstanding(), needed, "clones are unfunded");
+        drop(class);
+        assert_eq!(funding.outstanding(), 0);
+        assert_eq!(held(&source), 0);
+        drop(copy);
+        assert_eq!(held(&source), 0);
+
+        for available in 0..needed {
+            let (source, funding) = ceiling(available);
+            let result = OrderingEquivalenceClass::try_new(funded_orderings(), &funding);
+            assert!(
+                matches!(result, Err(DataFusionError::Refused { .. })),
+                "orderings unexpectedly stored with {available}/{needed} bytes"
+            );
+            assert_eq!(funding.outstanding(), 0, "available: {available}");
+            assert_eq!(held(&source), 0, "available: {available}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unfunded_growth_gives_back_without_over_discharging() -> Result<()> {
+        let (source, funding) = ceiling(usize::MAX);
+        let mut class = OrderingEquivalenceClass::try_new(funded_orderings(), &funding)?;
+        let mut ordering = LexOrdering::try_new(funded_orderings().remove(0), &funding)?
+            .expect("non-empty ordering");
+        let before = funding.outstanding();
+        class.add_orderings([[PhysicalSortExpr::new_default(
+            Arc::new(Column::new("d", 0)) as _,
+        )]]);
+        ordering.push(PhysicalSortExpr::new_default(
+            Arc::new(Column::new("d", 0)) as _
+        ));
+        assert!(
+            funding.outstanding() < before,
+            "unfunded growth kept the funded storage charged"
+        );
+        let mut joined = class.clone().join_suffix(&class);
+        joined.add_offset(1, &funding)?;
+        drop((class, ordering, joined));
+        assert_eq!(funding.outstanding(), 0);
+        assert_eq!(held(&source), 0);
         Ok(())
     }
 }

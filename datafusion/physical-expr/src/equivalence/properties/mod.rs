@@ -199,7 +199,7 @@ impl OrderingEquivalenceCache {
         funding: &Funding,
     ) -> Result<Self> {
         let mut cache = Self {
-            normal_cls: OrderingEquivalenceClass::new(orderings),
+            normal_cls: OrderingEquivalenceClass::try_new(orderings, funding)?,
             leading_exprs: FundedSet::with_funding(funding),
         };
         cache.update_map()?;
@@ -450,11 +450,15 @@ impl EquivalenceProperties {
 
     fn update_oeq_cache(&mut self) -> Result<()> {
         // Renormalize orderings if the equivalence group changes:
+        let funding = self.oeq_cache.leading_exprs.funding().clone();
         let normal_cls = mem::take(&mut self.oeq_cache.normal_cls);
-        let normal_orderings = normal_cls
-            .into_iter()
-            .map(|o| self.eq_group.normalize_sort_exprs(o));
-        self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
+        let mut normal_orderings = funding.held::<Vec<_>>();
+        normal_orderings.reserve_exact(normal_cls.len())?;
+        for ordering in normal_cls {
+            normal_orderings.push(self.eq_group.try_normalize_sort_exprs(ordering)?)?;
+        }
+        self.oeq_cache.normal_cls =
+            OrderingEquivalenceClass::try_new(normal_orderings.drain(..), &funding)?;
         self.oeq_cache.update_map()?;
         // Discover any new orderings based on the new equivalence classes:
         self.discover_from_leading_exprs()
@@ -512,13 +516,15 @@ impl EquivalenceProperties {
         }
         // Renormalize the orderings after adding new constants by removing
         // the constants from existing orderings:
+        let funding = self.oeq_cache.leading_exprs.funding().clone();
         let normal_cls = mem::take(&mut self.oeq_cache.normal_cls);
         let normal_orderings = normal_cls.into_iter().map(|ordering| {
             ordering.into_iter().filter(|sort_expr| {
                 self.eq_group.is_expr_constant(&sort_expr.expr).is_none()
             })
         });
-        self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
+        self.oeq_cache.normal_cls =
+            OrderingEquivalenceClass::try_new(normal_orderings, &funding)?;
         self.oeq_cache.update_map()?;
         // Discover any new orderings based on the constants:
         self.discover_from_leading_exprs()
@@ -1306,13 +1312,18 @@ impl EquivalenceProperties {
             let eq_group = self.eq_group.try_project(mapping)?;
             let orderings =
                 self.projected_orderings(mapping, self.oeq_cache.normal_cls.clone())?;
-            let normal_orderings = orderings
-                .iter()
-                .cloned()
-                .map(|o| eq_group.normalize_sort_exprs(o));
+            let mut normal_orderings = funding.held::<Vec<_>>();
+            normal_orderings.reserve_exact(orderings.len())?;
+            for ordering in &orderings {
+                normal_orderings
+                    .push(eq_group.try_normalize_sort_exprs(ordering.iter().cloned())?)?;
+            }
             Ok(Self {
-                oeq_cache: OrderingEquivalenceCache::try_new(normal_orderings, funding)?,
-                oeq_class: OrderingEquivalenceClass::new(orderings),
+                oeq_cache: OrderingEquivalenceCache::try_new(
+                    normal_orderings.drain(..),
+                    funding,
+                )?,
+                oeq_class: OrderingEquivalenceClass::try_new(orderings, funding)?,
                 constraints: self.projected_constraints(mapping).unwrap_or_default(),
                 schema: output_schema,
                 eq_group,
@@ -2304,8 +2315,7 @@ mod funding_tests {
             let mut properties = rewrite_fixture(false, false);
             let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
             let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-            properties.eq_group =
-                EquivalenceGroup::new([EquivalenceClass::new([b, a])]);
+            properties.eq_group = EquivalenceGroup::new([EquivalenceClass::new([b, a])]);
             let error = properties
                 .try_add_orderings([[PhysicalSortExpr::new_default(expr)]])
                 .err()
@@ -2389,6 +2399,48 @@ mod funding_tests {
              ({given_back} bytes given back on drop)"
         );
         funding.unwound(0);
+        Ok(())
+    }
+
+    #[test]
+    fn projected_orderings_are_held_funded() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let (properties, mapping, schema) = ordered_projection()?;
+        let projected = properties.try_project(&mapping, schema, &funding)?;
+        let table = projected.oeq_cache.leading_exprs.charged_bytes();
+        let given_back = given_back_on_drop(&source, projected);
+        assert!(
+            given_back > table,
+            "projection kept its orderings unfunded: {given_back} bytes given back on \
+             drop, {table} of them its leading expression table"
+        );
+        funding.unwound(0);
+        assert_eq!(source.held.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn rewritten_orderings_are_held_funded() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let rewritten =
+            rewrite_fixture(true, true).with_new_schema(renamed_schema(), &funding)?;
+        let table = rewritten.oeq_cache.leading_exprs.charged_bytes();
+        let given_back = given_back_on_drop(&source, rewritten);
+        assert!(
+            given_back > table,
+            "schema rewriting kept its orderings unfunded: {given_back} bytes given back \
+             on drop, {table} of them its leading expression table"
+        );
+        funding.unwound(0);
+        assert_eq!(source.held.load(Ordering::Acquire), 0);
         Ok(())
     }
 }
