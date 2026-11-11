@@ -756,7 +756,7 @@ impl Deref for LexOrdering {
 impl Display for LexOrdering {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         let mut first = true;
-        for sort_expr in &self.exprs {
+        for sort_expr in self.exprs.iter() {
             if first {
                 first = false;
             } else {
