@@ -2325,6 +2325,52 @@ mod funding_tests {
         Ok(())
     }
 
+    #[test]
+    fn remaining_lex_rebind_refusal_preserves_previous_grants() -> Result<()> {
+        struct Revoked {
+            ceiling: Ceiling,
+            revoked: AtomicUsize,
+        }
+
+        impl PlanningFunding for Revoked {
+            fn charge(&self, bytes: usize) -> bool {
+                self.revoked.load(Ordering::Acquire) == 0 && self.ceiling.charge(bytes)
+            }
+
+            fn discharge(&self, bytes: usize) {
+                self.ceiling.discharge(bytes);
+            }
+        }
+
+        let source = Arc::new(Revoked {
+            ceiling: Ceiling {
+                limit: usize::MAX,
+                held: AtomicUsize::new(0),
+            },
+            revoked: AtomicUsize::new(0),
+        });
+        let previous = Funding::new(Arc::clone(&source) as _);
+        let expr = PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)));
+        let mut ordering =
+            LexOrdering::try_new([expr], &previous)?.expect("nonempty ordering");
+        let needed = previous.outstanding();
+        let next = Funding::new(Arc::new(Ceiling {
+            limit: needed - 1,
+            held: AtomicUsize::new(0),
+        }));
+        source.revoked.store(1, Ordering::Release);
+
+        let error = ordering
+            .rebind(&next)
+            .err()
+            .expect("the next pool cannot fund both buffers");
+        assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        assert_eq!(previous.outstanding(), needed);
+        assert_eq!(next.outstanding(), 0);
+        assert_eq!(ordering[0].expr.to_string(), "a@0");
+        Ok(())
+    }
+
     fn ordered_projection()
     -> Result<(EquivalenceProperties, ProjectionMapping, SchemaRef)> {
         let properties = rewrite_fixture(true, true);

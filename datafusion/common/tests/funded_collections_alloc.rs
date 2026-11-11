@@ -90,7 +90,10 @@ unsafe impl GlobalAlloc for CountingAlloc {
         let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
         if tracked && !new_ptr.is_null() {
             let next_live = LIVE_BYTES.with(|c| {
-                let next = c.get().saturating_add(new_size).saturating_sub(layout.size());
+                let next = c
+                    .get()
+                    .saturating_add(new_size)
+                    .saturating_sub(layout.size());
                 c.set(next);
                 next
             });

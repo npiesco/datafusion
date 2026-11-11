@@ -1044,6 +1044,113 @@ impl DerefMut for OrderingRequirements {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Schema};
+    use datafusion_common::funding::PlanningFunding;
+    use datafusion_expr_common::columnar_value::ColumnarValue;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Grants up to `limit` bytes outstanding; a limit of zero revokes every further grant.
+    #[derive(Default)]
+    struct Pool {
+        limit: AtomicUsize,
+        held: AtomicUsize,
+    }
+
+    impl PlanningFunding for Pool {
+        fn charge(&self, bytes: usize) -> bool {
+            let held = self.held.load(Ordering::Acquire);
+            if held + bytes > self.limit.load(Ordering::Acquire) {
+                return false;
+            }
+            self.held.fetch_add(bytes, Ordering::AcqRel);
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            self.held.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct Leaf;
+
+    impl Display for Leaf {
+        fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("leaf")
+        }
+    }
+
+    impl PhysicalExpr for Leaf {
+        fn data_type(&self, _schema: &Schema) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+
+        fn nullable(&self, _schema: &Schema) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn evaluate(&self, _batch: &arrow::array::RecordBatch) -> Result<ColumnarValue> {
+            unreachable!("never evaluated")
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            Ok(self)
+        }
+
+        fn fmt_sql(&self, f: &mut Formatter<'_>) -> fmt::Result {
+            f.write_str("leaf")
+        }
+    }
+
+    #[test]
+    fn a_refused_rebind_leaves_the_ordering_on_a_revoked_pool_untouched() {
+        let old_pool = Arc::new(Pool::default());
+        old_pool.limit.store(usize::MAX, Ordering::Release);
+        let previous = Funding::new(Arc::clone(&old_pool) as Arc<dyn PlanningFunding>);
+        let mut ordering = LexOrdering::try_new(
+            [PhysicalSortExpr::new_default(Arc::new(Leaf))],
+            &previous,
+        )
+        .unwrap()
+        .unwrap();
+        let charged = previous.outstanding();
+        assert!(charged > 0);
+        // The old pool stops granting: a rebind that hands its charge back and asks again
+        // cannot get it back.
+        old_pool.limit.store(0, Ordering::Release);
+        let new_pool = Arc::new(Pool::default());
+        // Room for the first buffer, not for both.
+        new_pool.limit.store(charged - 1, Ordering::Release);
+        let next = Funding::new(Arc::clone(&new_pool) as Arc<dyn PlanningFunding>);
+
+        let refused = ordering.rebind(&next);
+
+        assert!(refused.is_err(), "the rebind is refused: {refused:?}");
+        assert_eq!(
+            previous.outstanding(),
+            charged,
+            "the charge stays where it was"
+        );
+        assert_eq!(
+            next.outstanding(),
+            0,
+            "nothing stays charged to the new pool"
+        );
+        assert_eq!(new_pool.held.load(Ordering::Acquire), 0);
+        drop(ordering);
+        assert_eq!(
+            previous.outstanding(),
+            0,
+            "dropping the ordering gives it back"
+        );
+    }
 
     #[test]
     fn test_is_reversed_sort_options() {
