@@ -1013,7 +1013,7 @@ mod tests {
         let rebuilt = get_best_fitting_window(
             bounded.window_expr(),
             bounded.input(),
-            &bounded.partition_keys(),
+            bounded.partition_keys(),
             bounded.state_observer().cloned(),
             &Funding::default(),
         )?

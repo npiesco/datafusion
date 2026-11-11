@@ -140,6 +140,7 @@ impl SortMergeJoinExec {
     /// The inputs are sorted using `sort_options` are applied to the columns in the `on`
     /// # Error
     /// This function errors when it is not possible to join the left and right sides on keys `on`.
+    #[expect(clippy::too_many_arguments)]
     pub fn try_new(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,

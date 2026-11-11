@@ -840,7 +840,12 @@ impl ExecutionPlan for NestedLoopJoinExec {
                 funding,
             )?)?))
         } else {
-            try_embed_projection(projection, self)
+            let before = self.funding.outstanding();
+            let embedded = try_embed_projection(projection, self)?;
+            if embedded.is_none() {
+                self.funding.unwound(before);
+            }
+            Ok(embedded)
         }
     }
     #[cfg(feature = "proto")]

@@ -31,7 +31,7 @@ use crate::{
     SendableRecordBatchStream, Statistics, validate_child_count,
 };
 
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{Funding, arc_bytes};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
@@ -267,13 +267,27 @@ impl ExecutionPlan for SortPreservingMergeExec {
         &self,
         preserve_order: bool,
     ) -> Option<Arc<dyn ExecutionPlan>> {
-        self.input
-            .with_preserve_order(preserve_order)
-            .and_then(|new_input| {
-                let this = self.funding.arc(self.clone()).ok()?;
-                let children = self.funding.vec_of([new_input]).ok()?;
-                replace_children_if_necessary(this, children).ok()
-            })
+        let funding = &self.funding;
+        let before = funding.outstanding();
+        let rewritten =
+            self.input
+                .with_preserve_order(preserve_order)
+                .and_then(|new_input| {
+                    let same_input = Arc::ptr_eq(&self.input, &new_input);
+                    let this = funding.arc(self.clone()).ok()?;
+                    let children = funding.vec_of([new_input]).ok()?;
+                    let bytes = children.capacity() * size_of::<Arc<dyn ExecutionPlan>>();
+                    let result = replace_children_if_necessary(this, children);
+                    funding.discharge(bytes);
+                    if !same_input {
+                        funding.discharge(arc_bytes::<Self>());
+                    }
+                    result.ok()
+                });
+        if rewritten.is_none() {
+            funding.unwound(before);
+        }
+        rewritten
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {

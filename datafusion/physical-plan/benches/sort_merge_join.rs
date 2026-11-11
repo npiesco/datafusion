@@ -28,6 +28,7 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::NullEquality;
+use datafusion_common::funding::Funding;
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::expressions::col;
 use datafusion_physical_plan::collect;
@@ -108,6 +109,7 @@ fn do_join(
         join_type,
         vec![SortOptions::default()],
         NullEquality::NullEqualsNothing,
+        &Funding::default(),
     )
     .unwrap();
 
