@@ -1684,7 +1684,7 @@ mod tests {
     #[test]
     fn test_from_qualified_fields() -> Result<()> {
         let schema = DFSchema::new_with_metadata(
-            &vec![
+            &[
                 (
                     Some("t0".into()),
                     Arc::new(Field::new("c0", DataType::Boolean, true)),
@@ -2914,7 +2914,7 @@ mod tests {
     fn test_print_schema_mixed_qualified_unqualified() {
         // Test a schema with mixed qualified and unqualified fields
         let schema = DFSchema::new_with_metadata(
-            &vec![
+            &[
                 (
                     Some("table1".into()),
                     Arc::new(Field::new("id", DataType::Int32, false)),

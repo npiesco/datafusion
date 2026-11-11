@@ -280,6 +280,10 @@ impl Funding {
     }
 
     /// The value `boxed` holds, moved out of its block: the block, freed, is given back.
+    #[expect(
+        clippy::boxed_local,
+        reason = "Consuming the owned heap block lets its funding be discharged."
+    )]
     pub fn unboxed<T>(&self, boxed: Box<T>) -> T {
         let value = *boxed;
         self.discharge(size_of::<T>());

@@ -120,8 +120,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     ) -> Result<LogicalPlan> {
         match constraint {
             JoinConstraint::On(sql_expr) => {
-                let join_schema =
-                    left.schema().join(right.schema(), self.funding())?;
+                let join_schema = left.schema().join(right.schema(), self.funding())?;
                 // parse ON expression
                 self.warn_on_null_equality_predicate(&sql_expr);
                 let expr = self.sql_to_expr(sql_expr, &join_schema, planner_context);
