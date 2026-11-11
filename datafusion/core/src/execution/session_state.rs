@@ -972,7 +972,7 @@ impl SessionState {
     /// The funding planning is charged to
     /// ([`SessionConfig::with_planning_funding`]).
     pub fn planning_funding(&self) -> &datafusion_common::funding::Funding {
-        self.config.planning_funding()
+        self.inner.config.planning_funding()
     }
 
     /// Returns the statistics registry if one is configured.
