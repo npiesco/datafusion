@@ -423,55 +423,39 @@ fn hash_join_convert_symmetric_subrule(
             // the function concludes that no specific order is required for the SymmetricHashJoinExec. This approach
             // ensures that the symmetric hash join operation only imposes ordering constraints when necessary,
             // based on the properties of the child nodes and the filter condition.
-            let determine_order = |side: JoinSide| -> Option<LexOrdering> {
-                hash_join
-                    .filter()
-                    .map(|filter| {
-                        filter.column_indices().iter().any(
-                            |ColumnIndex {
-                                 index,
-                                 side: column_side,
-                             }| {
-                                // Skip if column side does not match the join side.
-                                if *column_side != side {
-                                    return false;
-                                }
-                                // Retrieve equivalence properties and schema based on the side.
-                                let (equivalence, schema) = match side {
-                                    JoinSide::Left => (
-                                        hash_join.left().equivalence_properties(),
-                                        hash_join.left().schema(),
-                                    ),
-                                    JoinSide::Right => (
-                                        hash_join.right().equivalence_properties(),
-                                        hash_join.right().schema(),
-                                    ),
-                                    JoinSide::None => return false,
-                                };
-
-                                let name = schema.field(*index).name();
-                                let col = Arc::new(Column::new(name, *index)) as _;
-                                // Check if the column is ordered.
-                                equivalence.get_expr_properties(col).sort_properties
-                                    != SortProperties::Unordered
-                            },
-                        )
-                    })
-                    .unwrap_or(false)
-                    .then(|| {
-                        match side {
-                            JoinSide::Left => hash_join.left().output_ordering(),
-                            JoinSide::Right => hash_join.right().output_ordering(),
-                            JoinSide::None => unreachable!(),
-                        }
-                        .cloned()
-                    })
-                    .flatten()
+            let determine_order = |side: JoinSide| -> Result<Option<LexOrdering>> {
+                let Some(filter) = hash_join.filter() else {
+                    return Ok(None);
+                };
+                let input = match side {
+                    JoinSide::Left => hash_join.left(),
+                    JoinSide::Right => hash_join.right(),
+                    JoinSide::None => return Ok(None),
+                };
+                let equivalence = input.equivalence_properties();
+                let schema = input.schema();
+                for ColumnIndex {
+                    index,
+                    side: column_side,
+                } in filter.column_indices()
+                {
+                    if *column_side != side {
+                        continue;
+                    }
+                    let name = schema.field(*index).name();
+                    let col = Arc::new(Column::new(name, *index)) as _;
+                    if equivalence.get_expr_properties(col)?.sort_properties
+                        != SortProperties::Unordered
+                    {
+                        return Ok(input.output_ordering().cloned());
+                    }
+                }
+                Ok(None)
             };
 
             // Determine the sort order for both left and right sides.
-            let left_order = determine_order(JoinSide::Left);
-            let right_order = determine_order(JoinSide::Right);
+            let left_order = determine_order(JoinSide::Left)?;
+            let right_order = determine_order(JoinSide::Right)?;
 
             let funding = hash_join.funding();
             let exec = SymmetricHashJoinExec::try_new(

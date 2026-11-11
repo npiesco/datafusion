@@ -657,7 +657,7 @@ mod tests {
                 .iter()
                 .map(|ordering| ordering.first().clone())
                 .collect::<Vec<_>>();
-            let expr_props = eq_properties.get_expr_properties(Arc::clone(&expr));
+            let expr_props = eq_properties.get_expr_properties(Arc::clone(&expr))?;
             let err_msg = format!(
                 "expr:{:?}, expected: {:?}, actual: {:?}, leading_orderings: {leading_orderings:?}",
                 expr, expected, expr_props.sort_properties

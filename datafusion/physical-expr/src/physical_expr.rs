@@ -18,12 +18,12 @@
 use std::sync::Arc;
 
 use crate::expressions::{self, Column};
+use crate::projection::funded_column;
 use crate::{LexOrdering, PhysicalSortExpr, create_physical_expr, create_physical_exprs};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_common::funding::Funding;
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{DFSchema, HashMap, ScalarValue, SplitPoint};
 use datafusion_common::{Result, plan_err};
 use datafusion_expr::execution_props::ExecutionProps;
@@ -44,18 +44,22 @@ pub fn add_offset_to_expr(
     offset: isize,
     funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    expr.transform_down(|e| match e.downcast_ref::<Column>() {
-        Some(col) => {
-            let Some(idx) = col.index().checked_add_signed(offset) else {
-                return plan_err!("Column index overflow");
-            };
-            let column: Arc<dyn PhysicalExpr> =
-                funding.arc(Column::new(funding.string(col.name())?, idx))?;
-            Ok(Transformed::yes(column))
-        }
-        None => Ok(Transformed::no(e)),
-    })
-    .data()
+    datafusion_physical_expr_common::physical_expr::rewrite_with_funding(
+        expr,
+        funding,
+        |e| match e.downcast_ref::<Column>() {
+            Some(col) => {
+                let Some(idx) = col.index().checked_add_signed(offset) else {
+                    return plan_err!("Column index overflow");
+                };
+                if idx == col.index() {
+                    return Ok(e);
+                }
+                funded_column(col.name(), idx, funding)
+            }
+            None => Ok(e),
+        },
+    )
 }
 
 /// This function is similar to the `contains` method of `Vec`. It finds

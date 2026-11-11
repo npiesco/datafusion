@@ -41,7 +41,10 @@ workspace = true
 name = "datafusion_physical_expr"
 
 [features]
-recursive_protection = ["dep:recursive"]
+recursive_protection = [
+    "dep:recursive",
+    "datafusion-physical-expr-common/recursive_protection",
+]
 # Forwards the `proto` feature to `datafusion-physical-expr-common`, exposing
 # `PhysicalExpr::to_proto` and letting expressions in this crate implement it.
 proto = [

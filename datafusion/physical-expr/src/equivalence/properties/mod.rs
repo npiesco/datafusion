@@ -42,7 +42,9 @@ use crate::{
 use arrow::datatypes::SchemaRef;
 use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::{Constraint, Constraints, HashMap, Result, plan_err};
+use datafusion_common::{
+    Constraint, Constraints, DataFusionError, HashMap, Result, plan_err,
+};
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_expr::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::sort_expr::options_compatible;
@@ -621,7 +623,7 @@ impl EquivalenceProperties {
             // Check whether given requirement is satisfied:
             let ExprProperties {
                 sort_properties, ..
-            } = eq_properties.get_expr_properties(Arc::clone(&element.expr));
+            } = eq_properties.get_expr_properties(Arc::clone(&element.expr))?;
             let satisfy = match sort_properties {
                 SortProperties::Ordered(options) => element.options.is_none_or(|opts| {
                     let nullable = element.expr.nullable(schema).unwrap_or(true);
@@ -666,10 +668,10 @@ impl EquivalenceProperties {
     fn add_satisfied_key_constants(&mut self, expr: Arc<dyn PhysicalExpr>) -> Result<()> {
         let mut stack = vec![expr];
         while let Some(expr) = stack.pop() {
-            let properties = self.get_expr_properties(Arc::clone(&expr));
+            let properties = self.get_expr_properties(Arc::clone(&expr))?;
             if properties.strictly_order_preserving {
                 for child in expr.children() {
-                    let child_properties = self.get_expr_properties(Arc::clone(child));
+                    let child_properties = self.get_expr_properties(Arc::clone(child))?;
                     if matches!(
                         child_properties.sort_properties,
                         SortProperties::Ordered(_)
@@ -699,7 +701,7 @@ impl EquivalenceProperties {
             // Check whether given ordering is satisfied:
             let ExprProperties {
                 sort_properties, ..
-            } = eq_properties.get_expr_properties(Arc::clone(&element.expr));
+            } = eq_properties.get_expr_properties(Arc::clone(&element.expr))?;
             let satisfy = match sort_properties {
                 SortProperties::Ordered(options) => options_compatible(
                     &options,
@@ -1213,26 +1215,25 @@ impl EquivalenceProperties {
         let mut search_indices = (0..exprs.len()).collect::<IndexSet<_>>();
         for _ in 0..exprs.len() {
             // Get ordered expressions with their indices.
-            let ordered_exprs = search_indices
-                .iter()
-                .filter_map(|&idx| {
-                    let ExprProperties {
-                        sort_properties, ..
-                    } = eq_properties.get_expr_properties(Arc::clone(&exprs[idx]));
-                    match sort_properties {
-                        SortProperties::Ordered(options) => {
-                            let expr = Arc::clone(&exprs[idx]);
-                            Some((PhysicalSortExpr::new(expr, options), idx))
-                        }
-                        SortProperties::Singleton => {
-                            // Assign default ordering to constant expressions:
-                            let expr = Arc::clone(&exprs[idx]);
-                            Some((PhysicalSortExpr::new_default(expr), idx))
-                        }
-                        SortProperties::Unordered => None,
+            let mut ordered_exprs = vec![];
+            for &idx in &search_indices {
+                let ExprProperties {
+                    sort_properties, ..
+                } = eq_properties.get_expr_properties(Arc::clone(&exprs[idx]))?;
+                let ordered = match sort_properties {
+                    SortProperties::Ordered(options) => {
+                        let expr = Arc::clone(&exprs[idx]);
+                        Some((PhysicalSortExpr::new(expr, options), idx))
                     }
-                })
-                .collect::<Vec<_>>();
+                    SortProperties::Singleton => {
+                        // Assign default ordering to constant expressions:
+                        let expr = Arc::clone(&exprs[idx]);
+                        Some((PhysicalSortExpr::new_default(expr), idx))
+                    }
+                    SortProperties::Unordered => None,
+                };
+                ordered_exprs.extend(ordered);
+            }
             // We reached a fixed point, exit.
             if ordered_exprs.is_empty() {
                 break;
@@ -1293,12 +1294,25 @@ impl EquivalenceProperties {
     ///
     /// Returns an [`ExprProperties`] object containing the ordering and range
     /// information for the given expression.
-    pub fn get_expr_properties(&self, expr: Arc<dyn PhysicalExpr>) -> ExprProperties {
-        ExprPropertiesNode::new_unknown(expr)
+    ///
+    /// Unknown properties are used for unsupported expressions, but funding
+    /// refusal is propagated to the caller.
+    pub fn get_expr_properties(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<ExprProperties> {
+        match ExprPropertiesNode::new_unknown(expr)
             .transform_up(|expr| update_properties(expr, self))
             .data()
-            .map(|node| node.data)
-            .unwrap_or_else(|_| ExprProperties::new_unknown())
+        {
+            Ok(node) => Ok(node.data),
+            Err(error)
+                if matches!(error.find_root(), DataFusionError::Refused { .. }) =>
+            {
+                Err(error)
+            }
+            Err(_) => Ok(ExprProperties::new_unknown()),
+        }
     }
 
     /// Transforms this `EquivalenceProperties` by mapping columns in the
@@ -1582,6 +1596,225 @@ mod funding_tests {
         fn discharge(&self, bytes: usize) {
             self.held.fetch_sub(bytes, Ordering::AcqRel);
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PropertyFailure {
+        Refused,
+        ContextualRefusal,
+        Unsupported,
+    }
+
+    #[derive(Debug)]
+    struct BudgetedProperties {
+        child: Arc<dyn PhysicalExpr>,
+        funding: Funding,
+        failure: PropertyFailure,
+    }
+
+    impl PartialEq for BudgetedProperties {
+        fn eq(&self, other: &Self) -> bool {
+            self.child.eq(&other.child)
+        }
+    }
+
+    impl Eq for BudgetedProperties {}
+
+    impl std::hash::Hash for BudgetedProperties {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            std::hash::Hash::hash(&self.child, state);
+        }
+    }
+
+    impl Display for BudgetedProperties {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "budgeted({})", self.child)
+        }
+    }
+
+    impl PhysicalExpr for BudgetedProperties {
+        fn data_type(&self, schema: &Schema) -> Result<DataType> {
+            self.child.data_type(schema)
+        }
+
+        fn nullable(&self, schema: &Schema) -> Result<bool> {
+            self.child.nullable(schema)
+        }
+
+        fn evaluate(
+            &self,
+            batch: &arrow::record_batch::RecordBatch,
+        ) -> Result<datafusion_expr::ColumnarValue> {
+            self.child.evaluate(batch)
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+            vec![&self.child]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn PhysicalExpr>>,
+        ) -> Result<Arc<dyn PhysicalExpr>> {
+            Ok(Arc::new(Self {
+                child: Arc::clone(&children[0]),
+                funding: self.funding.clone(),
+                failure: self.failure,
+            }))
+        }
+
+        fn get_properties(&self, _children: &[ExprProperties]) -> Result<ExprProperties> {
+            match self.failure {
+                PropertyFailure::Refused => self.funding.charge(1)?,
+                PropertyFailure::ContextualRefusal => self
+                    .funding
+                    .charge(1)
+                    .map_err(|error| error.context("Budgeted property lookup"))?,
+                PropertyFailure::Unsupported => {
+                    return plan_err!("Property lookup is unsupported");
+                }
+            }
+            Ok(ExprProperties::new_unknown())
+        }
+
+        fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.child.fmt_sql(f)
+        }
+    }
+
+    #[test]
+    fn remaining_refused_properties_reaches_ordering_callers() {
+        fn assert_refused<T>(result: Result<T>) {
+            let error = result.err().expect("property refusal was swallowed");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        }
+
+        for failure in [PropertyFailure::Refused, PropertyFailure::ContextualRefusal] {
+            let funding = Funding::new(Arc::new(Ceiling {
+                limit: 0,
+                held: AtomicUsize::new(0),
+            }));
+            let expr: Arc<dyn PhysicalExpr> = Arc::new(BudgetedProperties {
+                child: Arc::new(Column::new("a", 0)),
+                funding,
+                failure,
+            });
+            let properties = rewrite_fixture(false, true);
+            assert_refused(
+                properties
+                    .ordering_satisfy([PhysicalSortExpr::new_default(Arc::clone(&expr))]),
+            );
+            assert_refused(properties.ordering_satisfy_requirement([
+                PhysicalSortRequirement::new(Arc::clone(&expr), None),
+            ]));
+            assert_refused(properties.find_longest_permutation(&[expr]));
+        }
+    }
+
+    #[test]
+    fn remaining_unsupported_properties_remain_unknown() -> Result<()> {
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BudgetedProperties {
+            child: Arc::new(Column::new("a", 0)),
+            funding: Funding::default(),
+            failure: PropertyFailure::Unsupported,
+        });
+        let properties = rewrite_fixture(false, true);
+        assert!(
+            !properties
+                .ordering_satisfy([PhysicalSortExpr::new_default(Arc::clone(&expr)),])?
+        );
+        assert!(!properties.ordering_satisfy_requirement([
+            PhysicalSortRequirement::new(Arc::clone(&expr), None),
+        ])?);
+        let (ordering, indices) = properties.find_longest_permutation(&[expr])?;
+        assert!(ordering.is_empty());
+        assert!(indices.is_empty());
+        Ok(())
+    }
+
+    fn offset_fixture() -> Arc<dyn PhysicalExpr> {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("b", 1)),
+        ))
+    }
+
+    fn offset_rebuild_bytes() -> usize {
+        2 * arc_bytes::<Column>()
+            + 2
+            + datafusion_common::funding::counted_block(std::alloc::Layout::new::<
+                BinaryExpr,
+            >())
+            .unwrap()
+    }
+
+    #[test]
+    fn remaining_offset_refuses_unfunded_parent_rebuild() {
+        let source = Arc::new(Ceiling {
+            limit: 2 * arc_bytes::<Column>() + 2,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        assert!(matches!(
+            crate::physical_expr::add_offset_to_expr(offset_fixture(), 1, &funding),
+            Err(DataFusionError::Refused { .. })
+        ));
+        assert_eq!(source.held.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn remaining_offset_charges_parent_rebuild() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let rewritten =
+            crate::physical_expr::add_offset_to_expr(offset_fixture(), 1, &funding)?;
+        assert_eq!(funding.outstanding(), offset_rebuild_bytes());
+        assert_eq!(source.held.load(Ordering::Acquire), offset_rebuild_bytes());
+        for (index, child) in rewritten.children().into_iter().enumerate() {
+            assert_eq!(child.downcast_ref::<Column>().unwrap().index(), index + 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_offset_unwinds_partial_refusal() -> Result<()> {
+        for available in 0..offset_rebuild_bytes() {
+            let source = Arc::new(Ceiling {
+                limit: available + 7,
+                held: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as _);
+            funding.charge(7)?;
+            assert!(matches!(
+                crate::physical_expr::add_offset_to_expr(offset_fixture(), 1, &funding),
+                Err(DataFusionError::Refused { .. })
+            ));
+            assert_eq!(funding.outstanding(), 7, "available: {available}");
+            assert_eq!(
+                source.held.load(Ordering::Acquire),
+                7,
+                "available: {available}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remaining_offset_reuses_unchanged_tree() -> Result<()> {
+        let expr = offset_fixture();
+        let funding = Funding::new(Arc::new(Ceiling {
+            limit: 0,
+            held: AtomicUsize::new(0),
+        }));
+        let rewritten =
+            crate::physical_expr::add_offset_to_expr(Arc::clone(&expr), 0, &funding)?;
+        assert!(Arc::ptr_eq(&expr, &rewritten));
+        assert_eq!(funding.outstanding(), 0);
+        Ok(())
     }
 
     fn rewrite_fixture(equivalences: bool, orderings: bool) -> EquivalenceProperties {

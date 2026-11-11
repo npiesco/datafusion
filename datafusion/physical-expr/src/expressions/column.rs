@@ -17,7 +17,6 @@
 
 //! Physical column reference: [`Column`]
 
-use std::alloc::Layout;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -29,7 +28,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use datafusion_common::cloned::CloneBytes;
-use datafusion_common::funding::{Funding, counted_block};
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::placement::ExpressionPlacement;
@@ -252,42 +251,26 @@ pub fn with_new_schema(
     schema: &SchemaRef,
     funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    fn rewrite(
-        expr: Arc<dyn PhysicalExpr>,
-        schema: &SchemaRef,
-        funding: &Funding,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        if let Some(col) = expr.downcast_ref::<Column>() {
-            let idx = col.index();
-            let Some(field) = schema.fields().get(idx) else {
-                return plan_err!("New schema has fewer columns than original schema");
-            };
-            if col.name() == field.name() {
-                return Ok(expr);
+    datafusion_physical_expr_common::physical_expr::rewrite_with_funding(
+        expr,
+        funding,
+        |expr| {
+            if let Some(col) = expr.downcast_ref::<Column>() {
+                let idx = col.index();
+                let Some(field) = schema.fields().get(idx) else {
+                    return plan_err!(
+                        "New schema has fewer columns than original schema"
+                    );
+                };
+                if col.name() == field.name() {
+                    return Ok(expr);
+                }
+                return funded_column(field.name(), idx, funding);
             }
-            return funded_column(field.name(), idx, funding);
-        }
 
-        let mut children = Vec::new();
-        let mut changed = false;
-        for child in expr.children() {
-            let rewritten = rewrite(Arc::clone(child), schema, funding)?;
-            changed |= !Arc::ptr_eq(child, &rewritten);
-            children.push(rewritten);
-        }
-        if !changed {
-            return Ok(expr);
-        }
-        funding.charge(counted_block(Layout::for_value(expr.as_ref()))?)?;
-        expr.with_new_children(children)
-    }
-
-    let before = funding.outstanding();
-    let result = rewrite(expr, schema, funding);
-    if result.is_err() {
-        funding.unwound(before);
-    }
-    result
+            Ok(expr)
+        },
+    )
 }
 
 #[cfg(test)]

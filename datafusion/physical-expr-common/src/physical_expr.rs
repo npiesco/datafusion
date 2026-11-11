@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::alloc::Layout;
 use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Display, Formatter};
@@ -27,6 +28,7 @@ use arrow::array::{Array, ArrayRef, BooleanArray, new_empty_array};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::funding::{Funding, counted_block};
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
@@ -839,6 +841,52 @@ pub fn with_new_children_if_necessary(
     } else {
         Ok(expr)
     }
+}
+
+/// Rewrites an expression bottom-up, charging rebuilt parent Arc blocks first.
+///
+/// The visitor must fund the replacement nodes it creates. Child traversal
+/// buffers and expression-specific owned payloads are not covered here.
+/// A failed rewrite returns its new charges without disturbing earlier ones.
+pub fn rewrite_with_funding<F>(
+    expr: Arc<dyn PhysicalExpr>,
+    funding: &Funding,
+    mut visitor: F,
+) -> Result<Arc<dyn PhysicalExpr>>
+where
+    F: FnMut(Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>>,
+{
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn rewrite<F>(
+        expr: Arc<dyn PhysicalExpr>,
+        funding: &Funding,
+        visitor: &mut F,
+    ) -> Result<Arc<dyn PhysicalExpr>>
+    where
+        F: FnMut(Arc<dyn PhysicalExpr>) -> Result<Arc<dyn PhysicalExpr>>,
+    {
+        let mut children = Vec::new();
+        let mut changed = false;
+        for child in expr.children() {
+            let rewritten = rewrite(Arc::clone(child), funding, visitor)?;
+            changed |= !Arc::ptr_eq(child, &rewritten);
+            children.push(rewritten);
+        }
+        let expr = if changed {
+            funding.charge(counted_block(Layout::for_value(expr.as_ref()))?)?;
+            expr.with_new_children(children)?
+        } else {
+            expr
+        };
+        visitor(expr)
+    }
+
+    let before = funding.outstanding();
+    let result = rewrite(expr, funding, &mut visitor);
+    if result.is_err() {
+        funding.unwound(before);
+    }
+    result
 }
 
 /// Returns [`Display`] able a list of [`PhysicalExpr`]
