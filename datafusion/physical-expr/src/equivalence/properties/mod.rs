@@ -2294,6 +2294,27 @@ mod funding_tests {
         Ok(())
     }
 
+    #[test]
+    fn remaining_try_add_orderings_propagates_rebuild_refusal() -> Result<()> {
+        for failure in [
+            PropertyFailure::RebuildRefusal,
+            PropertyFailure::ContextualRebuildRefusal,
+        ] {
+            let (_, _, expr) = rebuild_projection(failure)?;
+            let mut properties = rewrite_fixture(false, false);
+            let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+            let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+            properties.eq_group =
+                EquivalenceGroup::new([EquivalenceClass::new([b, a])]);
+            let error = properties
+                .try_add_orderings([[PhysicalSortExpr::new_default(expr)]])
+                .err()
+                .expect("ordering normalization swallowed rebuilding refusal");
+            assert!(matches!(error.find_root(), DataFusionError::Refused { .. }));
+        }
+        Ok(())
+    }
+
     fn ordered_projection()
     -> Result<(EquivalenceProperties, ProjectionMapping, SchemaRef)> {
         let properties = rewrite_fixture(true, true);
