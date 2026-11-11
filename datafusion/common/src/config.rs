@@ -3883,6 +3883,7 @@ impl Display for OutputFormat {
 mod tests {
     #[cfg(feature = "parquet")]
     use crate::assert_contains;
+    #[cfg(any(feature = "parquet", feature = "parquet_encryption"))]
     use crate::config::TableParquetOptions;
     use crate::config::{
         ConfigEntry, ConfigExtension, ConfigField, ConfigFileType, ExtensionOptions,

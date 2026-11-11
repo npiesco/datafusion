@@ -68,6 +68,7 @@ impl Literal {
     /// Create a literal value expression, what it allocates charged to `funding` first.
     /// A non-empty `metadata` map is copied into the field uncharged: its table's size is
     /// not measured.
+    #[expect(clippy::needless_pass_by_value)]
     pub fn new_with_metadata(
         value: ScalarValue,
         metadata: Option<FieldMetadata>,
