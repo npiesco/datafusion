@@ -567,6 +567,22 @@ impl EquivalenceGroup {
     /// [`AcrossPartitions::Heterogeneous`] value is constant within a partition
     /// but varies across partitions, so it still discriminates the order once
     /// partitions are merged and must be kept.
+    /// Normalizes the given sort expressions as [`Self::normalize_sort_exprs`]
+    /// does, returning rebuilding errors to the caller.
+    pub fn try_normalize_sort_exprs(
+        &self,
+        sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
+    ) -> Result<Vec<PhysicalSortExpr>> {
+        let mut normal = vec![];
+        for mut sort_expr in sort_exprs {
+            sort_expr.expr = self.try_normalize_expr(sort_expr.expr)?;
+            if !self.is_uniform_constant(&sort_expr.expr) {
+                normal.push(sort_expr);
+            }
+        }
+        Ok(normal)
+    }
+
     fn is_uniform_constant(&self, expr: &Arc<dyn PhysicalExpr>) -> bool {
         matches!(
             self.is_expr_constant(expr),

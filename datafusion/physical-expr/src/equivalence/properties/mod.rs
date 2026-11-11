@@ -397,7 +397,10 @@ impl EquivalenceProperties {
         &mut self,
         orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
     ) {
-        if self.extend_orderings(orderings) {
+        let extended = self
+            .extend_orderings(orderings)
+            .expect("unfunded normalization never refuses");
+        if extended {
             self.oeq_cache.update_map_unfunded();
         }
     }
@@ -408,7 +411,7 @@ impl EquivalenceProperties {
         &mut self,
         orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
     ) -> Result<()> {
-        if self.extend_orderings(orderings) {
+        if self.extend_orderings(orderings)? {
             self.oeq_cache.update_map()?;
         }
         Ok(())
@@ -419,23 +422,25 @@ impl EquivalenceProperties {
     fn extend_orderings(
         &mut self,
         orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
-    ) -> bool {
+    ) -> Result<bool> {
         let orderings: Vec<_> =
             orderings.into_iter().filter_map(LexOrdering::new).collect();
-        let normal_orderings: Vec<_> = orderings
-            .iter()
-            .cloned()
-            .filter_map(|o| self.normalize_sort_exprs(o))
-            .collect();
+        let mut normal_orderings = vec![];
+        for ordering in &orderings {
+            let normal = self
+                .eq_group
+                .try_normalize_sort_exprs(ordering.iter().cloned())?;
+            normal_orderings.extend(LexOrdering::new(normal));
+        }
         if normal_orderings.is_empty() {
-            return false;
+            return Ok(false);
         }
         self.oeq_class.extend(orderings);
         // Normalize given orderings to update the cache:
         self.oeq_cache.normal_cls.extend(normal_orderings);
         // TODO: If no ordering is found to be redundant during extension, we
         //       can use a shortcut algorithm to update the leading expressions.
-        true
+        Ok(true)
     }
 
     /// Adds a single ordering to the existing ordering equivalence class.
@@ -546,7 +551,10 @@ impl EquivalenceProperties {
         let eq_class = self
             .eq_group
             .get_equivalence_class(&normal_expr)
-            .map_or_else(|| vec![normal_expr], |class| class.clone().into());
+            .map_or_else(
+                || vec![Arc::clone(&normal_expr)],
+                |class| class.clone().into(),
+            );
 
         let mut new_orderings = vec![];
         for ordering in self
