@@ -2118,7 +2118,12 @@ fn project_with_validation(
     if let Some(schema) = &schema {
         for (expr, field) in projected_expr.iter_mut().zip(schema.fields()) {
             if !matches!(expr, Expr::Column(_) | Expr::Alias(_)) {
-                *expr = std::mem::take(expr).alias(field.name());
+                *expr = Expr::Alias(Alias {
+                    expr: funding.boxed(std::mem::take(expr))?,
+                    relation: None,
+                    name: funding.string(field.name())?,
+                    metadata: None,
+                });
             }
         }
     }
@@ -2151,9 +2156,14 @@ fn replaced_columns(
             _ => None,
         };
         if let Some(new_expr) = new_expr {
-            let new_expr = funding.cloned(new_expr)?;
+            let new_expr = funding.boxed(funding.cloned(new_expr)?)?;
             if let Expr::Column(Column { name, .. }) = std::mem::take(expr) {
-                *expr = new_expr.alias(name);
+                *expr = Expr::Alias(Alias {
+                    expr: new_expr,
+                    relation: None,
+                    name,
+                    metadata: None,
+                });
             }
         }
         Ok(())
@@ -2162,14 +2172,10 @@ fn replaced_columns(
         Ok(()) => Ok(exprs),
         Err(e) => {
             // Each is a column the expansion made, or a copied expression aliased to its
-            // name: the alias's box was not made through `funding`.
+            // name.
             for expr in exprs.drain(..) {
                 match expr {
-                    Expr::Column(column) => funding.released_clone(column),
-                    Expr::Alias(Alias { expr, name, .. }) => {
-                        funding.released_clone(*expr);
-                        funding.released(name);
-                    }
+                    Expr::Column(_) | Expr::Alias(_) => funding.released_clone(expr),
                     _ => {}
                 }
             }
@@ -2439,6 +2445,48 @@ mod tests {
         Constraint, DataFusionError, RecursionUnnestOption, SchemaError,
     };
     use insta::assert_snapshot;
+
+    struct Unlimited;
+
+    impl datafusion_common::funding::PlanningFunding for Unlimited {
+        fn charge(&self, _: usize) -> bool {
+            true
+        }
+
+        fn discharge(&self, _: usize) {}
+    }
+
+    /// A REPLACE's alias box is charged as it is made: freeing the replaced expansion
+    /// gives back exactly what was charged, no more.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn replaced_column_alias_box_is_charged() -> Result<()> {
+        use crate::expr::{PlannedReplaceSelectItem, ReplaceSelectElement};
+        use sqlparser::ast::{self, Ident};
+        let funding = Funding::new(Arc::new(Unlimited));
+        let options = WildcardOptions::default().with_replace(PlannedReplaceSelectItem {
+            items: vec![ReplaceSelectElement {
+                expr: ast::Expr::Identifier(Ident::new("b")),
+                column_name: Ident::new("a"),
+                as_keyword: true,
+            }],
+            planned_expressions: vec![col("b")],
+        });
+        let mut expanded = funding.vec_with_capacity(1)?;
+        expanded.push(funding.cloned(&col("a"))?);
+
+        let mut replaced = replaced_columns(expanded, &options, &funding)?;
+        assert_eq!(replaced, vec![col("b").alias("a")]);
+        assert_eq!(
+            funding.outstanding(),
+            size_of::<Expr>() + replaced[0].clone_bytes()
+        );
+
+        replaced.drain(..).for_each(|e| funding.released_clone(e));
+        funding.released(replaced);
+        assert_eq!(funding.outstanding(), 0);
+        Ok(())
+    }
 
     #[test]
     fn plan_builder_simple() -> Result<()> {
