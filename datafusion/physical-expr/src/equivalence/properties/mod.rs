@@ -40,7 +40,7 @@ use crate::{
 };
 
 use arrow::datatypes::SchemaRef;
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{FundedSet, Funding};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     Constraint, Constraints, DataFusionError, HashMap, Result, plan_err,
@@ -157,43 +157,89 @@ pub struct EquivalenceProperties {
 /// efficiently determine whether a given ordering is satisfied by the
 /// existing orderings, and discover new orderings based on the existing
 /// equivalence properties.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct OrderingEquivalenceCache {
     /// Equivalent sort expressions in normal form.
     normal_cls: OrderingEquivalenceClass,
-    /// Map associating leading sort expressions with full lexicographical
-    /// orderings. Values are indices into `normal_cls`.
-    leading_map: HashMap<Arc<dyn PhysicalExpr>, Vec<usize>>,
+    /// The distinct leading expressions of the orderings in `normal_cls`, in
+    /// order of first appearance. Its table is charged to the funding the
+    /// cache was built through.
+    leading_exprs: FundedSet<Arc<dyn PhysicalExpr>>,
+}
+
+impl Clone for OrderingEquivalenceCache {
+    /// Clones are unfunded; [`OrderingEquivalenceCache::try_new`] builds a
+    /// funded cache.
+    fn clone(&self) -> Self {
+        Self {
+            normal_cls: self.normal_cls.clone(),
+            leading_exprs: self
+                .leading_exprs
+                .clone_funded(&Funding::default())
+                .expect("unfunded growth is never refused"),
+        }
+    }
 }
 
 impl OrderingEquivalenceCache {
-    /// Creates a new `OrderingEquivalenceCache` object with the given
+    /// Creates a new, unfunded `OrderingEquivalenceCache` object with the given
     /// equivalent orderings, which should be in normal form.
     pub fn new(
         orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
     ) -> Self {
-        let mut cache = Self {
-            normal_cls: OrderingEquivalenceClass::new(orderings),
-            leading_map: HashMap::new(),
-        };
-        cache.update_map();
-        cache
+        Self::try_new(orderings, &Funding::default())
+            .expect("unfunded growth is never refused")
     }
 
-    /// Updates/reconstructs the leading expression map according to the normal
-    /// ordering equivalence class within.
-    pub fn update_map(&mut self) {
-        self.leading_map.clear();
-        for (idx, ordering) in self.normal_cls.iter().enumerate() {
-            let expr = Arc::clone(&ordering.first().expr);
-            self.leading_map.entry(expr).or_default().push(idx);
+    /// Creates a new `OrderingEquivalenceCache` object with the given
+    /// equivalent orderings, which should be in normal form, charging its
+    /// leading expression table to `funding`.
+    pub fn try_new(
+        orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let mut cache = Self {
+            normal_cls: OrderingEquivalenceClass::new(orderings),
+            leading_exprs: FundedSet::with_funding(funding),
+        };
+        cache.update_map()?;
+        Ok(cache)
+    }
+
+    /// Updates/reconstructs the leading expressions according to the normal
+    /// ordering equivalence class within, charging any table growth to the
+    /// cache's funding.
+    pub fn update_map(&mut self) -> Result<()> {
+        self.leading_exprs.clear();
+        for ordering in self.normal_cls.iter() {
+            self.leading_exprs
+                .try_insert(Arc::clone(&ordering.first().expr))?;
         }
+        Ok(())
+    }
+
+    /// [`Self::update_map`] for callers that cannot propagate a refusal: the
+    /// table's standing charge is given back and it grows unfunded.
+    pub fn update_map_unfunded(&mut self) {
+        self.leading_exprs
+            .rebind(&Funding::default())
+            .expect("unfunded growth is never refused");
+        self.update_map().expect("unfunded growth is never refused");
+    }
+
+    /// The distinct leading expressions, collected into a scratch vector
+    /// charged to the cache's funding; give it back with [`Funding::released`].
+    fn leading_exprs(&self) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
+        let funding = self.leading_exprs.funding();
+        let mut exprs = funding.vec_with_capacity(self.leading_exprs.len())?;
+        exprs.extend(self.leading_exprs.iter().cloned());
+        Ok(exprs)
     }
 
     /// Clears the cache, removing all orderings and leading expressions.
     pub fn clear(&mut self) {
         self.normal_cls.clear();
-        self.leading_map.clear();
+        self.leading_exprs.clear();
     }
 }
 
@@ -351,6 +397,29 @@ impl EquivalenceProperties {
         &mut self,
         orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
     ) {
+        if self.extend_orderings(orderings) {
+            self.oeq_cache.update_map_unfunded();
+        }
+    }
+
+    /// [`Self::add_orderings`], charging the cache's leading expression table
+    /// growth to the funding it was built through and propagating refusal.
+    pub fn try_add_orderings(
+        &mut self,
+        orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
+    ) -> Result<()> {
+        if self.extend_orderings(orderings) {
+            self.oeq_cache.update_map()?;
+        }
+        Ok(())
+    }
+
+    /// Extends the orderings and the normal orderings of the cache, returning
+    /// whether the cache's leading expressions need rebuilding.
+    fn extend_orderings(
+        &mut self,
+        orderings: impl IntoIterator<Item = impl IntoIterator<Item = PhysicalSortExpr>>,
+    ) -> bool {
         let orderings: Vec<_> =
             orderings.into_iter().filter_map(LexOrdering::new).collect();
         let normal_orderings: Vec<_> = orderings
@@ -358,14 +427,15 @@ impl EquivalenceProperties {
             .cloned()
             .filter_map(|o| self.normalize_sort_exprs(o))
             .collect();
-        if !normal_orderings.is_empty() {
-            self.oeq_class.extend(orderings);
-            // Normalize given orderings to update the cache:
-            self.oeq_cache.normal_cls.extend(normal_orderings);
-            // TODO: If no ordering is found to be redundant during extension, we
-            //       can use a shortcut algorithm to update the leading map.
-            self.oeq_cache.update_map();
+        if normal_orderings.is_empty() {
+            return false;
         }
+        self.oeq_class.extend(orderings);
+        // Normalize given orderings to update the cache:
+        self.oeq_cache.normal_cls.extend(normal_orderings);
+        // TODO: If no ordering is found to be redundant during extension, we
+        //       can use a shortcut algorithm to update the leading expressions.
+        true
     }
 
     /// Adds a single ordering to the existing ordering equivalence class.
@@ -380,13 +450,9 @@ impl EquivalenceProperties {
             .into_iter()
             .map(|o| self.eq_group.normalize_sort_exprs(o));
         self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
-        self.oeq_cache.update_map();
+        self.oeq_cache.update_map()?;
         // Discover any new orderings based on the new equivalence classes:
-        let leading_exprs: Vec<_> = self.oeq_cache.leading_map.keys().cloned().collect();
-        for expr in leading_exprs {
-            self.discover_new_orderings(expr)?;
-        }
-        Ok(())
+        self.discover_from_leading_exprs()
     }
 
     /// Incorporates the given equivalence group to into the existing
@@ -448,13 +514,21 @@ impl EquivalenceProperties {
             })
         });
         self.oeq_cache.normal_cls = OrderingEquivalenceClass::new(normal_orderings);
-        self.oeq_cache.update_map();
+        self.oeq_cache.update_map()?;
         // Discover any new orderings based on the constants:
-        let leading_exprs: Vec<_> = self.oeq_cache.leading_map.keys().cloned().collect();
-        for expr in leading_exprs {
-            self.discover_new_orderings(expr)?;
-        }
-        Ok(())
+        self.discover_from_leading_exprs()
+    }
+
+    /// Runs [`Self::discover_new_orderings`] for each leading expression the
+    /// cache holds now, snapshotted into scratch charged to the cache's funding.
+    fn discover_from_leading_exprs(&mut self) -> Result<()> {
+        let funding = self.oeq_cache.leading_exprs.funding().clone();
+        let leading_exprs = self.oeq_cache.leading_exprs()?;
+        let result = leading_exprs
+            .iter()
+            .try_for_each(|expr| self.discover_new_orderings(Arc::clone(expr)));
+        funding.released(leading_exprs);
+        result
     }
 
     /// Discover new valid orderings in light of a new equality. Accepts a single
@@ -466,17 +540,21 @@ impl EquivalenceProperties {
         &mut self,
         normal_expr: Arc<dyn PhysicalExpr>,
     ) -> Result<()> {
-        let Some(ordering_idxs) = self.oeq_cache.leading_map.get(&normal_expr) else {
+        if !self.oeq_cache.leading_exprs.contains(&normal_expr) {
             return Ok(());
-        };
+        }
         let eq_class = self
             .eq_group
             .get_equivalence_class(&normal_expr)
             .map_or_else(|| vec![normal_expr], |class| class.clone().into());
 
         let mut new_orderings = vec![];
-        for idx in ordering_idxs {
-            let ordering = &self.oeq_cache.normal_cls[*idx];
+        for ordering in self
+            .oeq_cache
+            .normal_cls
+            .iter()
+            .filter(|ordering| ordering.first().expr.eq(&normal_expr))
+        {
             let leading_ordering_options = ordering[0].options;
 
             'exprs: for equivalent_expr in &eq_class {
@@ -520,7 +598,7 @@ impl EquivalenceProperties {
         }
 
         if !new_orderings.is_empty() {
-            self.add_orderings(new_orderings);
+            self.try_add_orderings(new_orderings)?;
         }
         Ok(())
     }
@@ -1225,7 +1303,7 @@ impl EquivalenceProperties {
                 .cloned()
                 .map(|o| eq_group.normalize_sort_exprs(o));
             Ok(Self {
-                oeq_cache: OrderingEquivalenceCache::new(normal_orderings),
+                oeq_cache: OrderingEquivalenceCache::try_new(normal_orderings, funding)?,
                 oeq_class: OrderingEquivalenceClass::new(orderings),
                 constraints: self.projected_constraints(mapping).unwrap_or_default(),
                 schema: output_schema,
@@ -1438,6 +1516,8 @@ impl EquivalenceProperties {
             .oeq_cache
             .normal_cls
             .with_new_schema(&schema, funding)?;
+        self.oeq_cache.leading_exprs.rebind(funding)?;
+        self.oeq_cache.update_map()?;
 
         // Update the schema:
         self.schema = schema;
@@ -1626,7 +1706,7 @@ mod funding_tests {
     use crate::expressions::BinaryExpr;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::DataFusionError;
-    use datafusion_common::funding::{PlanningFunding, arc_bytes};
+    use datafusion_common::funding::{FundedSet, PlanningFunding, arc_bytes};
     use datafusion_expr::Operator;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2203,6 +2283,83 @@ mod funding_tests {
             assert_eq!(funding.outstanding(), 7, "available: {available}");
             assert_eq!(source.held.load(Ordering::Acquire), 7);
         }
+        Ok(())
+    }
+
+    fn ordered_projection()
+    -> Result<(EquivalenceProperties, ProjectionMapping, SchemaRef)> {
+        let properties = rewrite_fixture(true, true);
+        let mapping = ProjectionMapping::try_new(
+            [(Arc::new(Column::new("a", 0)) as _, "a".to_string())],
+            properties.schema(),
+            &Funding::default(),
+        )?;
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        Ok((properties, mapping, schema))
+    }
+
+    /// Bytes given back to `source` when `properties` is dropped: the standing
+    /// charge of its ordering cache's leading expression table.
+    fn given_back_on_drop(source: &Ceiling, properties: EquivalenceProperties) -> usize {
+        let held = source.held.load(Ordering::Acquire);
+        drop(properties);
+        held - source.held.load(Ordering::Acquire)
+    }
+
+    #[test]
+    fn projected_leading_expressions_are_funded_and_given_back() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let (properties, mapping, schema) = ordered_projection()?;
+        let projected = properties.try_project(&mapping, schema, &funding)?;
+        assert_eq!(projected.oeq_class()[0][0].expr.to_string(), "a@0");
+        let needed = funding.outstanding();
+        let given_back = given_back_on_drop(&source, projected);
+        assert!(
+            given_back >= FundedSet::<Arc<dyn PhysicalExpr>>::ENTRY_BYTES,
+            "projection built its ordering cache's leading expressions unfunded \
+             ({given_back} bytes given back on drop)"
+        );
+        funding.unwound(0);
+
+        for available in 0..needed {
+            let source = Arc::new(Ceiling {
+                limit: 7 + available,
+                held: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as _);
+            funding.charge(7)?;
+            let (properties, mapping, schema) = ordered_projection()?;
+            let result = properties.try_project(&mapping, schema, &funding);
+            assert!(
+                matches!(result, Err(DataFusionError::Refused { .. })),
+                "projection unexpectedly succeeded with {available}/{needed} bytes"
+            );
+            assert_eq!(funding.outstanding(), 7, "available: {available}");
+            assert_eq!(source.held.load(Ordering::Acquire), 7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rewritten_leading_expressions_are_funded_and_given_back() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let rewritten =
+            rewrite_fixture(true, true).with_new_schema(renamed_schema(), &funding)?;
+        let given_back = given_back_on_drop(&source, rewritten);
+        assert!(
+            given_back >= FundedSet::<Arc<dyn PhysicalExpr>>::ENTRY_BYTES,
+            "schema rewriting kept its ordering cache's leading expressions unfunded \
+             ({given_back} bytes given back on drop)"
+        );
+        funding.unwound(0);
         Ok(())
     }
 }
