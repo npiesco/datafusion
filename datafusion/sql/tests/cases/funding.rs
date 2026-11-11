@@ -206,7 +206,9 @@ fn subqueries_are_funded() {
         );
     }
 
-    assert_funded("SELECT j1_id FROM j1 WHERE EXISTS (SELECT 1 FROM j2 WHERE j1_id = j2_id)");
+    assert_funded(
+        "SELECT j1_id FROM j1 WHERE EXISTS (SELECT 1 FROM j2 WHERE j1_id = j2_id)",
+    );
     assert_funded("SELECT j1_id FROM j1 WHERE j1_id IN (SELECT j2_id FROM j2)");
     assert_funded("SELECT (SELECT j2_id FROM j2 WHERE j2_id = j1_id) FROM j1");
     assert_funded("SELECT j1_id FROM j1 WHERE j1_id = ANY (SELECT j2_id FROM j2)");

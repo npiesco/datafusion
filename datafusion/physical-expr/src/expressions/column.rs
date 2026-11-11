@@ -17,17 +17,19 @@
 
 //! Physical column reference: [`Column`]
 
+use std::alloc::Layout;
 use std::hash::Hash;
 use std::sync::Arc;
 
 use crate::physical_expr::PhysicalExpr;
+use crate::projection::funded_column;
 use arrow::datatypes::FieldRef;
 use arrow::{
     datatypes::{DataType, Schema, SchemaRef},
     record_batch::RecordBatch,
 };
 use datafusion_common::cloned::CloneBytes;
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::funding::{Funding, counted_block};
 use datafusion_common::{Result, internal_err, plan_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::placement::ExpressionPlacement;
@@ -243,27 +245,49 @@ pub fn col(name: &str, schema: &Schema) -> Result<Arc<dyn PhysicalExpr>> {
 /// refers to with the column at corresponding index in the new schema. Returns
 /// an error if the given schema has fewer columns than the original schema.
 /// Note that the resulting expression may not be valid if data types in the
-/// new schema is incompatible with expression nodes.
+/// new schema is incompatible with expression nodes. Rewritten columns and
+/// rebuilt expression blocks are charged before allocation.
 pub fn with_new_schema(
     expr: Arc<dyn PhysicalExpr>,
     schema: &SchemaRef,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    Ok(expr
-        .transform_up(|expr| {
-            if let Some(col) = expr.downcast_ref::<Column>() {
-                let idx = col.index();
-                let Some(field) = schema.fields().get(idx) else {
-                    return plan_err!(
-                        "New schema has fewer columns than original schema"
-                    );
-                };
-                let new_col = Column::new(field.name(), idx);
-                Ok(Transformed::yes(Arc::new(new_col) as _))
-            } else {
-                Ok(Transformed::no(expr))
+    fn rewrite(
+        expr: Arc<dyn PhysicalExpr>,
+        schema: &SchemaRef,
+        funding: &Funding,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        if let Some(col) = expr.downcast_ref::<Column>() {
+            let idx = col.index();
+            let Some(field) = schema.fields().get(idx) else {
+                return plan_err!("New schema has fewer columns than original schema");
+            };
+            if col.name() == field.name() {
+                return Ok(expr);
             }
-        })?
-        .data)
+            return funded_column(field.name(), idx, funding);
+        }
+
+        let mut children = Vec::new();
+        let mut changed = false;
+        for child in expr.children() {
+            let rewritten = rewrite(Arc::clone(child), schema, funding)?;
+            changed |= !Arc::ptr_eq(child, &rewritten);
+            children.push(rewritten);
+        }
+        if !changed {
+            return Ok(expr);
+        }
+        funding.charge(counted_block(Layout::for_value(expr.as_ref()))?)?;
+        expr.with_new_children(children)
+    }
+
+    let before = funding.outstanding();
+    let result = rewrite(expr, schema, funding);
+    if result.is_err() {
+        funding.unwound(before);
+    }
+    result
 }
 
 #[cfg(test)]

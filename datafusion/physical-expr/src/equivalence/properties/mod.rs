@@ -40,6 +40,7 @@ use crate::{
 };
 
 use arrow::datatypes::SchemaRef;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Constraint, Constraints, HashMap, Result, plan_err};
 use datafusion_expr::interval_arithmetic::Interval;
@@ -1302,7 +1303,16 @@ impl EquivalenceProperties {
 
     /// Transforms this `EquivalenceProperties` by mapping columns in the
     /// original schema to columns in the new schema by index.
-    pub fn with_new_schema(mut self, schema: SchemaRef) -> Result<Self> {
+    pub fn with_new_schema(self, schema: SchemaRef, funding: &Funding) -> Result<Self> {
+        let before = funding.outstanding();
+        let result = self.rewrite_schema(schema, funding);
+        if result.is_err() {
+            funding.unwound(before);
+        }
+        result
+    }
+
+    fn rewrite_schema(mut self, schema: SchemaRef, funding: &Funding) -> Result<Self> {
         // The new schema and the original schema is aligned when they have the
         // same number of columns, and fields at the same index have the same
         // type in both schemas.
@@ -1330,7 +1340,7 @@ impl EquivalenceProperties {
             eq_class.exprs = eq_class
                 .exprs
                 .into_iter()
-                .map(|expr| with_new_schema(expr, &schema))
+                .map(|expr| with_new_schema(expr, &schema, funding))
                 .collect::<Result<_>>()?;
             // Rewrite the constant value (if available and known):
             let data_type = eq_class
@@ -1358,8 +1368,11 @@ impl EquivalenceProperties {
         self.eq_group = eq_classes.into();
 
         // Rewrite orderings according to new schema:
-        self.oeq_class = self.oeq_class.with_new_schema(&schema)?;
-        self.oeq_cache.normal_cls = self.oeq_cache.normal_cls.with_new_schema(&schema)?;
+        self.oeq_class = self.oeq_class.with_new_schema(&schema, funding)?;
+        self.oeq_cache.normal_cls = self
+            .oeq_cache
+            .normal_cls
+            .with_new_schema(&schema, funding)?;
 
         // Update the schema:
         self.schema = schema;
@@ -1538,5 +1551,168 @@ fn get_expr_properties(
             .collect::<Result<Vec<_>>>()?;
         // Calculate expression ordering using ordering of its children.
         expr.get_properties(&child_states)
+    }
+}
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+    use crate::equivalence::EquivalenceClass;
+    use crate::expressions::BinaryExpr;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::DataFusionError;
+    use datafusion_common::funding::{PlanningFunding, arc_bytes};
+    use datafusion_expr::Operator;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Ceiling {
+        limit: usize,
+        held: AtomicUsize,
+    }
+
+    impl PlanningFunding for Ceiling {
+        fn charge(&self, bytes: usize) -> bool {
+            self.held
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                    held.checked_add(bytes).filter(|total| *total <= self.limit)
+                })
+                .is_ok()
+        }
+
+        fn discharge(&self, bytes: usize) {
+            self.held.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    fn rewrite_fixture(equivalences: bool, orderings: bool) -> EquivalenceProperties {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let mut properties = if orderings {
+            EquivalenceProperties::new_with_orderings(
+                schema,
+                [[PhysicalSortExpr::new_default(Arc::clone(&a))]],
+            )
+        } else {
+            EquivalenceProperties::new(schema)
+        };
+        if equivalences {
+            properties.eq_group = EquivalenceGroup::new([EquivalenceClass::new([a, b])]);
+        }
+        properties
+    }
+
+    fn renamed_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("renamed_a", DataType::Int64, false),
+            Field::new("renamed_b", DataType::Int64, false),
+        ]))
+    }
+
+    #[test]
+    fn schema_rewrite_refuses_unfunded_columns() {
+        for (equivalences, orderings) in [(true, false), (false, true), (true, true)] {
+            let source = Arc::new(Ceiling {
+                limit: 0,
+                held: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as _);
+            let result = rewrite_fixture(equivalences, orderings)
+                .with_new_schema(renamed_schema(), &funding);
+            assert!(
+                matches!(result, Err(DataFusionError::Refused { .. })),
+                "schema rewriting bypassed funding: {result:?}"
+            );
+            assert_eq!(funding.outstanding(), 0);
+            assert_eq!(source.held.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn union_schema_rewrites_respect_funding() {
+        for initial in [true, false] {
+            let source = Arc::new(Ceiling {
+                limit: 0,
+                held: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as _);
+            let mut inputs = vec![];
+            if !initial {
+                inputs.push(EquivalenceProperties::new(renamed_schema()));
+            }
+            inputs.push(rewrite_fixture(false, true));
+            let result = calculate_union(inputs, renamed_schema(), &funding);
+            assert!(
+                matches!(result, Err(DataFusionError::Refused { .. })),
+                "UNION schema rewriting bypassed funding: {result:?}"
+            );
+            assert_eq!(funding.outstanding(), 0);
+            assert_eq!(source.held.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn schema_rewrite_charges_rebuilt_expression_nodes() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(source);
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Plus,
+            Arc::new(Column::new("b", 1)),
+        ));
+        let rewritten = with_new_schema(expr, &renamed_schema(), &funding)?;
+        assert_eq!(rewritten.to_string(), "renamed_a@0 + renamed_b@1");
+        assert_eq!(
+            funding.outstanding(),
+            2 * arc_bytes::<Column>()
+                + "renamed_a".len()
+                + "renamed_b".len()
+                + arc_bytes::<BinaryExpr>(),
+            "schema rewriting must fund the rebuilt parent, not only its columns"
+        );
+        drop(rewritten);
+        funding.unwound(0);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_rewrite_unwinds_partial_refusal() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: usize::MAX,
+            held: AtomicUsize::new(0),
+        });
+        let funding = Funding::new(source);
+        let rewritten =
+            rewrite_fixture(true, true).with_new_schema(renamed_schema(), &funding)?;
+        let needed = funding.outstanding();
+        assert!(needed > 1, "rewritten expressions were not charged");
+        assert_eq!(rewritten.schema(), &renamed_schema());
+        assert_eq!(rewritten.oeq_class()[0][0].expr.to_string(), "renamed_a@0");
+        drop(rewritten);
+        funding.unwound(0);
+
+        for available in 0..needed {
+            let source = Arc::new(Ceiling {
+                limit: 7 + available,
+                held: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as _);
+            funding.charge(7)?;
+            let result =
+                rewrite_fixture(true, true).with_new_schema(renamed_schema(), &funding);
+            assert!(
+                matches!(result, Err(DataFusionError::Refused { .. })),
+                "rewrite unexpectedly succeeded with {available}/{needed} bytes"
+            );
+            assert_eq!(funding.outstanding(), 7, "available: {available}");
+            assert_eq!(source.held.load(Ordering::Acquire), 7);
+        }
+        Ok(())
     }
 }

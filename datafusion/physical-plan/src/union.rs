@@ -257,7 +257,7 @@ impl UnionExec {
                 .iter()
                 .map(|child| child.equivalence_properties().clone()),
         );
-        let eq_properties = calculate_union(children_eqps, schema)?;
+        let eq_properties = calculate_union(children_eqps, schema, funding)?;
 
         // Calculate output partitioning; i.e. sum output partitions of the inputs.
         let num_partitions = inputs

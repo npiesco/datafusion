@@ -23,6 +23,7 @@ use crate::equivalence::class::AcrossPartitions;
 use crate::{ConstExpr, PhysicalSortExpr};
 
 use arrow::datatypes::SchemaRef;
+use datafusion_common::funding::Funding;
 use datafusion_common::{Result, internal_err};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 
@@ -38,10 +39,11 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 fn calculate_union_binary(
     lhs: EquivalenceProperties,
     mut rhs: EquivalenceProperties,
+    funding: &Funding,
 ) -> Result<EquivalenceProperties> {
     // Harmonize the schema of the rhs with the schema of the lhs (which is the accumulator schema):
     if !rhs.schema.eq(&lhs.schema) {
-        rhs = rhs.with_new_schema(Arc::clone(&lhs.schema))?;
+        rhs = rhs.with_new_schema(Arc::clone(&lhs.schema), funding)?;
     }
 
     // First, calculate valid constants for the union. An expression is constant
@@ -87,6 +89,20 @@ fn calculate_union_binary(
 pub fn calculate_union(
     eqps: Vec<EquivalenceProperties>,
     schema: SchemaRef,
+    funding: &Funding,
+) -> Result<EquivalenceProperties> {
+    let before = funding.outstanding();
+    let result = calculate_union_inner(eqps, schema, funding);
+    if result.is_err() {
+        funding.unwound(before);
+    }
+    result
+}
+
+fn calculate_union_inner(
+    eqps: Vec<EquivalenceProperties>,
+    schema: SchemaRef,
+    funding: &Funding,
 ) -> Result<EquivalenceProperties> {
     // TODO: In some cases, we should be able to preserve some equivalence
     //       classes. Add support for such cases.
@@ -99,11 +115,11 @@ pub fn calculate_union(
 
     // Harmonize the schema of the init with the schema of the union:
     if !acc.schema.eq(&schema) {
-        acc = acc.with_new_schema(schema)?;
+        acc = acc.with_new_schema(schema, funding)?;
     }
     // Fold in the rest of the EquivalenceProperties:
     for props in iter {
-        acc = calculate_union_binary(acc, props)?;
+        acc = calculate_union_binary(acc, props, funding)?;
     }
     Ok(acc)
 }
@@ -784,9 +800,12 @@ mod tests {
                 for c in &child_properties {
                     println!("{c}");
                 }
-                let actual_properties =
-                    calculate_union(child_properties, Arc::clone(&output_schema))
-                        .expect("failed to calculate union equivalence properties");
+                let actual_properties = calculate_union(
+                    child_properties,
+                    Arc::clone(&output_schema),
+                    &Funding::default(),
+                )
+                .expect("failed to calculate union equivalence properties");
                 Self::assert_eq_properties_same(
                     &actual_properties,
                     &expected_properties,
@@ -886,7 +905,8 @@ mod tests {
         input2.add_constants(vec![const_expr2])?;
 
         // Calculate union properties
-        let union_props = calculate_union(vec![input1, input2], schema)?;
+        let union_props =
+            calculate_union(vec![input1, input2], schema, &Funding::default())?;
 
         // Verify column 'a' remains constant with value 10
         let const_a = &union_props.constants()[0];
@@ -923,7 +943,8 @@ mod tests {
         let mut input = EquivalenceProperties::new(input_schema);
         input.add_constants(vec![const_expr])?;
 
-        let union_props = calculate_union(vec![input], output_schema)?;
+        let union_props =
+            calculate_union(vec![input], output_schema, &Funding::default())?;
         assert!(union_props.constants().is_empty());
 
         Ok(())
@@ -989,7 +1010,8 @@ mod tests {
         input2.add_constants(vec![const_expr_1_foo.clone(), const_expr_2_bar.clone()])?;
 
         // Calculate union properties
-        let union_props = calculate_union(vec![input1, input2], schema)?;
+        let union_props =
+            calculate_union(vec![input1, input2], schema, &Funding::default())?;
 
         // This should result in:
         //   const_1 = Uniform("foo")

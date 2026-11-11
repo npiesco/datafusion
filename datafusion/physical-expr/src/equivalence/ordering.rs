@@ -193,7 +193,16 @@ impl OrderingEquivalenceClass {
     /// and the original schema needs to be aligned; i.e. they should have the
     /// same number of columns, and fields at the same index have the same type
     /// in both schemas.
-    pub fn with_new_schema(mut self, schema: &SchemaRef) -> Result<Self> {
+    pub fn with_new_schema(self, schema: &SchemaRef, funding: &Funding) -> Result<Self> {
+        let before = funding.outstanding();
+        let result = self.rewrite_schema(schema, funding);
+        if result.is_err() {
+            funding.unwound(before);
+        }
+        result
+    }
+
+    fn rewrite_schema(mut self, schema: &SchemaRef, funding: &Funding) -> Result<Self> {
         self.orderings = self
             .orderings
             .into_iter()
@@ -201,7 +210,8 @@ impl OrderingEquivalenceClass {
                 ordering
                     .into_iter()
                     .map(|mut sort_expr| {
-                        sort_expr.expr = with_new_schema(sort_expr.expr, schema)?;
+                        sort_expr.expr =
+                            with_new_schema(sort_expr.expr, schema, funding)?;
                         Ok(sort_expr)
                     })
                     .collect::<Result<Vec<_>>>()
