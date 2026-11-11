@@ -720,6 +720,7 @@ impl LogicalPlan {
                         Arc::unwrap_or_clone(input),
                         new_columns,
                         options,
+                        &datafusion_common::funding::Funding::default(),
                     )
                 })?
             }

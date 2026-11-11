@@ -744,7 +744,8 @@ impl LogicalPlanBuilder {
 
     /// Apply an alias
     pub fn alias(self, alias: impl Into<TableReference>) -> Result<Self> {
-        let plan = subquery_alias(self.funding.unwrapped(self.plan)?, alias)?;
+        let plan =
+            subquery_alias(self.funding.unwrapped(self.plan)?, alias, &self.funding)?;
         Self::built(plan, self.funding)
     }
 
@@ -1607,7 +1608,11 @@ impl LogicalPlanBuilder {
 
     /// Unnest the given column.
     pub fn unnest_column(self, column: impl Into<Column>) -> Result<Self> {
-        let plan = unnest(self.funding.unwrapped(self.plan)?, vec![column.into()])?;
+        let plan = unnest(
+            self.funding.unwrapped(self.plan)?,
+            vec![column.into()],
+            &self.funding,
+        )?;
         Self::built(plan, self.funding)
     }
 
@@ -1621,6 +1626,7 @@ impl LogicalPlanBuilder {
             self.funding.unwrapped(self.plan)?,
             vec![column.into()],
             options,
+            &self.funding,
         )?;
         Self::built(plan, self.funding)
     }
@@ -1631,8 +1637,12 @@ impl LogicalPlanBuilder {
         columns: Vec<Column>,
         options: UnnestOptions,
     ) -> Result<Self> {
-        let plan =
-            unnest_with_options(self.funding.unwrapped(self.plan)?, columns, options)?;
+        let plan = unnest_with_options(
+            self.funding.unwrapped(self.plan)?,
+            columns,
+            options,
+            &self.funding,
+        )?;
         Self::built(plan, self.funding)
     }
 }
@@ -2189,8 +2199,17 @@ fn replaced_columns(
 pub fn subquery_alias(
     plan: LogicalPlan,
     alias: impl Into<TableReference>,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
-    SubqueryAlias::try_new(Arc::new(plan), alias).map(LogicalPlan::SubqueryAlias)
+    let before = funding.outstanding();
+    let result = funding
+        .arc(plan)
+        .and_then(|plan| SubqueryAlias::try_new(plan, alias, funding))
+        .map(LogicalPlan::SubqueryAlias);
+    if result.is_err() {
+        funding.unwound(before);
+    }
+    result
 }
 
 /// Create a LogicalPlanBuilder representing a scan of a table with the provided name and schema.
@@ -2376,8 +2395,12 @@ impl TableSource for LogicalTableSource {
 }
 
 /// Create a [`LogicalPlan::Unnest`] plan
-pub fn unnest(input: LogicalPlan, columns: Vec<Column>) -> Result<LogicalPlan> {
-    unnest_with_options(input, columns, UnnestOptions::default())
+pub fn unnest(
+    input: LogicalPlan,
+    columns: Vec<Column>,
+    funding: &Funding,
+) -> Result<LogicalPlan> {
+    unnest_with_options(input, columns, UnnestOptions::default(), funding)
 }
 
 pub fn get_struct_unnested_columns(
@@ -2423,12 +2446,17 @@ pub fn unnest_with_options(
     input: LogicalPlan,
     columns_to_unnest: Vec<Column>,
     options: UnnestOptions,
+    funding: &Funding,
 ) -> Result<LogicalPlan> {
-    Ok(LogicalPlan::Unnest(Unnest::try_new(
-        Arc::new(input),
-        columns_to_unnest,
-        options,
-    )?))
+    let before = funding.outstanding();
+    let result = funding
+        .arc(input)
+        .and_then(|input| Unnest::try_new(input, columns_to_unnest, options, funding))
+        .map(LogicalPlan::Unnest);
+    if result.is_err() {
+        funding.unwound(before);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2454,6 +2482,61 @@ mod tests {
         }
 
         fn discharge(&self, _: usize) {}
+    }
+
+    struct TwoNodes(std::sync::Mutex<usize>);
+
+    impl datafusion_common::funding::PlanningFunding for TwoNodes {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.0.lock().unwrap();
+            match held.checked_add(bytes) {
+                Some(total) if total <= 2 * arc_bytes::<LogicalPlan>() => {
+                    *held = total;
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn discharge(&self, bytes: usize) {
+            let mut held = self.0.lock().unwrap();
+            *held = held.checked_sub(bytes).expect("uncharged planning release");
+        }
+    }
+
+    fn assert_schema_refuses_node_only_budget(
+        input: LogicalPlan,
+        build: impl FnOnce(LogicalPlanBuilder) -> Result<LogicalPlanBuilder>,
+    ) -> Result<()> {
+        let source = Arc::new(TwoNodes(std::sync::Mutex::new(0)));
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let input = funding.arc(input)?;
+        let error = build(LogicalPlanBuilder::new_from_arc(input, &funding))
+            .expect_err("both plan nodes fit, but the output schema must also be funded");
+        assert!(error.refused().is_some(), "{error}");
+        assert_eq!(funding.outstanding(), 0);
+        assert_eq!(*source.0.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn subquery_alias_schema_respects_builder_funding() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+        let input = table_scan(Some("t"), &schema, None)?.build()?;
+        assert_schema_refuses_node_only_budget(input, |builder| builder.alias("a"))
+    }
+
+    #[test]
+    fn unnest_schema_respects_builder_funding() -> Result<()> {
+        let schema = Schema::new(vec![Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            true,
+        )]);
+        let input = table_scan(Some("t"), &schema, None)?.build()?;
+        assert_schema_refuses_node_only_budget(input, |builder| {
+            builder.unnest_column("items")
+        })
     }
 
     /// A REPLACE's alias box is charged as it is made: freeing the replaced expansion
@@ -3139,12 +3222,12 @@ mod tests {
     #[test]
     fn test_join_metadata() -> Result<()> {
         let left_schema = DFSchema::new_with_metadata(
-            &vec![(None, Arc::new(Field::new("a", DataType::Int32, false)))],
+            &[(None, Arc::new(Field::new("a", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "left".to_string())]),
             &Funding::default(),
         )?;
         let right_schema = DFSchema::new_with_metadata(
-            &vec![(None, Arc::new(Field::new("b", DataType::Int32, false)))],
+            &[(None, Arc::new(Field::new("b", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "right".to_string())]),
             &Funding::default(),
         )?;

@@ -703,7 +703,8 @@ impl LogicalPlan {
                 input,
                 alias,
                 schema: _,
-            }) => SubqueryAlias::try_new(input, alias).map(LogicalPlan::SubqueryAlias),
+            }) => SubqueryAlias::try_new(input, alias, &Funding::default())
+                .map(LogicalPlan::SubqueryAlias),
             LogicalPlan::Limit(_) => Ok(self),
             LogicalPlan::Ddl(_) => Ok(self),
             LogicalPlan::Extension(Extension { node }) => {
@@ -770,7 +771,12 @@ impl LogicalPlan {
                 ..
             }) => {
                 // Update schema with unnested column type.
-                unnest_with_options(Arc::unwrap_or_clone(input), exec_columns, options)
+                unnest_with_options(
+                    Arc::unwrap_or_clone(input),
+                    exec_columns,
+                    options,
+                    &Funding::default(),
+                )
             }
         }
     }
@@ -1024,8 +1030,12 @@ impl LogicalPlan {
             LogicalPlan::SubqueryAlias(SubqueryAlias { alias, .. }) => {
                 self.assert_no_expressions(expr)?;
                 let input = self.only_input(inputs)?;
-                SubqueryAlias::try_new(Arc::new(input), alias.clone())
-                    .map(LogicalPlan::SubqueryAlias)
+                SubqueryAlias::try_new(
+                    Arc::new(input),
+                    alias.clone(),
+                    &Funding::default(),
+                )
+                .map(LogicalPlan::SubqueryAlias)
             }
             LogicalPlan::Limit(Limit { skip, fetch, .. }) => {
                 let old_expr_len = skip.iter().chain(fetch.iter()).count();
@@ -1221,7 +1231,12 @@ impl LogicalPlan {
                         .collect::<Result<Vec<_>>>()?
                 };
                 let input = self.only_input(inputs)?;
-                Ok(unnest_with_options(input, exec_columns, options.clone())?)
+                Ok(unnest_with_options(
+                    input,
+                    exec_columns,
+                    options.clone(),
+                    &Funding::default(),
+                )?)
             }
         }
     }
@@ -2581,64 +2596,74 @@ pub struct SubqueryAlias {
 }
 
 impl SubqueryAlias {
+    /// Charges the output schema and any inserted projection to `funding`.
     pub fn try_new(
         plan: Arc<LogicalPlan>,
         alias: impl Into<TableReference>,
+        funding: &Funding,
     ) -> Result<Self> {
-        let alias = alias.into();
+        let before = funding.outstanding();
+        let result = (|| {
+            let alias = alias.into();
 
-        // Since SubqueryAlias will replace all field qualification for the output schema of `plan`,
-        // no field must share the same column name as this would lead to ambiguity when referencing
-        // columns in parent logical nodes.
+            // Since SubqueryAlias will replace all field qualification for the output schema of `plan`,
+            // no field must share the same column name as this would lead to ambiguity when referencing
+            // columns in parent logical nodes.
 
-        // Compute unique aliases, if any, for each column of the input's schema.
-        let aliases = unique_field_aliases(plan.schema().fields());
-        let is_projection_needed = aliases.iter().any(Option::is_some);
+            // Compute unique aliases, if any, for each column of the input's schema.
+            let aliases = unique_field_aliases(plan.schema().fields());
+            let is_projection_needed = aliases.iter().any(Option::is_some);
 
-        // Insert a projection node, if needed, to make sure aliases are applied.
-        let plan = if is_projection_needed {
-            let projection_expressions = aliases
-                .iter()
-                .zip(plan.schema().iter())
-                .map(|(alias, (qualifier, field))| {
-                    let column =
-                        Expr::Column(Column::new(qualifier.cloned(), field.name()));
-                    match alias {
-                        None => column,
-                        Some(alias) => {
-                            Expr::Alias(Alias::new(column, qualifier.cloned(), alias))
-                        }
-                    }
-                })
-                .collect();
-            let projection =
-                Projection::try_new(projection_expressions, plan, &Funding::default())?;
-            Arc::new(LogicalPlan::Projection(projection))
-        } else {
-            plan
-        };
+            // Insert a projection node, if needed, to make sure aliases are applied.
+            let plan = if is_projection_needed {
+                let mut projection_expressions =
+                    funding.vec_with_capacity(aliases.len())?;
+                projection_expressions.extend(
+                    aliases.iter().zip(plan.schema().iter()).map(
+                        |(alias, (qualifier, field))| {
+                            let column = Expr::Column(Column::new(
+                                qualifier.cloned(),
+                                field.name(),
+                            ));
+                            match alias {
+                                None => column,
+                                Some(alias) => Expr::Alias(Alias::new(
+                                    column,
+                                    qualifier.cloned(),
+                                    alias,
+                                )),
+                            }
+                        },
+                    ),
+                );
+                let projection =
+                    Projection::try_new(projection_expressions, plan, funding)?;
+                funding.arc(LogicalPlan::Projection(projection))?
+            } else {
+                plan
+            };
 
-        // Requalify fields with the new `alias`.
-        let fields = plan.schema().fields().clone();
-        let meta_data = plan.schema().metadata().clone();
-        let func_dependencies = plan.schema().functional_dependencies().clone();
-
-        let schema = DFSchema::from_unqualified_fields(fields, meta_data)?;
-        let schema = schema.as_arrow();
-
-        let schema = DFSchemaRef::new(
-            DFSchema::try_from_qualified_schema(
-                alias.clone(),
+            // Requalify fields with the new `alias`.
+            let schema = funding.arc(
+                DFSchema::try_from_qualified_schema(
+                    alias.clone(),
+                    plan.schema().as_arrow(),
+                    funding,
+                )?
+                .with_functional_dependencies(
+                    funding.cloned(plan.schema().functional_dependencies())?,
+                )?,
+            )?;
+            Ok(SubqueryAlias {
+                input: plan,
+                alias,
                 schema,
-                &Funding::default(),
-            )?
-            .with_functional_dependencies(func_dependencies)?,
-        );
-        Ok(SubqueryAlias {
-            input: plan,
-            alias,
-            schema,
-        })
+            })
+        })();
+        if result.is_err() {
+            funding.unwound(before);
+        }
+        result
     }
 }
 
@@ -4744,142 +4769,152 @@ impl PartialOrd for Unnest {
 }
 
 impl Unnest {
+    /// Charges the output schema to `funding`.
     pub fn try_new(
         input: Arc<LogicalPlan>,
         exec_columns: Vec<Column>,
         options: UnnestOptions,
+        funding: &Funding,
     ) -> Result<Self> {
-        if exec_columns.is_empty() {
-            return plan_err!("unnest plan requires at least 1 column to unnest");
-        }
+        let before = funding.outstanding();
+        let result = (|| {
+            if exec_columns.is_empty() {
+                return plan_err!("unnest plan requires at least 1 column to unnest");
+            }
 
-        let mut list_columns: Vec<(usize, ColumnUnnestList)> = vec![];
-        let mut struct_columns = vec![];
-        let indices_to_unnest = exec_columns
-            .iter()
-            .map(|c| Ok((input.schema().index_of_column(c)?, c)))
-            .collect::<Result<HashMap<usize, &Column>>>()?;
+            let mut list_columns: Vec<(usize, ColumnUnnestList)> = vec![];
+            let mut struct_columns = vec![];
+            let indices_to_unnest = exec_columns
+                .iter()
+                .map(|c| Ok((input.schema().index_of_column(c)?, c)))
+                .collect::<Result<HashMap<usize, &Column>>>()?;
 
-        let input_schema = input.schema();
+            let input_schema = input.schema();
 
-        let mut dependency_indices = vec![];
-        // Transform input schema into new schema
-        // Given this comprehensive example
-        //
-        // input schema:
-        // 1.col1_unnest_placeholder: list[list[int]],
-        // 2.col1: list[list[int]]
-        // 3.col2: list[int]
-        // with unnest on unnest(col1,depth=2), unnest(col1,depth=1) and unnest(col2,depth=1)
-        // output schema:
-        // 1.unnest_col1_depth_2: int
-        // 2.unnest_col1_depth_1: list[int]
-        // 3.col1: list[list[int]]
-        // 4.unnest_col2_depth_1: int
-        // Meaning the placeholder column will be replaced by its unnested variation(s), note
-        // the plural.
-        let fields = input_schema
-            .iter()
-            .enumerate()
-            .map(|(index, (original_qualifier, original_field))| {
-                match indices_to_unnest.get(&index) {
-                    Some(column_to_unnest) => {
-                        let recursions_on_column = options
-                            .recursions
-                            .iter()
-                            .filter(|p| -> bool { &p.input_column == *column_to_unnest })
-                            .collect::<Vec<_>>();
-                        let mut transformed_columns = recursions_on_column
-                            .iter()
-                            .map(|r| {
-                                list_columns.push((
-                                    index,
-                                    ColumnUnnestList {
-                                        output_column: r.output_column.clone(),
-                                        depth: r.depth,
-                                    },
-                                ));
-                                Ok(get_unnested_columns(
-                                    &r.output_column.name,
-                                    original_field.data_type(),
-                                    r.depth,
-                                )?
-                                .into_iter()
-                                .next()
-                                .unwrap()) // because unnesting a list column always result into one result
-                            })
-                            .collect::<Result<Vec<(Column, Arc<Field>)>>>()?;
-                        if transformed_columns.is_empty() {
-                            transformed_columns = get_unnested_columns(
-                                &column_to_unnest.name,
-                                original_field.data_type(),
-                                1,
-                            )?;
-                            match original_field.data_type() {
-                                DataType::Struct(_) => {
-                                    struct_columns.push(index);
-                                }
-                                DataType::List(_)
-                                | DataType::FixedSizeList(_, _)
-                                | DataType::LargeList(_)
-                                | DataType::ListView(_)
-                                | DataType::LargeListView(_) => {
+            let mut dependency_indices = vec![];
+            // Transform input schema into new schema
+            // Given this comprehensive example
+            //
+            // input schema:
+            // 1.col1_unnest_placeholder: list[list[int]],
+            // 2.col1: list[list[int]]
+            // 3.col2: list[int]
+            // with unnest on unnest(col1,depth=2), unnest(col1,depth=1) and unnest(col2,depth=1)
+            // output schema:
+            // 1.unnest_col1_depth_2: int
+            // 2.unnest_col1_depth_1: list[int]
+            // 3.col1: list[list[int]]
+            // 4.unnest_col2_depth_1: int
+            // Meaning the placeholder column will be replaced by its unnested variation(s), note
+            // the plural.
+            let fields = input_schema
+                .iter()
+                .enumerate()
+                .map(|(index, (original_qualifier, original_field))| {
+                    match indices_to_unnest.get(&index) {
+                        Some(column_to_unnest) => {
+                            let recursions_on_column = options
+                                .recursions
+                                .iter()
+                                .filter(|p| -> bool {
+                                    &p.input_column == *column_to_unnest
+                                })
+                                .collect::<Vec<_>>();
+                            let mut transformed_columns = recursions_on_column
+                                .iter()
+                                .map(|r| {
                                     list_columns.push((
                                         index,
                                         ColumnUnnestList {
-                                            output_column: Column::from_name(
-                                                &column_to_unnest.name,
-                                            ),
-                                            depth: 1,
+                                            output_column: r.output_column.clone(),
+                                            depth: r.depth,
                                         },
                                     ));
-                                }
-                                _ => {}
-                            };
+                                    Ok(get_unnested_columns(
+                                        &r.output_column.name,
+                                        original_field.data_type(),
+                                        r.depth,
+                                    )?
+                                    .into_iter()
+                                    .next()
+                                    .unwrap()) // because unnesting a list column always result into one result
+                                })
+                                .collect::<Result<Vec<(Column, Arc<Field>)>>>()?;
+                            if transformed_columns.is_empty() {
+                                transformed_columns = get_unnested_columns(
+                                    &column_to_unnest.name,
+                                    original_field.data_type(),
+                                    1,
+                                )?;
+                                match original_field.data_type() {
+                                    DataType::Struct(_) => {
+                                        struct_columns.push(index);
+                                    }
+                                    DataType::List(_)
+                                    | DataType::FixedSizeList(_, _)
+                                    | DataType::LargeList(_)
+                                    | DataType::ListView(_)
+                                    | DataType::LargeListView(_) => {
+                                        list_columns.push((
+                                            index,
+                                            ColumnUnnestList {
+                                                output_column: Column::from_name(
+                                                    &column_to_unnest.name,
+                                                ),
+                                                depth: 1,
+                                            },
+                                        ));
+                                    }
+                                    _ => {}
+                                };
+                            }
+
+                            // new columns dependent on the same original index
+                            dependency_indices.extend(std::iter::repeat_n(
+                                index,
+                                transformed_columns.len(),
+                            ));
+                            Ok(transformed_columns
+                                .iter()
+                                .map(|(col, field)| {
+                                    (col.relation.to_owned(), field.to_owned())
+                                })
+                                .collect())
                         }
+                        None => {
+                            dependency_indices.push(index);
+                            Ok(vec![(
+                                original_qualifier.cloned(),
+                                Arc::clone(original_field),
+                            )])
+                        }
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
 
-                        // new columns dependent on the same original index
-                        dependency_indices.extend(std::iter::repeat_n(
-                            index,
-                            transformed_columns.len(),
-                        ));
-                        Ok(transformed_columns
-                            .iter()
-                            .map(|(col, field)| {
-                                (col.relation.to_owned(), field.to_owned())
-                            })
-                            .collect())
-                    }
-                    None => {
-                        dependency_indices.push(index);
-                        Ok(vec![(
-                            original_qualifier.cloned(),
-                            Arc::clone(original_field),
-                        )])
-                    }
-                }
+            let metadata = input_schema.metadata().clone();
+            let df_schema = DFSchema::new_with_metadata(&fields, metadata, funding)?;
+            // We can use the existing functional dependencies:
+            let deps = funding.cloned(input_schema.functional_dependencies())?;
+            let schema = funding.arc(df_schema.with_functional_dependencies(deps)?)?;
+
+            Ok(Unnest {
+                input,
+                exec_columns,
+                list_type_columns: list_columns,
+                struct_type_columns: struct_columns,
+                dependency_indices,
+                schema,
+                options,
             })
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-
-        let metadata = input_schema.metadata().clone();
-        let df_schema =
-            DFSchema::new_with_metadata(&fields, metadata, &Funding::default())?;
-        // We can use the existing functional dependencies:
-        let deps = input_schema.functional_dependencies().clone();
-        let schema = Arc::new(df_schema.with_functional_dependencies(deps)?);
-
-        Ok(Unnest {
-            input,
-            exec_columns,
-            list_type_columns: list_columns,
-            struct_type_columns: struct_columns,
-            dependency_indices,
-            schema,
-            options,
-        })
+        })();
+        if result.is_err() {
+            funding.unwound(before);
+        }
+        result
     }
 }
 

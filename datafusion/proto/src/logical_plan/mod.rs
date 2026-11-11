@@ -548,6 +548,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
                                 Arc::new(new_proj),
                                 alias.clone(),
+                                ctx.session_config().planning_funding(),
                             )?))
                         }
                     },

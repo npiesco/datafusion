@@ -733,7 +733,7 @@ fn using_keys(on: &[(Expr, Expr)]) -> impl Iterator<Item = &Column> + Clone {
 fn any_using_join(
     funding: &Funding,
     plan: &LogicalPlan,
-    f: &mut dyn FnMut(&[(Expr, Expr)]) -> bool,
+    f: &mut impl FnMut(&[(Expr, Expr)]) -> bool,
 ) -> Result<bool> {
     let mut found = false;
     apply_plan(funding, plan, true, &mut |node| {
@@ -1389,7 +1389,7 @@ pub(crate) fn merged_input_schema(
     apply_inputs(plan, &mut |input| {
         let base = merged
             .as_ref()
-            .map_or(DFSchema::empty_ref().as_ref(), |(schema, _)| schema);
+            .map_or_else(|| DFSchema::empty_ref().as_ref(), |(schema, _)| schema);
         let before = funding.outstanding();
         let next = base.merge(input.schema(), funding)?;
         let bytes = funding.outstanding().saturating_sub(before);

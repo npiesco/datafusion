@@ -17,6 +17,7 @@
 
 //! [`DecorrelateLateralJoin`] decorrelates logical plans produced by lateral joins.
 
+use datafusion_common::funding::Funding;
 use std::sync::Arc;
 
 use crate::decorrelate::{PullUpCorrelatedExpr, UN_MATCHED_ROW_INDICATOR};
@@ -52,14 +53,14 @@ impl OptimizerRule for DecorrelateLateralJoin {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
         // Find cross joins with outer column references on the right side (i.e., the apply operator).
         let LogicalPlan::Join(join) = plan else {
             return Ok(Transformed::no(plan));
         };
 
-        rewrite_internal(join)
+        rewrite_internal(join, &config.funding())
     }
 
     fn name(&self) -> &str {
@@ -73,7 +74,7 @@ impl OptimizerRule for DecorrelateLateralJoin {
 
 // Build the decorrelated join based on the original lateral join query.
 // Supports INNER and LEFT lateral joins.
-fn rewrite_internal(join: Join) -> Result<Transformed<LogicalPlan>> {
+fn rewrite_internal(join: Join, funding: &Funding) -> Result<Transformed<LogicalPlan>> {
     if !matches!(join.join_type, JoinType::Inner | JoinType::Left) {
         return Ok(Transformed::no(LogicalPlan::Join(join)));
     }
@@ -141,6 +142,7 @@ fn rewrite_internal(join: Join) -> Result<Transformed<LogicalPlan>> {
             let right = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
                 Arc::new(rewritten_subquery),
                 alias.clone(),
+                funding,
             )?);
             let corr = correlation_filter
                 .map(|f| requalify_filter(f, &inner_schema, alias))

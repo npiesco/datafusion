@@ -2213,6 +2213,8 @@ fn group_of(len: usize, nulls: &[usize], funding: &Funding) -> Result<Vec<bool>>
     Ok(group)
 }
 
+type GroupingExprs = Vec<(Arc<dyn PhysicalExpr>, String)>;
+
 /// The physical and NULL expression of each of `exprs`, both lists charged to
 /// `funding` first.
 fn grouping_exprs_with_nulls(
@@ -2222,13 +2224,10 @@ fn grouping_exprs_with_nulls(
     execution_props: &ExecutionProps,
     planning_ctx: &PhysicalPlanningContext,
     funding: &Funding,
-) -> Result<(
-    Vec<(Arc<dyn PhysicalExpr>, String)>,
-    Vec<(Arc<dyn PhysicalExpr>, String)>,
-)> {
-    let mut null_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+) -> Result<(GroupingExprs, GroupingExprs)> {
+    let mut null_exprs = funding.held::<GroupingExprs>();
     null_exprs.reserve_exact(exprs.len())?;
-    let mut all_exprs = funding.held::<Vec<(Arc<dyn PhysicalExpr>, String)>>();
+    let mut all_exprs = funding.held::<GroupingExprs>();
     all_exprs.reserve_exact(exprs.len())?;
 
     for expr in exprs {
@@ -3302,6 +3301,10 @@ impl DefaultPhysicalPlanner {
         Ok((links, index_map))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The caller's funding must accompany the projection planning inputs."
+    )]
     fn create_project_physical_exec_with_props(
         &self,
         execution_props: &ExecutionProps,
@@ -5796,7 +5799,11 @@ digraph {
 
         let join = left.join(right, JoinType::Full, join_keys, None)?.build()?;
 
-        let alias = subquery_alias(join, "alias")?;
+        let alias = subquery_alias(
+            join,
+            "alias",
+            &datafusion_common::funding::Funding::default(),
+        )?;
 
         let planner = DefaultPhysicalPlanner::default();
 
