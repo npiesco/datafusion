@@ -144,11 +144,72 @@ fn unnest_is_funded_and_failure_frees_it() {
 
 #[test]
 fn select_joins_are_funded() {
+    let (_, j1_scan_kept, _) = plan_within("SELECT 1 FROM j1", usize::MAX);
+    let (_, person_scan_kept, _) = plan_within("SELECT 1 FROM person", usize::MAX);
+    let scan_delta = person_scan_kept - j1_scan_kept;
+
+    let (_, j1_join1_kept, _) =
+        plan_within("SELECT 1 FROM j1 JOIN j2 ON true", usize::MAX);
+    let (_, person_join1_kept, _) =
+        plan_within("SELECT 1 FROM person JOIN j2 ON true", usize::MAX);
+    let per_join_schema_delta = (person_join1_kept - j1_join1_kept) - scan_delta;
+
+    let (_, j1_join3_kept, _) = plan_within(
+        "SELECT 1 FROM j1 JOIN j2 ON true JOIN j3 ON true JOIN j3 AS j4 ON true",
+        usize::MAX,
+    );
+    let (_, person_join3_kept, _) = plan_within(
+        "SELECT 1 FROM person JOIN j2 ON true JOIN j3 ON true JOIN j3 AS j4 ON true",
+        usize::MAX,
+    );
+    assert_eq!(
+        person_join3_kept - j1_join3_kept,
+        scan_delta + 3 * per_join_schema_delta,
+        "multi-way joins must release temporary outer_from_schema allocations"
+    );
+
     assert_funded("SELECT j1_id, j2_string FROM j1 JOIN j2 ON j1_id = j2_id");
     assert_funded("SELECT j1_id FROM j1 LEFT JOIN j2 ON j1_id = j2_id AND j2_id > 1");
     assert_funded("SELECT j1_id, j2_id FROM j1, j2");
+    assert_funded(
+        "SELECT j1_id FROM j1 JOIN j2 ON j1_id = j2_id JOIN j3 ON j2_id = j3_id",
+    );
+    assert_funded(
+        "SELECT j1_id FROM j1 JOIN j2 ON j1_id = j2_id CROSS JOIN LATERAL (SELECT j1_id)",
+    );
     assert_failure_freed("SELECT j1_id FROM j1 JOIN j2 ON no_such_column = j2_id");
     assert_failure_freed("SELECT j1_id FROM j1 JOIN j1 ON true");
+}
+
+#[test]
+fn subqueries_are_funded() {
+    let (_, j1_base_kept, _) = plan_within("SELECT 1 FROM j1 WHERE true", usize::MAX);
+    let (_, person_base_kept, _) =
+        plan_within("SELECT 1 FROM person WHERE true", usize::MAX);
+    let base_delta = person_base_kept - j1_base_kept;
+
+    for predicate in [
+        "EXISTS (SELECT 1)",
+        "1 IN (SELECT 1)",
+        "(SELECT 1) = 1",
+        "1 = ANY (SELECT 1)",
+        "EXISTS (SELECT 1 FROM (SELECT 1))",
+    ] {
+        let j1_sql = format!("SELECT 1 FROM j1 WHERE {predicate}");
+        let person_sql = format!("SELECT 1 FROM person WHERE {predicate}");
+        let (_, j1_kept, _) = plan_within(&j1_sql, usize::MAX);
+        let (_, person_kept, _) = plan_within(&person_sql, usize::MAX);
+        assert_eq!(
+            person_kept - j1_kept,
+            base_delta,
+            "{predicate} must release temporary outer_query_schema allocations"
+        );
+    }
+
+    assert_funded("SELECT j1_id FROM j1 WHERE EXISTS (SELECT 1 FROM j2 WHERE j1_id = j2_id)");
+    assert_funded("SELECT j1_id FROM j1 WHERE j1_id IN (SELECT j2_id FROM j2)");
+    assert_funded("SELECT (SELECT j2_id FROM j2 WHERE j2_id = j1_id) FROM j1");
+    assert_funded("SELECT j1_id FROM j1 WHERE j1_id = ANY (SELECT j2_id FROM j2)");
 }
 
 #[test]

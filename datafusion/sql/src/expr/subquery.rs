@@ -45,7 +45,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         )?;
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
-        planner_context.pop_outer_query_schema();
+        if let Some(popped) = planner_context.pop_outer_query_schema() {
+            DFSchema::released_arc(popped, self.funding());
+        }
         Ok(Expr::Exists(Exists {
             subquery: Subquery {
                 subquery: self.funding().arc(sub_plan)?,
@@ -82,7 +84,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
-        planner_context.pop_outer_query_schema();
+        if let Some(popped) = planner_context.pop_outer_query_schema() {
+            DFSchema::released_arc(popped, self.funding());
+        }
 
         self.validate_single_column(
             &sub_plan,
@@ -126,7 +130,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         }
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
-        planner_context.pop_outer_query_schema();
+        if let Some(popped) = planner_context.pop_outer_query_schema() {
+            DFSchema::released_arc(popped, self.funding());
+        }
 
         self.validate_single_column(
             &sub_plan,
@@ -204,7 +210,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
         let sub_plan = self.query_to_plan(subquery, planner_context)?;
         let outer_ref_columns = sub_plan.all_out_ref_exprs();
-        planner_context.pop_outer_query_schema();
+        if let Some(popped) = planner_context.pop_outer_query_schema() {
+            DFSchema::released_arc(popped, self.funding());
+        }
 
         self.validate_single_column(
             &sub_plan,

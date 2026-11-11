@@ -325,7 +325,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         // the `for` loop in `plan_table_with_joins`.
         let old_from_schema = planner_context
             .set_outer_from_schema(None)
-            .unwrap_or_else(|| Arc::new(DFSchema::empty()));
+            .unwrap_or_else(|| Arc::clone(DFSchema::empty_ref()));
         let outer_query_schema = planner_context.pop_outer_query_schema();
         let new_query_schema = match outer_query_schema {
             Some(ref old_query_schema) => self
@@ -338,7 +338,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let plan = self.create_relation(subquery, planner_context)?;
         let outer_ref_columns = plan.all_out_ref_exprs();
 
-        planner_context.pop_outer_query_schema();
+        if let Some(popped) = planner_context.pop_outer_query_schema() {
+            DFSchema::released_arc(popped, self.funding());
+        }
         if let Some(schema) = outer_query_schema {
             planner_context.append_outer_query_schema(schema, self.funding())?;
         }

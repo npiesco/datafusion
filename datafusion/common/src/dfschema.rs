@@ -469,6 +469,17 @@ impl DFSchema {
         funding.discharge(freed);
     }
 
+    /// `schema`, a counted schema [`DFSchema::merge`], [`DFSchema::join`] or
+    /// [`Funding::cloned`] made through `funding` ([`Funding::arc`]), freed when no other
+    /// handle to it remains: the counted block and what making the schema allocated are
+    /// given back.
+    pub fn released_arc(schema: Arc<Self>, funding: &Funding) {
+        if let Ok(schema) = Arc::try_unwrap(schema) {
+            funding.discharge(arc_bytes::<Self>());
+            schema.released(funding);
+        }
+    }
+
     /// Drop a schema built by [`Self::try_from_qualified_schema`], giving back to
     /// `funding` the qualifier list, functional dependencies, and `Arc<Schema>` header
     /// it charged without discharging the shared Arrow `Fields` slice.
@@ -2130,6 +2141,21 @@ mod tests {
         let merged = left.merge(&right, &unlimited)?;
         let peak_merge = unlimited_source.peak.load(Ordering::Relaxed);
         merged.released(&unlimited);
+        assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
+
+        let merged_arc = unlimited.arc(left.merge(&right, &unlimited)?)?;
+        let merged_arc_clone = Arc::clone(&merged_arc);
+        let held_with_arc = unlimited.outstanding();
+        DFSchema::released_arc(merged_arc_clone, &unlimited);
+        assert_eq!(unlimited.outstanding(), held_with_arc);
+        DFSchema::released_arc(merged_arc, &unlimited);
+        assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
+
+        let cloned_arc = unlimited.arc(unlimited.cloned(&left)?)?;
+        assert!(unlimited.outstanding() > 0);
+        DFSchema::released_arc(cloned_arc, &unlimited);
         assert_eq!(unlimited.outstanding(), 0);
         assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
 

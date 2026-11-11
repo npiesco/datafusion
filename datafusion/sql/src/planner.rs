@@ -453,7 +453,9 @@ impl PlannerContext {
             Some(from_schema) => funding.arc(from_schema.merge(schema, funding)?)?,
             None => Arc::clone(schema),
         };
-        self.outer_from_schema = Some(extended);
+        if let Some(previous) = self.outer_from_schema.replace(extended) {
+            DFSchema::released_arc(previous, funding);
+        }
         Ok(())
     }
 

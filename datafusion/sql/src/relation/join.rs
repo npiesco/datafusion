@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
-use datafusion_common::{Column, Result, not_impl_err, plan_datafusion_err};
+use datafusion_common::{Column, DFSchema, Result, not_impl_err, plan_datafusion_err};
 use datafusion_expr::{JoinType, LogicalPlan};
 use sqlparser::ast::{
     Join, JoinConstraint, JoinOperator, ObjectName, TableFactor, TableWithJoins,
@@ -37,9 +37,19 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let old_outer_from_schema = planner_context.outer_from_schema();
         for join in t.joins {
             planner_context.extend_outer_from_schema(left.schema(), self.funding())?;
-            left = self.parse_relation_join(left, join, planner_context)?;
+            left = match self.parse_relation_join(left, join, planner_context) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    planner_context.set_outer_from_schema(old_outer_from_schema);
+                    return Err(err);
+                }
+            };
         }
-        planner_context.set_outer_from_schema(old_outer_from_schema);
+        if let Some(previous) =
+            planner_context.set_outer_from_schema(old_outer_from_schema)
+        {
+            DFSchema::released_arc(previous, self.funding());
+        }
         Ok(left)
     }
 
