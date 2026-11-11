@@ -524,6 +524,7 @@ fn test_symmetric_hash_join_requires_co_partitioned_children() -> Result<()> {
         None,
         None,
         StreamJoinPartitionMode::Partitioned,
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
     assert_sanity_check(&compatible_join, true);
 
@@ -537,6 +538,7 @@ fn test_symmetric_hash_join_requires_co_partitioned_children() -> Result<()> {
         None,
         None,
         StreamJoinPartitionMode::Partitioned,
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
     assert_sanity_check(&incompatible_join, false);
 

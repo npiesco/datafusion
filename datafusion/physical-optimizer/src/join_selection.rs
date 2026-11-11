@@ -231,20 +231,20 @@ pub(crate) fn try_collect_left(
             {
                 Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
             } else {
-                Ok(Some(Arc::new(
+                Ok(Some(
                     hash_join
-                        .builder()
+                        .builder()?
                         .with_partition_mode(PartitionMode::CollectLeft)
-                        .build()?,
-                )))
+                        .build_exec()?,
+                ))
             }
         }
-        (true, false) => Ok(Some(Arc::new(
+        (true, false) => Ok(Some(
             hash_join
-                .builder()
+                .builder()?
                 .with_partition_mode(PartitionMode::CollectLeft)
-                .build()?,
-        ))),
+                .build_exec()?,
+        )),
         (false, true) => {
             // Don't swap null-aware anti joins as they have specific side requirements
             if optimizer_config.join_reordering
@@ -292,12 +292,10 @@ pub(crate) fn partitioned_hash_join(
             PartitionMode::Partitioned
         };
 
-        Ok(Arc::new(
-            hash_join
-                .builder()
-                .with_partition_mode(partition_mode)
-                .build()?,
-        ))
+        hash_join
+            .builder()?
+            .with_partition_mode(partition_mode)
+            .build_exec()
     }
 }
 
@@ -475,7 +473,8 @@ fn hash_join_convert_symmetric_subrule(
             let left_order = determine_order(JoinSide::Left);
             let right_order = determine_order(JoinSide::Right);
 
-            return SymmetricHashJoinExec::try_new(
+            let funding = hash_join.funding();
+            let exec = SymmetricHashJoinExec::try_new(
                 Arc::clone(hash_join.left()),
                 Arc::clone(hash_join.right()),
                 hash_join.on().to_vec(),
@@ -485,8 +484,9 @@ fn hash_join_convert_symmetric_subrule(
                 left_order,
                 right_order,
                 mode,
-            )
-            .map(|exec| Arc::new(exec) as _);
+                funding,
+            )?;
+            return Ok(funding.arc(exec)? as _);
         }
     }
     Ok(input)

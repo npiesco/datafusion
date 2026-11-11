@@ -1399,7 +1399,8 @@ mod tests {
         let input: Arc<dyn ExecutionPlan> =
             TestMemoryExec::try_new_exec(&[vec![]], Arc::clone(&schema_not_null), None)?;
 
-        let coerced = coerce_schema(Arc::clone(&input), &schema_not_null)?;
+        let coerced =
+            coerce_schema(Arc::clone(&input), &schema_not_null, &Funding::default())?;
         assert!(Arc::ptr_eq(&coerced, &input));
 
         Ok(())
@@ -1424,7 +1425,8 @@ mod tests {
 
         let nullable_schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
-        let coerced = coerce_schema(Arc::clone(&input), &nullable_schema)?;
+        let coerced =
+            coerce_schema(Arc::clone(&input), &nullable_schema, &Funding::default())?;
         assert_eq!(&coerced.schema(), &nullable_schema);
         let plan_str = crate::displayable(coerced.as_ref())
             .indent(true)
@@ -1451,7 +1453,7 @@ mod tests {
 
         let schema_utf8 =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
-        let err = coerce_schema(input, &schema_utf8).unwrap_err();
+        let err = coerce_schema(input, &schema_utf8, &Funding::default()).unwrap_err();
         assert!(err.to_string().contains("same data type per column"));
 
         Ok(())

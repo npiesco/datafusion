@@ -2184,21 +2184,18 @@ mod tests {
         let schema = Arc::new(Schema::empty());
         let dynamic: Arc<dyn PhysicalExpr> =
             Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
-        let valid = EmptyExec::new(Arc::clone(&schema), &Funding::default())
-            .unwrap()
+        let valid = EmptyExec::new(Arc::clone(&schema))
             .with_dynamic_expressions(vec![Arc::clone(&dynamic)]);
         check_default_invariants(&valid, InvariantLevel::Always)?;
 
-        let missing_id = EmptyExec::new(Arc::clone(&schema), &Funding::default())
-            .unwrap()
-            .with_dynamic_expressions(vec![lit(true)]);
+        let missing_id =
+            EmptyExec::new(Arc::clone(&schema)).with_dynamic_expressions(vec![lit(true)]);
         let error = check_default_invariants(&missing_id, InvariantLevel::Always)
             .unwrap_err()
             .strip_backtrace();
         assert!(error.contains("without an expression ID"), "{error}");
 
-        let duplicate = EmptyExec::new(schema, &Funding::default())
-            .unwrap()
+        let duplicate = EmptyExec::new(schema)
             .with_dynamic_expressions(vec![Arc::clone(&dynamic), dynamic]);
         let error = check_default_invariants(&duplicate, InvariantLevel::Always)
             .unwrap_err()
@@ -2919,7 +2916,7 @@ mod tests {
     #[test]
     fn test_execution_plan_name() {
         let schema1 = Arc::new(Schema::empty());
-        let default_name_exec = EmptyExec::new(schema1, &Funding::default()).unwrap();
+        let default_name_exec = EmptyExec::new(schema1);
         assert_eq!(default_name_exec.name(), "EmptyExec");
 
         let schema2 = Arc::new(Schema::empty());
@@ -2931,8 +2928,7 @@ mod tests {
     #[test]
     fn test_execution_plan_downcast_delegates_to_downcast_delegate() {
         let schema = Arc::new(Schema::empty());
-        let inner: Arc<dyn ExecutionPlan> =
-            Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap());
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
         let wrapped: Arc<dyn ExecutionPlan> = Arc::new(DowncastDelegatingExec(inner));
         let nested: Arc<dyn ExecutionPlan> =
             Arc::new(DowncastDelegatingExec(Arc::clone(&wrapped)));

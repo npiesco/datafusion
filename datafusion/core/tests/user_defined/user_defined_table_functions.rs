@@ -178,7 +178,7 @@ impl SimpleCsvTable {
         )
         .map(LogicalPlan::Projection)?;
         let rbs = collect(
-            state.create_physical_plan(&logical_plan).await?,
+            state.create_physical_plan(&logical_plan)?.await?,
             Arc::new(TaskContext::from(state)),
         )
         .await?;

@@ -25,7 +25,7 @@ use datafusion_common::funding::Funding;
 use insta::assert_snapshot;
 
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{TransformedResult, TreeNode, TreeNodeRecursion};
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::ensure_requirements::EnsureRequirements;
 use datafusion_physical_optimizer::ensure_requirements::enforce_sorting::{
@@ -1215,6 +1215,7 @@ fn test_idempotent_sort_merge_join() {
                 nulls_first: false,
             }],
             NullEquality::NullEqualsNothing,
+            &Funding::default(),
         )
         .expect("SortMergeJoinExec creation failed"),
     );
@@ -1365,6 +1366,7 @@ fn test_enforce_distribution_idempotent_hash_join() {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .expect("HashJoinExec creation failed"),
     );
@@ -1468,6 +1470,7 @@ fn collect_left_plan_before_parallelize_sorts(
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?);
 
     Ok(Arc::new(

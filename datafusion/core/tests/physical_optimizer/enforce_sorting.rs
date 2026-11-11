@@ -300,6 +300,7 @@ async fn test_hash_join_interleaved_projection_preserves_parent_sort() -> Result
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?);
     let ordering = [sort_expr("nullable_col", &join.schema())].into();
     let physical_plan = sort_exec(ordering, join);

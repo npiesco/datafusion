@@ -284,6 +284,7 @@ fn pushdown_sorts_helper(
         &sort_push_down.plan,
         parent_requirement.clone(),
         parent_fetch,
+        funding,
     )? {
         // For operators that can take a sort pushdown, continue with updated
         // requirements. If this node already outputs single partition (e.g. SPM),
@@ -332,6 +333,7 @@ fn pushdown_requirement_to_children(
     plan: &Arc<dyn ExecutionPlan>,
     parent_required: OrderingRequirements,
     parent_fetch: Option<usize>,
+    funding: &Funding,
 ) -> Result<Option<Vec<Option<OrderingRequirements>>>> {
     // If there is a limit on the parent plan we cannot push it down through operators that change the cardinality.
     // E.g. consider if LIMIT 2 is applied below a FilteExec that filters out 1/2 of the rows we'll end up with 1 row instead of 2.
@@ -479,6 +481,7 @@ fn pushdown_requirement_to_children(
                 parent_required.into_single(),
                 ordering,
                 JoinSide::Left,
+                funding,
             ),
             Some((JoinSide::Right, ordering)) => {
                 let right_offset =
@@ -486,12 +489,14 @@ fn pushdown_requirement_to_children(
                 let ordering = add_offset_to_physical_sort_exprs(
                     ordering,
                     -(right_offset as isize),
+                    funding,
                 )?;
                 try_pushdown_requirements_to_join(
                     smj,
                     parent_required.into_single(),
                     ordering,
                     JoinSide::Right,
+                    funding,
                 )
             }
             _ => {
@@ -707,6 +712,7 @@ fn try_pushdown_requirements_to_join(
     parent_required: LexRequirement,
     sort_exprs: Vec<PhysicalSortExpr>,
     push_side: JoinSide,
+    funding: &Funding,
 ) -> Result<Option<Vec<Option<OrderingRequirements>>>> {
     let mut smj_required_orderings = smj.required_input_ordering();
 
@@ -751,6 +757,7 @@ fn try_pushdown_requirements_to_join(
         smj.left().schema().fields.len(),
         &smj.maintains_input_order(),
         Some(probe_side),
+        funding,
     )?;
     let mut smj_eqs = smj.properties().equivalence_properties().clone();
     if let Some(new_output_ordering) = new_output_ordering {

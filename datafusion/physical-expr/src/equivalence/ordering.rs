@@ -25,6 +25,7 @@ use crate::{LexOrdering, PhysicalExpr, add_offset_to_physical_sort_exprs};
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
+use datafusion_common::funding::Funding;
 use datafusion_common::{HashSet, Result};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
@@ -174,12 +175,13 @@ impl OrderingEquivalenceClass {
     }
 
     /// Adds `offset` value to the index of each expression inside this
-    /// ordering equivalence class.
-    pub fn add_offset(&mut self, offset: isize) -> Result<()> {
+    /// ordering equivalence class, the rewritten expressions charged to
+    /// `funding` before they are allocated.
+    pub fn add_offset(&mut self, offset: isize, funding: &Funding) -> Result<()> {
         let orderings = std::mem::take(&mut self.orderings);
         for ordering_result in orderings
             .into_iter()
-            .map(|o| add_offset_to_physical_sort_exprs(o, offset))
+            .map(|o| add_offset_to_physical_sort_exprs(o, offset, funding))
         {
             self.orderings.extend(LexOrdering::new(ordering_result?));
         }
@@ -322,8 +324,9 @@ impl From<OrderingEquivalenceClass> for Vec<LexOrdering> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion_common::funding::Funding;
     use std::sync::Arc;
+
+    use datafusion_common::funding::Funding;
 
     use crate::equivalence::tests::create_test_schema;
     use crate::equivalence::{

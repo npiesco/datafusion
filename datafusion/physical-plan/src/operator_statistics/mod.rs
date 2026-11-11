@@ -1826,6 +1826,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNull,
             false,
+            &Funding::default(),
         )?))
     }
 
@@ -1889,6 +1890,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNull,
             false,
+            &Funding::default(),
         )?);
 
         let registry = StatisticsRegistry::with_providers(vec![
@@ -1951,6 +1953,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNull,
             false,
+            &Funding::default(),
         )?);
 
         let registry = StatisticsRegistry::with_providers(vec![
@@ -1992,6 +1995,7 @@ mod tests {
             None,
             &JoinType::Inner,
             None,
+            &Funding::default(),
         )?);
 
         let registry = StatisticsRegistry::with_providers(vec![
@@ -2026,6 +2030,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNull,
             false,
+            &Funding::default(),
         )?))
     }
 
@@ -2124,7 +2129,8 @@ mod tests {
         use crate::joins::CrossJoinExec;
         let left = make_source(100);
         let right = make_source(200);
-        let join: Arc<dyn ExecutionPlan> = Arc::new(CrossJoinExec::new(left, right));
+        let join: Arc<dyn ExecutionPlan> =
+            Arc::new(CrossJoinExec::new(left, right, &Funding::default())?);
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(JoinStatisticsProvider),

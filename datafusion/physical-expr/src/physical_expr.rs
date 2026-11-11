@@ -38,16 +38,20 @@ pub(crate) use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 /// Adds the `offset` value to `Column` indices inside `expr`. This function is
 /// generally used during the update of the right table schema in join operations.
+/// The rewritten columns are charged to `funding` before they are allocated.
 pub fn add_offset_to_expr(
     expr: Arc<dyn PhysicalExpr>,
     offset: isize,
+    funding: &Funding,
 ) -> Result<Arc<dyn PhysicalExpr>> {
     expr.transform_down(|e| match e.downcast_ref::<Column>() {
         Some(col) => {
             let Some(idx) = col.index().checked_add_signed(offset) else {
                 return plan_err!("Column index overflow");
             };
-            Ok(Transformed::yes(Arc::new(Column::new(col.name(), idx))))
+            let column: Arc<dyn PhysicalExpr> =
+                funding.arc(Column::new(funding.string(col.name())?, idx))?;
+            Ok(Transformed::yes(column))
         }
         None => Ok(Transformed::no(e)),
     })
@@ -351,17 +355,21 @@ fn normalize_range_split_point_value(
     )
 }
 
+/// Adds the `offset` value to `Column` indices inside `sort_exprs`, what it makes
+/// charged to `funding` before it is allocated.
 pub fn add_offset_to_physical_sort_exprs(
     sort_exprs: impl IntoIterator<Item = PhysicalSortExpr>,
     offset: isize,
+    funding: &Funding,
 ) -> Result<Vec<PhysicalSortExpr>> {
-    sort_exprs
-        .into_iter()
-        .map(|mut sort_expr| {
-            sort_expr.expr = add_offset_to_expr(sort_expr.expr, offset)?;
-            Ok(sort_expr)
-        })
-        .collect()
+    let sort_exprs = sort_exprs.into_iter();
+    let mut offset_exprs = funding.held::<Vec<PhysicalSortExpr>>();
+    offset_exprs.reserve(sort_exprs.size_hint().0)?;
+    for mut sort_expr in sort_exprs {
+        sort_expr.expr = add_offset_to_expr(sort_expr.expr, offset, funding)?;
+        offset_exprs.push(sort_expr)?;
+    }
+    Ok(offset_exprs.keep())
 }
 
 #[cfg(test)]

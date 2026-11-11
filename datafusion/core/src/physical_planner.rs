@@ -237,7 +237,7 @@ impl ChildrenContainer {
         match self {
             Self::None => Ok(funding.held()),
             Self::One(p) => {
-                let mut v = funding.held();
+                let mut v: Held<Vec<Arc<dyn ExecutionPlan>>> = funding.held();
                 v.reserve_exact(1)?;
                 v.push(p)?;
                 Ok(v)
@@ -511,7 +511,8 @@ impl DefaultPhysicalPlanner {
                 }
                 1 => NodeState::ZeroOrOneChild,
                 _ => {
-                    let mut ready_children = funding.held();
+                    let mut ready_children: Held<Vec<ExecutionPlanChild>> =
+                        funding.held();
                     ready_children.reserve_exact(inputs)?;
                     NodeState::TwoOrMoreChildren(Mutex::new(ready_children))
                 }
@@ -545,7 +546,7 @@ impl DefaultPhysicalPlanner {
             ))
         };
         let mut leaves = flat_tree_leaf_indices.iter().copied();
-        let mut running = funding.held();
+        let mut running: Held<Vec<Option<HeldFuture<'_, _>>>> = funding.held();
         running.reserve_exact(max_concurrency)?;
         for index in leaves.by_ref().take(max_concurrency) {
             running.push(Some(task(index)?))?;
@@ -676,7 +677,7 @@ impl DefaultPhysicalPlanner {
                     // We reverse sort because of how we visited the node in the initial
                     // DFS traversal (see above).
                     children.sort_unstable_by_key(|epc| std::cmp::Reverse(epc.index));
-                    let mut plans = funding.held();
+                    let mut plans: Held<Vec<Arc<dyn ExecutionPlan>>> = funding.held();
                     plans.reserve_exact(children.len())?;
                     for child in children.drain(..) {
                         plans.push(child.plan)?;
@@ -1746,10 +1747,12 @@ impl DefaultPhysicalPlanner {
                             planning_ctx,
                             funding,
                         )?;
-                        let column_indices = join_utils::JoinFilter::build_column_indices(
-                            left_field_indices,
-                            right_field_indices,
-                        );
+                        let column_indices =
+                            join_utils::JoinFilter::build_column_indices(
+                                left_field_indices,
+                                right_field_indices,
+                                funding,
+                            )?;
 
                         Some(join_utils::JoinFilter::new(
                             filter_expr,
@@ -1767,7 +1770,11 @@ impl DefaultPhysicalPlanner {
                 let join: Arc<dyn ExecutionPlan> = if join_on.is_empty() {
                     if join_filter.is_none() && *join_type == JoinType::Inner {
                         // cross join if there is no join conditions and no join filter set
-                        Arc::new(CrossJoinExec::new(physical_left, physical_right))
+                        funding.arc(CrossJoinExec::new(
+                            physical_left,
+                            physical_right,
+                            funding,
+                        )?)?
                     } else if num_range_filters == 1
                         && total_filters == 1
                         && !matches!(
@@ -1841,13 +1848,14 @@ impl DefaultPhysicalPlanner {
                         let left_side = side_of(lhs_logical)?;
                         let right_side = side_of(rhs_logical)?;
                         if left_side == Side::Both || right_side == Side::Both {
-                            return Ok(Arc::new(NestedLoopJoinExec::try_new(
+                            return Ok(funding.arc(NestedLoopJoinExec::try_new(
                                 physical_left,
                                 physical_right,
                                 join_filter,
                                 join_type,
                                 None,
-                            )?));
+                                funding,
+                            )?)?);
                         }
 
                         if left_side == Side::Right && right_side == Side::Left {
@@ -1876,23 +1884,25 @@ impl DefaultPhysicalPlanner {
                             funding,
                         )?;
 
-                        Arc::new(PiecewiseMergeJoinExec::try_new(
+                        funding.arc(PiecewiseMergeJoinExec::try_new(
                             physical_left,
                             physical_right,
                             (on_left, on_right),
                             op,
                             *join_type,
                             session_state.config().target_partitions(),
-                        )?)
+                            funding,
+                        )?)?
                     } else {
                         // there is no equal join condition, use the nested loop join
-                        Arc::new(NestedLoopJoinExec::try_new(
+                        funding.arc(NestedLoopJoinExec::try_new(
                             physical_left,
                             physical_right,
                             join_filter,
                             join_type,
                             None,
-                        )?)
+                            funding,
+                        )?)?
                     }
                 } else if session_state.config().target_partitions() > 1
                     && session_state.config().repartition_joins()
@@ -1905,7 +1915,7 @@ impl DefaultPhysicalPlanner {
                 {
                     // Use SortMergeJoin if hash join is not preferred
                     let join_on_len = join_on.len();
-                    Arc::new(SortMergeJoinExec::try_new(
+                    funding.arc(SortMergeJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
@@ -1913,14 +1923,15 @@ impl DefaultPhysicalPlanner {
                         *join_type,
                         vec![SortOptions::default(); join_on_len],
                         *null_equality,
-                    )?)
+                        funding,
+                    )?)?
                 } else if session_state.config().target_partitions() > 1
                     && session_state.config().repartition_joins()
                     && prefer_hash_join
                     && !*null_aware
                 // Null-aware joins must use CollectLeft
                 {
-                    Arc::new(HashJoinExec::try_new(
+                    funding.arc(HashJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
@@ -1930,9 +1941,10 @@ impl DefaultPhysicalPlanner {
                         PartitionMode::Auto,
                         *null_equality,
                         *null_aware,
-                    )?)
+                        funding,
+                    )?)?
                 } else {
-                    Arc::new(HashJoinExec::try_new(
+                    funding.arc(HashJoinExec::try_new(
                         physical_left,
                         physical_right,
                         join_on,
@@ -1942,7 +1954,8 @@ impl DefaultPhysicalPlanner {
                         PartitionMode::CollectLeft,
                         *null_equality,
                         *null_aware,
-                    )?)
+                        funding,
+                    )?)?
                 };
 
                 // If plan was mutated previously then need to create the ExecutionPlan
@@ -2829,13 +2842,14 @@ pub fn create_aggregate_expr_with_name_and_maybe_filter(
     execution_props: &ExecutionProps,
 ) -> Result<AggregateExprWithOptionalArgs> {
     let planning_ctx = PhysicalPlanningContext::default();
+    let funding = Funding::default();
     let mut builder = LoweredAggregateBuilder::new(
         e,
         logical_input_schema,
         physical_input_schema,
         execution_props,
         &planning_ctx,
-        &Funding::default(),
+        &funding,
     )
     .with_human_display(human_display);
 
@@ -2871,13 +2885,14 @@ pub fn create_aggregate_expr_and_maybe_filter(
     };
 
     let planning_ctx = PhysicalPlanningContext::default();
+    let funding = Funding::default();
     let mut builder = LoweredAggregateBuilder::new(
         &e,
         logical_input_schema,
         physical_input_schema,
         execution_props,
         &planning_ctx,
-        &Funding::default(),
+        &funding,
     )
     .with_human_display(human_display);
 
@@ -4300,6 +4315,7 @@ mod tests {
             physical_input_schema,
             session_state.execution_props(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         );
 
         insta::assert_debug_snapshot!(cube, @r#"
@@ -4432,6 +4448,7 @@ mod tests {
             physical_input_schema,
             session_state.execution_props(),
             &PhysicalPlanningContext::default(),
+            &Funding::default(),
         );
 
         insta::assert_debug_snapshot!(rollup, @r#"
@@ -4606,7 +4623,8 @@ mod tests {
             node: Arc::new(NoOpExtensionNode::default()),
         });
         match planner
-            .create_physical_plan(&logical_plan, &session_state)?
+            .create_physical_plan(&logical_plan, &session_state)
+            .unwrap()
             .await
         {
             Ok(_) => panic!("Expected planning failure"),
@@ -4664,7 +4682,8 @@ mod tests {
             node: Arc::new(NoOpExtensionNode::default()),
         });
         let plan = planner
-            .create_physical_plan(&logical_plan, &session_state)?
+            .create_physical_plan(&logical_plan, &session_state)
+            .unwrap()
             .await;
 
         let expected_error = "No installed planner was able to convert the custom node to an execution plan: NoOp";
@@ -4690,7 +4709,8 @@ mod tests {
             node: Arc::new(NoOpExtensionNode::default()),
         });
         let e = planner
-            .create_physical_plan(&logical_plan, &session_state)?
+            .create_physical_plan(&logical_plan, &session_state)
+            .unwrap()
             .await
             .expect_err("planning error")
             .strip_backtrace();
@@ -6069,7 +6089,8 @@ digraph {
             .unwrap();
 
         let plan = physical_planner
-            .create_physical_plan(&logical_plan, &session_state)?
+            .create_physical_plan(&logical_plan, &session_state)
+            .unwrap()
             .await
             .unwrap();
 

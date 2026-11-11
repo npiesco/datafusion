@@ -47,6 +47,7 @@ use crate::{
 
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, assert_eq_or_internal_err, internal_err,
@@ -130,6 +131,8 @@ pub struct SortMergeJoinExec {
     pub null_equality: NullEquality,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
+    /// The handle the node, and the nodes rebuilt from it, are charged to
+    funding: Funding,
 }
 
 impl SortMergeJoinExec {
@@ -145,6 +148,7 @@ impl SortMergeJoinExec {
         join_type: JoinType,
         sort_options: Vec<SortOptions>,
         null_equality: NullEquality,
+        funding: &Funding,
     ) -> Result<Self> {
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -158,21 +162,20 @@ impl SortMergeJoinExec {
             );
         }
 
-        let (left_sort_exprs, right_sort_exprs): (Vec<_>, Vec<_>) = on
-            .iter()
-            .zip(sort_options.iter())
-            .map(|((l, r), sort_op)| {
-                let left = PhysicalSortExpr {
+        let left_sort_exprs =
+            on.iter().zip(sort_options.iter()).map(|((l, _), sort_op)| {
+                PhysicalSortExpr {
                     expr: Arc::clone(l),
                     options: *sort_op,
-                };
-                let right = PhysicalSortExpr {
+                }
+            });
+        let right_sort_exprs =
+            on.iter().zip(sort_options.iter()).map(|((_, r), sort_op)| {
+                PhysicalSortExpr {
                     expr: Arc::clone(r),
                     options: *sort_op,
-                };
-                (left, right)
-            })
-            .unzip();
+                }
+            });
         let Some(left_sort_exprs) = LexOrdering::new(left_sort_exprs) else {
             return plan_err!(
                 "SortMergeJoinExec requires valid sort expressions for its left side"
@@ -184,10 +187,19 @@ impl SortMergeJoinExec {
             );
         };
 
-        let schema =
-            Arc::new(build_join_schema(&left_schema, &right_schema, &join_type).0);
-        let cache =
-            Self::compute_properties(&left, &right, Arc::clone(&schema), join_type, &on)?;
+        let (schema, column_indices) =
+            build_join_schema(&left_schema, &right_schema, &join_type, funding)?;
+        funding.released(column_indices);
+        let schema = funding.arc(schema)?;
+        let cache = funding.arc(Self::compute_properties(
+            &left,
+            &right,
+            Arc::clone(&schema),
+            join_type,
+            &on,
+            funding,
+        )?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(Self {
             left,
             right,
@@ -200,8 +212,14 @@ impl SortMergeJoinExec {
             right_sort_exprs,
             sort_options,
             null_equality,
-            cache: Arc::new(cache),
+            cache,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Get probe side (e.g streaming side) information for this sort merge join.
@@ -225,20 +243,18 @@ impl SortMergeJoinExec {
     }
 
     /// Calculate order preservation flags for this sort merge join.
-    fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
+    fn maintains_input_order(join_type: JoinType) -> [bool; 2] {
         match join_type {
-            JoinType::Inner => vec![true, false],
+            JoinType::Inner => [true, false],
             JoinType::Left
             | JoinType::LeftSemi
             | JoinType::LeftAnti
-            | JoinType::LeftMark => vec![true, false],
+            | JoinType::LeftMark => [true, false],
             JoinType::Right
             | JoinType::RightSemi
             | JoinType::RightAnti
-            | JoinType::RightMark => {
-                vec![false, true]
-            }
-            _ => vec![false, false],
+            | JoinType::RightMark => [false, true],
+            _ => [false, false],
         }
     }
 
@@ -284,6 +300,7 @@ impl SortMergeJoinExec {
         schema: SchemaRef,
         join_type: JoinType,
         join_on: JoinOnRef,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let eq_properties = join_equivalence_properties(
@@ -294,10 +311,11 @@ impl SortMergeJoinExec {
             &Self::maintains_input_order(join_type),
             Some(Self::probe_side(&join_type)),
             join_on,
+            funding,
         )?;
 
         let output_partitioning =
-            symmetric_join_output_partitioning(left, right, &join_type)?;
+            symmetric_join_output_partitioning(left, right, &join_type, funding)?;
 
         Ok(PlanProperties::new(
             eq_properties,
@@ -313,19 +331,26 @@ impl SortMergeJoinExec {
     /// operators on the join's children. Check [`super::super::HashJoinExec::swap_inputs`]
     /// for more details.
     pub fn swap_inputs(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        let funding = &self.funding;
         let left = self.left();
         let right = self.right();
+        let mut on = funding.held::<Vec<_>>();
+        on.reserve_exact(self.on.len())?;
+        for (l, r) in self.on() {
+            on.push((Arc::clone(r), Arc::clone(l)))?;
+        }
         let new_join = SortMergeJoinExec::try_new(
             Arc::clone(right),
             Arc::clone(left),
-            self.on()
-                .iter()
-                .map(|(l, r)| (Arc::clone(r), Arc::clone(l)))
-                .collect::<Vec<_>>(),
-            self.filter().as_ref().map(JoinFilter::swap),
+            on.keep(),
+            self.filter()
+                .as_ref()
+                .map(|filter| filter.swap(funding))
+                .transpose()?,
             self.join_type().swap(),
-            self.sort_options.clone(),
+            funding.vec_from_slice(&self.sort_options)?,
             self.null_equality,
+            funding,
         )?;
 
         // TODO: OR this condition with having a built-in projection (like
@@ -339,9 +364,14 @@ impl SortMergeJoinExec {
                 | JoinType::LeftMark
                 | JoinType::RightMark
         ) {
-            Ok(Arc::new(new_join))
+            Ok(funding.arc(new_join)?)
         } else {
-            reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
+            reorder_output_after_swap(
+                funding.arc(new_join)?,
+                &left.schema(),
+                &right.schema(),
+                funding,
+            )
         }
     }
 }
@@ -433,7 +463,7 @@ impl ExecutionPlan for SortMergeJoinExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        Self::maintains_input_order(self.join_type)
+        Self::maintains_input_order(self.join_type).to_vec()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -459,23 +489,48 @@ impl ExecutionPlan for SortMergeJoinExec {
             ChildrenPropertiesMode::Keep => {
                 let left = children.swap_remove(0);
                 let right = children.swap_remove(0);
-                Ok(Arc::new(Self {
+                let funding = &self.funding;
+                let on = funding.vec_from_slice(&self.on)?;
+                let filter = self
+                    .filter
+                    .as_ref()
+                    .map(|filter| filter.funded_clone(funding))
+                    .transpose()?;
+                let sort_options = funding.vec_from_slice(&self.sort_options)?;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(funding.arc(Self {
                     left,
                     right,
+                    on,
+                    filter,
+                    join_type: self.join_type,
+                    schema: Arc::clone(&self.schema),
                     metrics: ExecutionPlanMetricsSet::new(),
-                    ..Self::clone(&*self)
-                }))
+                    left_sort_exprs: self.left_sort_exprs.clone(),
+                    right_sort_exprs: self.right_sort_exprs.clone(),
+                    sort_options,
+                    null_equality: self.null_equality,
+                    cache: Arc::clone(&self.cache),
+                    funding: funding.clone(),
+                })?)
             }
             ChildrenPropertiesMode::Recompute => match &children[..] {
-                [left, right] => Ok(Arc::new(SortMergeJoinExec::try_new(
-                    Arc::clone(left),
-                    Arc::clone(right),
-                    self.on.clone(),
-                    self.filter.clone(),
-                    self.join_type,
-                    self.sort_options.clone(),
-                    self.null_equality,
-                )?)),
+                [left, right] => {
+                    let funding = &self.funding;
+                    Ok(funding.arc(SortMergeJoinExec::try_new(
+                        Arc::clone(left),
+                        Arc::clone(right),
+                        funding.vec_from_slice(&self.on)?,
+                        self.filter
+                            .as_ref()
+                            .map(|filter| filter.funded_clone(funding))
+                            .transpose()?,
+                        self.join_type,
+                        funding.vec_from_slice(&self.sort_options)?,
+                        self.null_equality,
+                        funding,
+                    )?)?)
+                }
                 _ => internal_err!("SortMergeJoin wrong number of children"),
             },
         }
@@ -668,15 +723,22 @@ impl ExecutionPlan for SortMergeJoinExec {
             self.children()[1],
         )?;
 
-        Ok(Some(Arc::new(SortMergeJoinExec::try_new(
-            Arc::new(new_left),
-            Arc::new(new_right),
-            new_on,
-            self.filter.clone(),
-            self.join_type,
-            self.sort_options.clone(),
-            self.null_equality,
-        )?)))
+        let funding = &self.funding;
+        Ok(Some(
+            funding.arc(SortMergeJoinExec::try_new(
+                funding.arc(new_left)?,
+                funding.arc(new_right)?,
+                new_on,
+                self.filter
+                    .as_ref()
+                    .map(|filter| filter.funded_clone(funding))
+                    .transpose()?,
+                self.join_type,
+                funding.vec_from_slice(&self.sort_options)?,
+                self.null_equality,
+                funding,
+            )?)?,
+        ))
     }
 
     #[cfg(feature = "proto")]
@@ -821,6 +883,7 @@ impl SortMergeJoinExec {
             join_type,
             sort_options,
             null_equality,
+            &Funding::default(),
         )?))
     }
 }

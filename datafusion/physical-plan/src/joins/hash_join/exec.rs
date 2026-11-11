@@ -75,13 +75,13 @@ use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
-use arrow_schema::{DataType, Schema};
+use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::memory::{RecordBatchMemoryCounter, estimate_memory_size};
 use datafusion_common::{
-    JoinSide, JoinType, NullEquality, Result, assert_or_internal_err, internal_err,
-    plan_err, project_schema,
+    JoinSide, JoinType, NullEquality, Result, ScalarValue, assert_or_internal_err,
+    internal_err, plan_err, project_schema,
 };
 use datafusion_execution::TaskContext;
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
@@ -90,7 +90,7 @@ use datafusion_functions_aggregate_common::min_max::{MaxAccumulator, MinAccumula
 use datafusion_physical_expr::equivalence::{
     ProjectionMapping, join_equivalence_properties,
 };
-use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, lit};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion_physical_expr::projection::{ProjectionRef, combine_projections};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
@@ -292,21 +292,25 @@ pub struct HashJoinExecBuilder {
 }
 
 impl HashJoinExecBuilder {
-    /// Make a new [`HashJoinExecBuilder`].
+    /// Make a new [`HashJoinExecBuilder`], charging what it allocates, and what the
+    /// node it builds allocates, to `funding`.
     pub fn new(
         left: Arc<dyn ExecutionPlan>,
         right: Arc<dyn ExecutionPlan>,
         on: Vec<(PhysicalExprRef, PhysicalExprRef)>,
         join_type: JoinType,
-    ) -> Self {
-        Self {
+        funding: &Funding,
+    ) -> Result<Self> {
+        let left_fut = funding.arc(OnceAsync::default())?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+        Ok(Self {
             exec: HashJoinExec {
                 left,
                 right,
                 on,
                 filter: None,
                 join_type,
-                left_fut: Default::default(),
+                left_fut,
                 random_state: HASH_JOIN_SEED,
                 mode: PartitionMode::Auto,
                 fetch: None,
@@ -318,12 +322,13 @@ impl HashJoinExecBuilder {
                 dynamic_filter: None,
                 // Will be computed at when plan will be built.
                 cache: stub_properties(),
-                join_schema: Arc::new(Schema::empty()),
+                join_schema: Arc::clone(stub_properties().schema()),
+                funding: funding.clone(),
             },
             // As `exec` is initialized with stub properties,
             // they will be properly computed when plan will be built.
             preserve_properties: false,
-        }
+        })
     }
 
     /// Set join type.
@@ -333,9 +338,12 @@ impl HashJoinExecBuilder {
         self
     }
 
-    /// Set projection from the vector.
-    pub fn with_projection(self, projection: Option<Vec<usize>>) -> Self {
-        self.with_projection_ref(projection.map(Into::into))
+    /// Set projection from the vector, its shared copy charged first.
+    pub fn with_projection(self, projection: Option<Vec<usize>>) -> Result<Self> {
+        let projection = projection
+            .map(|projection| self.exec.funding.arc_from_vec(projection))
+            .transpose()?;
+        Ok(self.with_projection_ref(projection))
     }
 
     /// Set projection from the shared reference.
@@ -414,7 +422,9 @@ impl HashJoinExecBuilder {
 
     /// Build result as a dyn execution plan.
     pub fn build_exec(self) -> Result<Arc<dyn ExecutionPlan>> {
-        self.build().map(|p| Arc::new(p) as _)
+        let exec = self.build()?;
+        let funding = exec.funding.clone();
+        Ok(funding.arc(exec)?)
     }
 
     /// Build resulting execution plan.
@@ -460,11 +470,13 @@ impl HashJoinExecBuilder {
             null_aware,
             dynamic_filter,
             fetch,
+            funding,
             // Recomputed.
             join_schema: _,
-            column_indices: _,
+            column_indices: replaced_column_indices,
             cache: _,
         } = exec;
+        funding.released(replaced_column_indices);
 
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -474,9 +486,9 @@ impl HashJoinExecBuilder {
 
         check_join_is_valid(&left_schema, &right_schema, &on)?;
         let (join_schema, column_indices) =
-            build_join_schema(&left_schema, &right_schema, &join_type);
+            build_join_schema(&left_schema, &right_schema, &join_type, &funding)?;
 
-        let join_schema = Arc::new(join_schema);
+        let join_schema = funding.arc(join_schema)?;
 
         // Check if the projection is valid.
         can_project(&join_schema, projection.as_deref())?;
@@ -489,7 +501,9 @@ impl HashJoinExecBuilder {
             &on,
             mode,
             projection.as_deref(),
+            &funding,
         )?;
+        let cache = funding.arc(cache)?;
 
         Ok(HashJoinExec {
             left,
@@ -506,42 +520,16 @@ impl HashJoinExecBuilder {
             column_indices,
             null_equality,
             null_aware,
-            cache: Arc::new(cache),
+            cache,
             dynamic_filter,
             fetch,
+            funding,
         })
     }
 
     fn with_dynamic_filter(mut self, filter: Option<HashJoinExecDynamicFilter>) -> Self {
         self.exec.dynamic_filter = filter;
         self
-    }
-}
-
-impl From<&HashJoinExec> for HashJoinExecBuilder {
-    fn from(exec: &HashJoinExec) -> Self {
-        Self {
-            exec: HashJoinExec {
-                left: Arc::clone(exec.left()),
-                right: Arc::clone(exec.right()),
-                on: exec.on.clone(),
-                filter: exec.filter.clone(),
-                join_type: exec.join_type,
-                join_schema: Arc::clone(&exec.join_schema),
-                left_fut: Arc::clone(&exec.left_fut),
-                random_state: exec.random_state.clone(),
-                mode: exec.mode,
-                metrics: exec.metrics.clone(),
-                projection: exec.projection.clone(),
-                column_indices: exec.column_indices.clone(),
-                null_equality: exec.null_equality,
-                null_aware: exec.null_aware,
-                cache: Arc::clone(&exec.cache),
-                dynamic_filter: exec.dynamic_filter.clone(),
-                fetch: exec.fetch,
-            },
-            preserve_properties: true,
-        }
     }
 }
 
@@ -780,6 +768,8 @@ pub struct HashJoinExec {
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
     /// Maximum number of rows to return
     fetch: Option<usize>,
+    /// The handle the node, and the nodes rebuilt from it, are charged to
+    funding: Funding,
 }
 
 #[derive(Clone)]
@@ -835,10 +825,11 @@ impl HashJoinExec {
         partition_mode: PartitionMode,
         null_equality: NullEquality,
         null_aware: bool,
+        funding: &Funding,
     ) -> Result<Self> {
-        HashJoinExecBuilder::new(left, right, on, *join_type)
+        HashJoinExecBuilder::new(left, right, on, *join_type, funding)?
             .with_filter(filter)
-            .with_projection(projection)
+            .with_projection(projection)?
             .with_partition_mode(partition_mode)
             .with_null_equality(null_equality)
             .with_null_aware(null_aware)
@@ -849,17 +840,62 @@ impl HashJoinExec {
     ///
     /// Returned builder preserves all existing fields. If a field requiring properties
     /// recomputation is modified, this will be done automatically during the node build.
+    /// The copies it makes are charged to the node's funding first.
     ///
-    pub fn builder(&self) -> HashJoinExecBuilder {
-        self.into()
+    pub fn builder(&self) -> Result<HashJoinExecBuilder> {
+        let funding = &self.funding;
+        Ok(HashJoinExecBuilder {
+            exec: HashJoinExec {
+                left: Arc::clone(&self.left),
+                right: Arc::clone(&self.right),
+                on: funding.vec_from_slice(&self.on)?,
+                filter: self
+                    .filter
+                    .as_ref()
+                    .map(|filter| filter.funded_clone(funding))
+                    .transpose()?,
+                join_type: self.join_type,
+                join_schema: Arc::clone(&self.join_schema),
+                left_fut: Arc::clone(&self.left_fut),
+                random_state: self.random_state.clone(),
+                mode: self.mode,
+                metrics: self.metrics.clone(),
+                projection: self.projection.clone(),
+                column_indices: funding.vec_from_slice(&self.column_indices)?,
+                null_equality: self.null_equality,
+                null_aware: self.null_aware,
+                cache: Arc::clone(&self.cache),
+                dynamic_filter: self.dynamic_filter.clone(),
+                fetch: self.fetch,
+                funding: funding.clone(),
+            },
+            preserve_properties: true,
+        })
     }
 
-    fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
+    }
+
+    fn create_dynamic_filter(
+        on: &JoinOn,
+        funding: &Funding,
+    ) -> Result<Arc<DynamicFilterPhysicalExpr>> {
         // Extract the right-side keys (probe side keys) from the `on` clauses
         // Dynamic filter will be created from build side values (left side) and applied to probe side (right side)
-        let right_keys: Vec<_> = on.iter().map(|(_, r)| Arc::clone(r)).collect();
+        let mut right_keys = funding.held::<Vec<_>>();
+        right_keys.reserve_exact(on.len())?;
+        for (_, right_key) in on {
+            right_keys.push(Arc::clone(right_key))?;
+        }
         // Initialize with a placeholder expression (true) that will be updated when the hash table is built
-        Arc::new(DynamicFilterPhysicalExpr::new(right_keys, lit(true)))
+        let placeholder: Arc<dyn PhysicalExpr> =
+            funding.arc(Literal::new(ScalarValue::Boolean(Some(true)), funding)?)?;
+        funding.arc(DynamicFilterPhysicalExpr::new(
+            right_keys.keep(),
+            placeholder,
+        ))
     }
 
     fn allow_join_dynamic_filter_pushdown(&self, config: &ConfigOptions) -> bool {
@@ -1009,8 +1045,8 @@ impl HashJoinExec {
     }
 
     /// Calculate order preservation flags for this hash join.
-    fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
-        vec![
+    fn maintains_input_order(join_type: JoinType) -> [bool; 2] {
+        [
             false,
             matches!(
                 join_type,
@@ -1036,12 +1072,15 @@ impl HashJoinExec {
 
     /// Return new instance of [HashJoinExec] with the given projection.
     pub fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
-        let projection = projection.map(Into::into);
+        let funding = &self.funding;
+        let projection = projection
+            .map(|projection| funding.arc_from_vec(projection))
+            .transpose()?;
         //  check if the projection is valid
         can_project(&self.schema(), projection.as_deref())?;
         let projection =
-            combine_projections(projection.as_ref(), self.projection.as_ref())?;
-        self.builder().with_projection_ref(projection).build()
+            combine_projections(projection.as_ref(), self.projection.as_ref(), funding)?;
+        self.builder()?.with_projection_ref(projection).build()
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
@@ -1053,6 +1092,7 @@ impl HashJoinExec {
         on: JoinOnRef,
         mode: PartitionMode,
         projection: Option<&[usize]>,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let mut eq_properties = join_equivalence_properties(
@@ -1063,17 +1103,18 @@ impl HashJoinExec {
             &Self::maintains_input_order(join_type),
             Some(Self::probe_side()),
             on,
+            funding,
         )?;
 
         let mut output_partitioning = match mode {
             PartitionMode::CollectLeft => {
-                asymmetric_join_output_partitioning(left, right, &join_type)?
+                asymmetric_join_output_partitioning(left, right, &join_type, funding)?
             }
             PartitionMode::Auto => Partitioning::UnknownPartitioning(
                 right.output_partitioning().partition_count(),
             ),
             PartitionMode::Partitioned => {
-                symmetric_join_output_partitioning(left, right, &join_type)?
+                symmetric_join_output_partitioning(left, right, &join_type, funding)?
             }
         };
 
@@ -1104,7 +1145,7 @@ impl HashJoinExec {
         if let Some(projection) = projection {
             // construct a map from the input expressions to the output expression of the Projection
             let projection_mapping =
-                ProjectionMapping::from_indices(projection, schema, &Funding::default())?;
+                ProjectionMapping::from_indices(projection, schema, funding)?;
             let out_schema = project_schema(schema, Some(&projection))?;
             output_partitioning =
                 output_partitioning.project(&projection_mapping, &eq_properties);
@@ -1152,25 +1193,32 @@ impl HashJoinExec {
              Optimizer rules that reorder join inputs must run before optimizer rules `FilterPushdown::new_post_optimization()`"
         );
 
+        let funding = &self.funding;
         let left = self.left();
         let right = self.right();
+        let mut on = funding.held::<Vec<_>>();
+        on.reserve_exact(self.on.len())?;
+        for (l, r) in self.on() {
+            on.push((Arc::clone(r), Arc::clone(l)))?;
+        }
+        let filter = self
+            .filter()
+            .map(|filter| filter.swap(funding))
+            .transpose()?;
+        let projection = swap_join_projection(
+            left.schema().fields().len(),
+            right.schema().fields().len(),
+            self.projection.as_deref(),
+            self.join_type(),
+            funding,
+        )?;
         let new_join = self
-            .builder()
+            .builder()?
             .with_type(self.join_type.swap())
-            .with_new_children(vec![Arc::clone(right), Arc::clone(left)])?
-            .with_on(
-                self.on()
-                    .iter()
-                    .map(|(l, r)| (Arc::clone(r), Arc::clone(l)))
-                    .collect(),
-            )
-            .with_filter(self.filter().map(JoinFilter::swap))
-            .with_projection(swap_join_projection(
-                left.schema().fields().len(),
-                right.schema().fields().len(),
-                self.projection.as_deref(),
-                self.join_type(),
-            ))
+            .with_new_children(funding.vec_of([Arc::clone(right), Arc::clone(left)])?)?
+            .with_on(on.keep())
+            .with_filter(filter)
+            .with_projection(projection)?
             .with_partition_mode(partition_mode)
             .build()?;
         // In case of anti / semi joins or if there is embedded projection in HashJoinExec, output column order is preserved, no need to add projection again
@@ -1184,9 +1232,14 @@ impl HashJoinExec {
                 | JoinType::RightMark
         ) || self.projection.is_some()
         {
-            Ok(Arc::new(new_join))
+            Ok(funding.arc(new_join)?)
         } else {
-            reorder_output_after_swap(Arc::new(new_join), &left.schema(), &right.schema())
+            reorder_output_after_swap(
+                funding.arc(new_join)?,
+                &left.schema(),
+                &right.schema(),
+                funding,
+            )
         }
     }
 }
@@ -1339,7 +1392,7 @@ impl ExecutionPlan for HashJoinExec {
     // are processed sequentially in the probe phase, and unmatched rows are directly output
     // as results, these results tend to retain the order of the probe side table.
     fn maintains_input_order(&self) -> Vec<bool> {
-        Self::maintains_input_order(self.join_type)
+        Self::maintains_input_order(self.join_type).to_vec()
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1388,10 +1441,10 @@ impl ExecutionPlan for HashJoinExec {
         validate_child_count!(self, children);
         match options.children_properties {
             ChildrenPropertiesMode::Keep => {
-                self.builder().with_new_children(children)?.build_exec()
+                self.builder()?.with_new_children(children)?.build_exec()
             }
             ChildrenPropertiesMode::Recompute => self
-                .builder()
+                .builder()?
                 .recompute_properties()
                 .with_new_children(children)?
                 .build_exec(),
@@ -1409,7 +1462,7 @@ impl ExecutionPlan for HashJoinExec {
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
-        self.builder().reset_state().build_exec()
+        self.builder()?.reset_state().build_exec()
     }
 
     fn execute(
@@ -1655,15 +1708,16 @@ impl ExecutionPlan for HashJoinExec {
             self.filter(),
             self.column_indices.as_slice(),
         )? {
-            self.builder()
-                .with_new_children(vec![
-                    Arc::new(projected_left_child),
-                    Arc::new(projected_right_child),
-                ])?
+            let funding = &self.funding;
+            self.builder()?
+                .with_new_children(funding.vec_of([
+                    funding.arc(projected_left_child)? as Arc<dyn ExecutionPlan>,
+                    funding.arc(projected_right_child)?,
+                ])?)?
                 .with_on(join_on)
                 .with_filter(join_filter)
                 // Returned early if projection is not None
-                .with_projection(None)
+                .with_projection(None)?
                 .build_exec()
                 .map(Some)
         } else {
@@ -1781,7 +1835,7 @@ impl ExecutionPlan for HashJoinExec {
             && self.allow_join_dynamic_filter_pushdown(config)
         {
             // Add actual dynamic filter to right side (probe side)
-            let dynamic_filter = Self::create_dynamic_filter(&self.on);
+            let dynamic_filter = Self::create_dynamic_filter(&self.on, &config.funding)?;
             right_child = right_child.with_self_filter(dynamic_filter);
         }
 
@@ -1809,7 +1863,7 @@ impl ExecutionPlan for HashJoinExec {
             {
                 // We successfully pushed down our self filter - we need to make a new node with the dynamic filter
                 let new_node = self
-                    .builder()
+                    .builder()?
                     .with_dynamic_filter(Some(HashJoinExecDynamicFilter {
                         filter: dynamic_filter,
                         build_accumulator: OnceLock::new(),
@@ -1833,11 +1887,7 @@ impl ExecutionPlan for HashJoinExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        self.builder()
-            .with_fetch(limit)
-            .build()
-            .ok()
-            .map(|exec| Arc::new(exec) as _)
+        self.builder().ok()?.with_fetch(limit).build_exec().ok()
     }
     #[cfg(feature = "proto")]
     fn try_to_proto(
@@ -2021,14 +2071,15 @@ impl HashJoinExec {
             })
             .transpose()?;
 
-        let mut hash_join = HashJoinExecBuilder::new(left, right, on, join_type)
-            .with_filter(filter)
-            .with_projection(projection)
-            .with_partition_mode(partition_mode)
-            .with_null_equality(null_equality)
-            .with_null_aware(hashjoin.null_aware)
-            .with_fetch(fetch)
-            .build()?;
+        let mut hash_join =
+            HashJoinExecBuilder::new(left, right, on, join_type, &Funding::default())?
+                .with_filter(filter)
+                .with_projection(projection)?
+                .with_partition_mode(partition_mode)
+                .with_null_equality(null_equality)
+                .with_null_aware(hashjoin.null_aware)
+                .with_fetch(fetch)
+                .build()?;
 
         if let Some(dynamic_filter_proto) = &hashjoin.dynamic_filter {
             // The dynamic filter is a `DynamicFilterPhysicalExpr` over the probe
@@ -2487,7 +2538,7 @@ mod tests {
         Date32Array, Int32Array, Int64Array, StructArray, UInt32Array, UInt64Array,
     };
     use arrow::buffer::NullBuffer;
-    use arrow::datatypes::{DataType, Field};
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::hash_utils::create_hashes;
     use datafusion_common::test_util::{batches_to_sort_string, batches_to_string};
     use datafusion_common::{
@@ -2497,7 +2548,7 @@ mod tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use datafusion_expr::Operator;
-    use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
+    use datafusion_physical_expr::expressions::{BinaryExpr, lit};
     use datafusion_physical_expr::{
         EquivalenceProperties, PhysicalSortExpr, RangePartitioning, SplitPoint,
     };
@@ -2664,6 +2715,7 @@ mod tests {
             PartitionMode::CollectLeft,
             null_equality,
             false,
+            &Funding::default(),
         )
     }
 
@@ -2685,6 +2737,7 @@ mod tests {
             PartitionMode::CollectLeft,
             null_equality,
             false,
+            &Funding::default(),
         )
     }
 
@@ -2793,7 +2846,8 @@ mod tests {
         join_type: JoinType,
         mode: PartitionMode,
     ) -> Result<(HashJoinExec, Arc<DynamicFilterPhysicalExpr>)> {
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter =
+            HashJoinExec::create_dynamic_filter(&on, &Funding::default())?;
         let consumer: Arc<dyn PhysicalExpr> = Arc::clone(&dynamic_filter) as _;
         let right = Arc::new(
             FilterExecBuilder::new(consumer, right, &Funding::default()).build()?,
@@ -2808,6 +2862,7 @@ mod tests {
             mode,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
         join.dynamic_filter = Some(HashJoinExecDynamicFilter {
             filter: Arc::clone(&dynamic_filter),
@@ -2918,6 +2973,7 @@ mod tests {
             partition_mode,
             null_equality,
             false,
+            &Funding::default(),
         )?;
 
         let columns = columns(&join.schema());
@@ -6106,6 +6162,7 @@ mod tests {
                 PartitionMode::Partitioned,
                 NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )?;
 
             let stream = join.execute(1, task_ctx)?;
@@ -6450,6 +6507,7 @@ mod tests {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
 
         let batches = tokio::time::timeout(
@@ -6777,6 +6835,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true, // null_aware = true
+            &Funding::default(),
         )?;
 
         let stream = join.execute(0, task_ctx)?;
@@ -6827,6 +6886,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true, // null_aware = true
+            &Funding::default(),
         )?;
 
         let stream = join.execute(0, task_ctx)?;
@@ -6879,6 +6939,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true, // null_aware = true
+            &Funding::default(),
         )?;
 
         let stream = join.execute(0, task_ctx)?;
@@ -6922,6 +6983,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true, // null_aware = true (invalid for Inner join)
+            &Funding::default(),
         );
 
         assert!(result.is_err());
@@ -6962,6 +7024,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true, // null_aware = true (invalid for multi-column)
+            &Funding::default(),
         );
 
         assert!(result.is_err());
@@ -7003,6 +7066,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
         assert!(join.dynamic_expressions_produced().is_empty());
 
@@ -7041,7 +7105,8 @@ mod tests {
             Arc::new(Column::new_with_schema("r_key", &right.schema())?) as _,
         )];
 
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter =
+            HashJoinExec::create_dynamic_filter(&on, &Funding::default())?;
         let join = HashJoinExec::try_new(
             left,
             right,
@@ -7052,6 +7117,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?
         .with_dynamic_filter_expr(dynamic_filter)?;
 
@@ -7085,6 +7151,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNull,
             false,
+            &Funding::default(),
         )?;
 
         // Null-equal joins keep dynamic filter pushdown: the pushed predicate carries an
@@ -7126,6 +7193,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true,
+            &Funding::default(),
         )?;
 
         assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
@@ -7160,6 +7228,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             true,
+            &Funding::default(),
         )?;
 
         assert!(join.allow_join_dynamic_filter_pushdown(session_config.options()));
@@ -7207,6 +7276,7 @@ mod tests {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
         Ok((join, on))
     }
@@ -7215,7 +7285,7 @@ mod tests {
         join: &HashJoinExec,
         on: &JoinOn,
     ) -> Result<HashJoinExec> {
-        join.builder()
+        join.builder()?
             .with_new_children(vec![
                 Arc::new(PartitionedTestExec::try_new(
                     join.left().schema(),
@@ -7295,6 +7365,7 @@ mod tests {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
 
         // Column index 99 is out of bounds for the right (probe) side schema.

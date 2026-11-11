@@ -247,6 +247,7 @@ async fn test_static_filter_pushdown_through_hash_join() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -317,6 +318,7 @@ async fn test_static_filter_pushdown_through_hash_join() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1143,6 +1145,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1367,6 +1370,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_range_partitioned() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1506,6 +1510,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
             PartitionMode::CollectLeft,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1625,6 +1630,7 @@ fn test_hashjoin_parent_filter_pushdown_same_column_names() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1692,6 +1698,7 @@ fn test_hashjoin_parent_filter_pushdown_mark_join() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1765,6 +1772,7 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1812,6 +1820,7 @@ fn test_hashjoin_parent_filter_pushdown_semi_anti_join() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2824,6 +2833,7 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -2932,6 +2942,7 @@ async fn test_hashjoin_hash_table_pushdown_partitioned() {
             PartitionMode::Partitioned,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -3040,6 +3051,7 @@ async fn test_hashjoin_hash_table_pushdown_collect_left() {
             PartitionMode::CollectLeft,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -3173,6 +3185,7 @@ fn test_hashjoin_dynamic_filter_pushdown_is_used() {
                 PartitionMode::CollectLeft,
                 datafusion_common::NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )
             .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
@@ -3370,6 +3383,7 @@ async fn test_discover_dynamic_filters_via_expressions_api() {
             PartitionMode::CollectLeft,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     ) as Arc<dyn ExecutionPlan>;
@@ -3452,6 +3466,7 @@ fn test_discover_dynamic_expression_producers() {
             PartitionMode::CollectLeft,
             datafusion_common::NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     ) as Arc<dyn ExecutionPlan>;

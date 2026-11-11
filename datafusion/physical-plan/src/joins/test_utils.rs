@@ -108,6 +108,7 @@ pub async fn partitioned_sym_join_with_filter(
         left.output_ordering().cloned(),
         right.output_ordering().cloned(),
         StreamJoinPartitionMode::Partitioned,
+        &Funding::default(),
     )?;
 
     let mut batches = vec![];
@@ -158,6 +159,7 @@ pub async fn partitioned_hash_join_with_filter(
         PartitionMode::Partitioned,
         null_equality,
         false, // null_aware
+        &Funding::default(),
     )?);
 
     let mut batches = vec![];

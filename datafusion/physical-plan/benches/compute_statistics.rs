@@ -161,7 +161,7 @@ fn build_cross_join_tree(depth: usize, next_col: &mut usize) -> Arc<dyn Executio
     }
     let left = build_cross_join_tree(depth - 1, next_col);
     let right = build_cross_join_tree(depth - 1, next_col);
-    Arc::new(CrossJoinExec::new(left, right))
+    Arc::new(CrossJoinExec::new(left, right, &Funding::default()).unwrap())
 }
 
 /// Build: Filter^depth -> BenchLeaf (always-true predicate).

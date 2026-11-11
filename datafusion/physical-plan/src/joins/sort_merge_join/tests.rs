@@ -241,6 +241,7 @@ fn join(
         join_type,
         sort_options,
         NullEquality::NullEqualsNothing,
+        &Funding::default(),
     )
 }
 
@@ -260,6 +261,7 @@ fn join_with_options(
         join_type,
         sort_options,
         null_equality,
+        &Funding::default(),
     )
 }
 
@@ -280,6 +282,7 @@ fn join_with_filter(
         join_type,
         sort_options,
         null_equality,
+        &Funding::default(),
     )
 }
 
@@ -3574,6 +3577,7 @@ async fn join_get_stream_and_get_expected(
             PartitionMode::Partitioned,
             null_equality,
             false,
+            &Funding::default(),
         )?;
 
         let stream = oracle.execute(0, Arc::clone(&task_ctx))?;
@@ -3591,6 +3595,7 @@ async fn join_get_stream_and_get_expected(
         join_type,
         sort_options,
         null_equality,
+        &Funding::default(),
     )?;
 
     let stream = join.execute(0, task_ctx)?;
@@ -4970,6 +4975,7 @@ async fn bitwise_spill_with_filter() -> Result<()> {
                 join_type,
                 sort_options.clone(),
                 NullEquality::NullEqualsNothing,
+                &Funding::default(),
             )?;
             let stream = join.execute(0, task_ctx)?;
             let spilled_result = common::collect(stream).await.unwrap();
@@ -5019,6 +5025,7 @@ async fn bitwise_spill_with_filter() -> Result<()> {
                 join_type,
                 sort_options.clone(),
                 NullEquality::NullEqualsNothing,
+                &Funding::default(),
             )?;
             let stream = join_no_spill.execute(0, task_ctx_no_spill)?;
             let no_spill_result = common::collect(stream).await.unwrap();
@@ -5087,6 +5094,7 @@ async fn bitwise_multi_spill_inner_key_group() -> Result<()> {
         LeftSemi,
         sort_options,
         NullEquality::NullEqualsNothing,
+        &Funding::default(),
     )?;
     let stream = join.execute(0, task_ctx)?;
     let batches = common::collect(stream).await?;
@@ -5757,6 +5765,7 @@ async fn bitwise_spill_pending_stream() -> Result<()> {
             join_type,
             sort_options.clone(),
             NullEquality::NullEqualsNothing,
+            &Funding::default(),
         )?;
         let stream = join.execute(0, task_ctx)?;
         let spilled_result = common::collect(stream).await.unwrap();
@@ -5776,6 +5785,7 @@ async fn bitwise_spill_pending_stream() -> Result<()> {
             join_type,
             sort_options.clone(),
             NullEquality::NullEqualsNothing,
+            &Funding::default(),
         )?;
         let stream = join_no_spill.execute(0, task_ctx_no_spill)?;
         let no_spill_result = common::collect(stream).await.unwrap();

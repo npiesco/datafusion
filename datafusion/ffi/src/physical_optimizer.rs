@@ -352,7 +352,6 @@ impl PhysicalOptimizerRule for ForeignPhysicalOptimizerRule {
 
 #[cfg(test)]
 mod tests {
-    use datafusion_common::funding::Funding;
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
@@ -426,7 +425,7 @@ mod tests {
     fn create_test_plan() -> Arc<dyn ExecutionPlan> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("a", DataType::Float32, false)]));
-        Arc::new(EmptyExec::new(schema, &Funding::default()).unwrap())
+        Arc::new(EmptyExec::new(schema))
     }
 
     #[test]

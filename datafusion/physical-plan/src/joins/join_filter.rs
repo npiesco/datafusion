@@ -18,6 +18,8 @@
 use crate::joins::utils::ColumnIndex;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::JoinSide;
+use datafusion_common::Result;
+use datafusion_common::funding::Funding;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use std::{fmt::Display, sync::Arc};
 
@@ -55,22 +57,35 @@ impl JoinFilter {
         }
     }
 
-    /// Helper for building ColumnIndex vector from left and right indices
+    /// Helper for building ColumnIndex vector from left and right indices, charged to
+    /// `funding` first; the index vectors are given back.
     pub fn build_column_indices(
         left_indices: Vec<usize>,
         right_indices: Vec<usize>,
-    ) -> Vec<ColumnIndex> {
-        left_indices
-            .into_iter()
-            .map(|i| ColumnIndex {
-                index: i,
-                side: JoinSide::Left,
-            })
-            .chain(right_indices.into_iter().map(|i| ColumnIndex {
-                index: i,
-                side: JoinSide::Right,
-            }))
-            .collect()
+        funding: &Funding,
+    ) -> Result<Vec<ColumnIndex>> {
+        let mut column_indices = funding.held::<Vec<ColumnIndex>>();
+        column_indices.reserve_exact(left_indices.len() + right_indices.len())?;
+        for (indices, side) in [
+            (&left_indices, JoinSide::Left),
+            (&right_indices, JoinSide::Right),
+        ] {
+            for &index in indices {
+                column_indices.push(ColumnIndex { index, side })?;
+            }
+        }
+        funding.released(left_indices);
+        funding.released(right_indices);
+        Ok(column_indices.keep())
+    }
+
+    /// A copy of this filter, its column indices charged to `funding` first.
+    pub fn funded_clone(&self, funding: &Funding) -> Result<JoinFilter> {
+        Ok(JoinFilter::new(
+            Arc::clone(&self.expression),
+            funding.vec_from_slice(&self.column_indices)?,
+            Arc::clone(&self.schema),
+        ))
     }
 
     /// Filter expression
@@ -88,21 +103,22 @@ impl JoinFilter {
         &self.schema
     }
 
-    /// Rewrites the join filter if the inputs to the join are rewritten
-    pub fn swap(&self) -> JoinFilter {
-        let column_indices = self
-            .column_indices()
-            .iter()
-            .map(|idx| ColumnIndex {
+    /// Rewrites the join filter if the inputs to the join are rewritten, the new column
+    /// indices charged to `funding` first
+    pub fn swap(&self, funding: &Funding) -> Result<JoinFilter> {
+        let mut column_indices = funding.held::<Vec<ColumnIndex>>();
+        column_indices.reserve_exact(self.column_indices.len())?;
+        for idx in self.column_indices() {
+            column_indices.push(ColumnIndex {
                 index: idx.index,
                 side: idx.side.negate(),
-            })
-            .collect();
+            })?;
+        }
 
-        JoinFilter::new(
+        Ok(JoinFilter::new(
             Arc::clone(self.expression()),
-            column_indices,
+            column_indices.keep(),
             Arc::clone(self.schema()),
-        )
+        ))
     }
 }

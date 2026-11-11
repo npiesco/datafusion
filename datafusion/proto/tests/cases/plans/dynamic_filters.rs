@@ -423,6 +423,7 @@ fn test_hash_join_with_dynamic_filter_roundtrip() -> Result<()> {
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?) as Arc<dyn ExecutionPlan>;
 
     // Run the optimizer rule for filter pushdown.

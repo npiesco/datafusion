@@ -1150,6 +1150,7 @@ fn hash_join_exec(
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     )

@@ -99,7 +99,12 @@ fn nested_loop_join_exec(
     join_type: JoinType,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     Ok(Arc::new(NestedLoopJoinExec::try_new(
-        left, right, None, &join_type, None,
+        left,
+        right,
+        None,
+        &join_type,
+        None,
+        &Funding::default(),
     )?))
 }
 

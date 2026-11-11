@@ -595,8 +595,9 @@ mod test {
                                                 WITH ORDER (id ASC);";
         let right_scan =
             create_scan_exec_with_statistics(Some(right_create_table_sql), Some(2)).await;
-        let cross_join: Arc<dyn ExecutionPlan> =
-            Arc::new(CrossJoinExec::new(left_scan, right_scan));
+        let cross_join: Arc<dyn ExecutionPlan> = Arc::new(
+            CrossJoinExec::new(left_scan, right_scan, &Funding::default()).unwrap(),
+        );
         let statistics = (0..cross_join.output_partitioning().partition_count())
             .map(|idx| {
                 StatisticsContext::new().compute(
@@ -707,6 +708,7 @@ mod test {
                 None,
                 &JoinType::RightSemi,
                 None,
+                &Funding::default(),
             )?);
 
         // Test partition_statistics(None) - returns overall statistics
@@ -1623,6 +1625,7 @@ mod test {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?) as Arc<dyn ExecutionPlan>;
 
         // Test partition statistics for CollectLeft mode
@@ -1704,6 +1707,7 @@ mod test {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?) as Arc<dyn ExecutionPlan>;
 
         // Test partition statistics for Partitioned mode
@@ -1783,6 +1787,7 @@ mod test {
             PartitionMode::Auto,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?) as Arc<dyn ExecutionPlan>;
 
         // Test partition statistics for Auto mode

@@ -155,7 +155,7 @@ pub fn adjust_input_keys_ordering(
                     Vec<(PhysicalExprRef, PhysicalExprRef)>,
                     Vec<SortOptions>,
                 )| {
-                    exec.builder()
+                    exec.builder()?
                         .with_partition_mode(PartitionMode::Partitioned)
                         .with_on(new_conditions.0)
                         .build_exec()
@@ -198,22 +198,25 @@ pub fn adjust_input_keys_ordering(
         requirements.children[1].data =
             shift_right_required(&requirements.data, left_columns_len)
                 .unwrap_or_default();
-    } else if let Some(SortMergeJoinExec {
-        left,
-        right,
-        on,
-        filter,
-        join_type,
-        sort_options,
-        null_equality,
-        ..
-    }) = plan.downcast_ref::<SortMergeJoinExec>()
+    } else if let Some(
+        exec @ SortMergeJoinExec {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            sort_options,
+            null_equality,
+            ..
+        },
+    ) = plan.downcast_ref::<SortMergeJoinExec>()
     {
+        let funding = exec.funding();
         let join_constructor = |new_conditions: (
             Vec<(PhysicalExprRef, PhysicalExprRef)>,
             Vec<SortOptions>,
         )| {
-            SortMergeJoinExec::try_new(
+            let join = SortMergeJoinExec::try_new(
                 Arc::clone(left),
                 Arc::clone(right),
                 new_conditions.0,
@@ -221,8 +224,9 @@ pub fn adjust_input_keys_ordering(
                 *join_type,
                 new_conditions.1,
                 *null_equality,
-            )
-            .map(|e| Arc::new(e) as _)
+                funding,
+            )?;
+            Ok(funding.arc(join)? as _)
         };
         return reorder_partitioned_join_keys(
             requirements,
@@ -485,22 +489,24 @@ pub fn reorder_join_keys_to_inputs(
                 } = join_keys;
                 let new_join_on = new_join_conditions(&left_keys, &right_keys);
                 return exec
-                    .builder()
+                    .builder()?
                     .with_partition_mode(PartitionMode::Partitioned)
                     .with_on(new_join_on)
                     .build_exec();
             }
         }
-    } else if let Some(SortMergeJoinExec {
-        left,
-        right,
-        on,
-        filter,
-        join_type,
-        sort_options,
-        null_equality,
-        ..
-    }) = plan.downcast_ref::<SortMergeJoinExec>()
+    } else if let Some(
+        smj @ SortMergeJoinExec {
+            left,
+            right,
+            on,
+            filter,
+            join_type,
+            sort_options,
+            null_equality,
+            ..
+        },
+    ) = plan.downcast_ref::<SortMergeJoinExec>()
     {
         let (join_keys, positions) = reorder_current_join_keys(
             extract_join_keys(on),
@@ -520,7 +526,8 @@ pub fn reorder_join_keys_to_inputs(
             let new_sort_options = (0..sort_options.len())
                 .map(|idx| sort_options[positions[idx]])
                 .collect();
-            return SortMergeJoinExec::try_new(
+            let funding = smj.funding();
+            let join = SortMergeJoinExec::try_new(
                 Arc::clone(left),
                 Arc::clone(right),
                 new_join_on,
@@ -528,8 +535,9 @@ pub fn reorder_join_keys_to_inputs(
                 *join_type,
                 new_sort_options,
                 *null_equality,
-            )
-            .map(|smj| Arc::new(smj) as _);
+                funding,
+            )?;
+            return Ok(funding.arc(join)? as _);
         }
     }
     Ok(plan)

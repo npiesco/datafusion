@@ -23,7 +23,7 @@ use crate::scalar_subquery::ScalarSubqueryExpr;
 use crate::{HigherOrderFunctionExpr, ScalarFunctionExpr};
 use crate::{
     PhysicalExpr,
-    expressions::{self, Column, Literal, binary, like, similar_to},
+    expressions::{self, Literal, binary, like, similar_to},
 };
 
 use arrow::datatypes::Schema;

@@ -22,6 +22,7 @@ use arrow::{
     util::bit_util,
 };
 use arrow_schema::{SchemaRef, SortOptions};
+use datafusion_common::funding::Funding;
 use datafusion_common::not_impl_err;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{JoinSide, Result, internal_err};
@@ -285,6 +286,8 @@ pub struct PiecewiseMergeJoinExec {
     cache: Arc<PlanProperties>,
     /// Number of partitions to process
     num_partitions: usize,
+    /// The handle the node, and the nodes rebuilt from it, are charged to
+    funding: Funding,
 }
 
 impl PiecewiseMergeJoinExec {
@@ -295,6 +298,7 @@ impl PiecewiseMergeJoinExec {
         operator: Operator,
         join_type: JoinType,
         num_partitions: usize,
+        funding: &Funding,
     ) -> Result<Self> {
         // TODO: Implement existence joins for PiecewiseMergeJoin
         if is_existence_join(join_type) {
@@ -331,9 +335,9 @@ impl PiecewiseMergeJoinExec {
 
         // Give the same `sort_option for comparison later`
         let left_child_plan_required_order =
-            vec![PhysicalSortExpr::new(Arc::clone(&on.0), sort_options)];
+            [PhysicalSortExpr::new(Arc::clone(&on.0), sort_options)];
         let right_batch_required_orders =
-            vec![PhysicalSortExpr::new(Arc::clone(&on.1), sort_options)];
+            [PhysicalSortExpr::new(Arc::clone(&on.1), sort_options)];
 
         let Some(left_child_plan_required_order) =
             LexOrdering::new(left_child_plan_required_order)
@@ -354,15 +358,19 @@ impl PiecewiseMergeJoinExec {
         let streamed_schema = streamed.schema();
 
         // Create output schema for the join
-        let schema =
-            Arc::new(build_join_schema(&buffered_schema, &streamed_schema, &join_type).0);
-        let cache = Self::compute_properties(
+        let (schema, column_indices) =
+            build_join_schema(&buffered_schema, &streamed_schema, &join_type, funding)?;
+        funding.released(column_indices);
+        let schema = funding.arc(schema)?;
+        let cache = funding.arc(Self::compute_properties(
             &buffered,
             &streamed,
             Arc::clone(&schema),
             join_type,
             &on,
-        )?;
+            funding,
+        )?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
 
         Ok(Self {
             streamed,
@@ -376,9 +384,15 @@ impl PiecewiseMergeJoinExec {
             left_child_plan_required_order,
             right_batch_required_orders,
             sort_options,
-            cache: Arc::new(cache),
+            cache,
             num_partitions,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// Reference to buffered side execution plan
@@ -424,6 +438,7 @@ impl PiecewiseMergeJoinExec {
         schema: SchemaRef,
         join_type: JoinType,
         join_on: &(PhysicalExprRef, PhysicalExprRef),
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         let eq_properties = join_equivalence_properties(
             buffered.equivalence_properties().clone(),
@@ -433,10 +448,11 @@ impl PiecewiseMergeJoinExec {
             &Self::maintains_input_order(join_type),
             Some(Self::probe_side(&join_type)),
             std::slice::from_ref(join_on),
+            funding,
         )?;
 
         let output_partitioning =
-            asymmetric_join_output_partitioning(buffered, streamed, &join_type)?;
+            asymmetric_join_output_partitioning(buffered, streamed, &join_type, funding)?;
 
         Ok(PlanProperties::new(
             eq_properties,
@@ -449,19 +465,19 @@ impl PiecewiseMergeJoinExec {
     // TODO: Add input order. Now they're all `false` indicating it will not maintain the input order.
     // However, for certain join types the order is maintained. This can be updated in the future after
     // more testing.
-    fn maintains_input_order(join_type: JoinType) -> Vec<bool> {
+    fn maintains_input_order(join_type: JoinType) -> [bool; 2] {
         match join_type {
             // The existence side is expected to come in sorted
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
-                vec![false, false]
+                [false, false]
             }
             JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
-                vec![false, false]
+                [false, false]
             }
             // Left, Right, Full, Inner Join is not guaranteed to maintain
             // input order as the streamed side will be sorted during
             // execution for `PiecewiseMergeJoin`
-            _ => vec![false, false],
+            _ => [false, false],
         }
     }
 
@@ -528,7 +544,9 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
             ChildrenPropertiesMode::Keep => {
                 let buffered = children.swap_remove(0);
                 let streamed = children.swap_remove(0);
-                Ok(Arc::new(Self {
+                let funding = &self.funding;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(funding.arc(Self {
                     buffered,
                     streamed,
                     on: self.on.clone(),
@@ -543,20 +561,25 @@ impl ExecutionPlan for PiecewiseMergeJoinExec {
                     cache: Arc::clone(&self.cache),
                     num_partitions: self.num_partitions,
 
+                    funding: funding.clone(),
+
                     // Re-set state.
                     metrics: ExecutionPlanMetricsSet::new(),
                     buffered_fut: Default::default(),
-                }))
+                })?)
             }
             ChildrenPropertiesMode::Recompute => match &children[..] {
-                [left, right] => Ok(Arc::new(PiecewiseMergeJoinExec::try_new(
-                    Arc::clone(left),
-                    Arc::clone(right),
-                    self.on.clone(),
-                    self.operator,
-                    self.join_type,
-                    self.num_partitions,
-                )?)),
+                [left, right] => {
+                    Ok(self.funding.arc(PiecewiseMergeJoinExec::try_new(
+                        Arc::clone(left),
+                        Arc::clone(right),
+                        self.on.clone(),
+                        self.operator,
+                        self.join_type,
+                        self.num_partitions,
+                        &self.funding,
+                    )?)?)
+                }
                 _ => internal_err!(
                     "PiecewiseMergeJoin should have 2 children, found {}",
                     children.len()

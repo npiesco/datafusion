@@ -17,12 +17,12 @@
 
 //! Join related functionality used both on logical and physical plans
 
-use datafusion_common::funding::Funding;
+use datafusion_common::cloned::CloneBytes;
+use datafusion_common::funding::{Funding, arc_bytes};
 use std::cmp::{Ordering, min};
 use std::collections::HashSet;
 use std::fmt::{self, Debug};
 use std::future::Future;
-use std::iter::once;
 use std::ops::Range;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -57,7 +57,7 @@ use arrow::array::{
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::{self, take};
 use arrow::datatypes::{
-    ArrowNativeType, Field, Schema, SchemaBuilder, UInt32Type, UInt64Type,
+    ArrowNativeType, Field, FieldRef, Schema, UInt32Type, UInt64Type,
 };
 use arrow_ord::ord::{DynComparator, make_comparator};
 use arrow_schema::{DataType, SortOptions, TimeUnit};
@@ -86,6 +86,22 @@ use parking_lot::Mutex;
 /// Checks whether the schemas "left" and "right" and columns "on" represent a valid join.
 /// They are valid whenever their columns' intersection equals the set `on`
 pub fn check_join_is_valid(left: &Schema, right: &Schema, on: JoinOnRef) -> Result<()> {
+    // Keys that are columns of their side are checked in place; anything else is
+    // checked through the sets below.
+    let in_place = |key: &PhysicalExprRef, schema: &Schema| {
+        key.downcast_ref::<Column>().map(|column| {
+            schema
+                .fields()
+                .get(column.index())
+                .is_some_and(|field| field.name() == column.name())
+        })
+    };
+    if on.iter().all(|(left_key, right_key)| {
+        in_place(left_key, left) == Some(true) && in_place(right_key, right) == Some(true)
+    }) {
+        return Ok(());
+    }
+
     let left: HashSet<Column> = left
         .fields()
         .iter()
@@ -134,19 +150,26 @@ fn check_join_set_is_valid(
 pub fn adjust_right_output_partitioning(
     right_partitioning: &Partitioning,
     left_columns_len: usize,
+    funding: &Funding,
 ) -> Result<Partitioning> {
     let result = match right_partitioning {
         Partitioning::Hash(exprs, size) => {
-            let new_exprs = exprs
-                .iter()
-                .map(|expr| add_offset_to_expr(Arc::clone(expr), left_columns_len as _))
-                .collect::<Result<_>>()?;
-            Partitioning::Hash(new_exprs, *size)
+            let mut new_exprs = funding.held::<Vec<_>>();
+            new_exprs.reserve_exact(exprs.len())?;
+            for expr in exprs {
+                new_exprs.push(add_offset_to_expr(
+                    Arc::clone(expr),
+                    left_columns_len as _,
+                    funding,
+                )?)?;
+            }
+            Partitioning::Hash(new_exprs.keep(), *size)
         }
         Partitioning::Range(range) => {
             let ordering = add_offset_to_physical_sort_exprs(
                 range.ordering().iter().cloned(),
                 left_columns_len as _,
+                funding,
             )?;
             let ordering = LexOrdering::new(ordering).ok_or_else(|| {
                 internal_datafusion_err!(
@@ -158,12 +181,13 @@ pub fn adjust_right_output_partitioning(
                 range.split_points().to_vec(),
             ))
         }
-        result => result.clone(),
+        result => result.funded_clone(funding)?,
     };
     Ok(result)
 }
 
-/// Calculate the output ordering of a given join operation.
+/// Calculate the output ordering of a given join operation, the offset columns it
+/// makes charged to `funding` first.
 pub fn calculate_join_output_ordering(
     left_ordering: Option<&LexOrdering>,
     right_ordering: Option<&LexOrdering>,
@@ -171,6 +195,7 @@ pub fn calculate_join_output_ordering(
     left_columns_len: usize,
     maintains_input_order: &[bool],
     probe_side: Option<JoinSide>,
+    funding: &Funding,
 ) -> Result<Option<LexOrdering>> {
     match maintains_input_order {
         [true, false] => {
@@ -182,6 +207,7 @@ pub fn calculate_join_output_ordering(
                 let right_offset = add_offset_to_physical_sort_exprs(
                     right_ordering,
                     left_columns_len as _,
+                    funding,
                 )?;
                 return if let Some(left_ordering) = left_ordering {
                     let mut result = left_ordering.clone();
@@ -200,6 +226,7 @@ pub fn calculate_join_output_ordering(
                     let mut right_offset = add_offset_to_physical_sort_exprs(
                         right_ordering,
                         left_columns_len as _,
+                        funding,
                     )?;
                     if let Some(left_ordering) = left_ordering {
                         right_offset.extend(left_ordering.clone());
@@ -217,6 +244,7 @@ pub fn calculate_join_output_ordering(
                     add_offset_to_physical_sort_exprs(
                         right_ordering.clone(),
                         left_columns_len as _,
+                        funding,
                     )
                     .map(LexOrdering::new)
                 }
@@ -240,8 +268,15 @@ pub struct ColumnIndex {
 }
 
 /// Returns the output field given the input field. Outer joins may
-/// insert nulls even if the input was not null
-fn output_join_field(old_field: &Field, join_type: &JoinType, is_left: bool) -> Field {
+/// insert nulls even if the input was not null. The input field itself is returned
+/// when it already is as needed; a nullable copy is charged to `funding` before it is
+/// made. A non-empty metadata map is copied uncharged: its table's size is not measured.
+fn output_join_field(
+    old_field: &FieldRef,
+    join_type: &JoinType,
+    is_left: bool,
+    funding: &Funding,
+) -> Result<FieldRef> {
     let force_nullable = match join_type {
         JoinType::Inner => false,
         JoinType::Left => !is_left, // right input is padded with nulls
@@ -255,81 +290,72 @@ fn output_join_field(old_field: &Field, join_type: &JoinType, is_left: bool) -> 
         JoinType::RightMark => false,
     };
 
-    if force_nullable {
-        old_field.clone().with_nullable(true)
-    } else {
-        old_field.clone()
+    if !force_nullable || old_field.is_nullable() {
+        return Ok(Arc::clone(old_field));
     }
+    funding.charge(
+        old_field
+            .name()
+            .len()
+            .saturating_add(old_field.data_type().clone_bytes())
+            .saturating_add(arc_bytes::<Field>()),
+    )?;
+    Ok(Arc::new(Field::clone(old_field).with_nullable(true)))
 }
 
-/// Creates a schema for a join operation.
-/// The fields from the left side are first
+/// Creates a schema for a join operation, and where each of its fields comes from.
+/// The fields from the left side are first. What it allocates is charged to
+/// `funding` first; the merged metadata map is copied uncharged: its table's size is
+/// not measured.
 pub fn build_join_schema(
     left: &Schema,
     right: &Schema,
     join_type: &JoinType,
-) -> (Schema, Vec<ColumnIndex>) {
-    let left_fields = || {
-        left.fields()
-            .iter()
-            .map(|f| output_join_field(f, join_type, true))
-            .enumerate()
-            .map(|(index, f)| {
-                (
-                    f,
-                    ColumnIndex {
-                        index,
-                        side: JoinSide::Left,
-                    },
-                )
-            })
-    };
-
-    let right_fields = || {
-        right
-            .fields()
-            .iter()
-            .map(|f| output_join_field(f, join_type, false))
-            .enumerate()
-            .map(|(index, f)| {
-                (
-                    f,
-                    ColumnIndex {
-                        index,
-                        side: JoinSide::Right,
-                    },
-                )
-            })
-    };
-
-    let (fields, column_indices): (SchemaBuilder, Vec<ColumnIndex>) = match join_type {
+    funding: &Funding,
+) -> Result<(Schema, Vec<ColumnIndex>)> {
+    let (sides, mark): (&[JoinSide], bool) = match join_type {
         JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
             // left then right
-            left_fields().chain(right_fields()).unzip()
+            (&[JoinSide::Left, JoinSide::Right], false)
         }
-        JoinType::LeftSemi | JoinType::LeftAnti => left_fields().unzip(),
-        JoinType::LeftMark => {
-            let right_field = once((
-                Field::new("mark", DataType::Boolean, false),
-                ColumnIndex {
-                    index: 0,
-                    side: JoinSide::None,
-                },
-            ));
-            left_fields().chain(right_field).unzip()
-        }
-        JoinType::RightSemi | JoinType::RightAnti => right_fields().unzip(),
-        JoinType::RightMark => {
-            let left_field = once((
-                Field::new("mark", DataType::Boolean, false),
-                ColumnIndex {
-                    index: 0,
-                    side: JoinSide::None,
-                },
-            ));
-            right_fields().chain(left_field).unzip()
-        }
+        JoinType::LeftSemi | JoinType::LeftAnti => (&[JoinSide::Left], false),
+        JoinType::LeftMark => (&[JoinSide::Left], true),
+        JoinType::RightSemi | JoinType::RightAnti => (&[JoinSide::Right], false),
+        JoinType::RightMark => (&[JoinSide::Right], true),
     };
+    let side_fields = |side: &JoinSide| match side {
+        JoinSide::Left => left.fields(),
+        _ => right.fields(),
+    };
+    let len = sides
+        .iter()
+        .map(|side| side_fields(side).len())
+        .sum::<usize>()
+        + usize::from(mark);
+
+    let mut fields = funding.held::<Vec<FieldRef>>();
+    fields.reserve_exact(len)?;
+    let mut column_indices = funding.held::<Vec<ColumnIndex>>();
+    column_indices.reserve_exact(len)?;
+    for side in sides {
+        let is_left = *side == JoinSide::Left;
+        for (index, field) in side_fields(side).iter().enumerate() {
+            fields.push(output_join_field(field, join_type, is_left, funding)?)?;
+            column_indices.push(ColumnIndex { index, side: *side })?;
+        }
+    }
+    if mark {
+        funding.charge(arc_bytes::<Field>())?;
+        fields.push(Arc::new(Field::new(
+            funding.string("mark")?,
+            DataType::Boolean,
+            false,
+        )))?;
+        column_indices.push(ColumnIndex {
+            index: 0,
+            side: JoinSide::None,
+        })?;
+    }
 
     let (schema1, schema2) = match join_type {
         JoinType::Right
@@ -346,7 +372,10 @@ pub fn build_join_schema(
         .chain(schema2.metadata().clone())
         .collect();
 
-    (fields.finish().with_metadata(metadata), column_indices)
+    Ok((
+        Schema::new_with_metadata(funding.fields(&fields)?, metadata),
+        column_indices.keep(),
+    ))
 }
 
 /// A [`OnceAsync`] runs an `async` closure once, where multiple calls to
@@ -1896,20 +1925,23 @@ pub(crate) fn symmetric_join_output_partitioning(
     left: &Arc<dyn ExecutionPlan>,
     right: &Arc<dyn ExecutionPlan>,
     join_type: &JoinType,
+    funding: &Funding,
 ) -> Result<Partitioning> {
     let left_columns_len = left.schema().fields.len();
     let left_partitioning = left.output_partitioning();
     let right_partitioning = right.output_partitioning();
     let result = match join_type {
         JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
-            left_partitioning.clone()
+            left_partitioning.funded_clone(funding)?
         }
         JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
-            right_partitioning.clone()
+            right_partitioning.funded_clone(funding)?
         }
-        JoinType::Inner | JoinType::Right => {
-            adjust_right_output_partitioning(right_partitioning, left_columns_len)?
-        }
+        JoinType::Inner | JoinType::Right => adjust_right_output_partitioning(
+            right_partitioning,
+            left_columns_len,
+            funding,
+        )?,
         JoinType::Full => {
             // We could also use left partition count as they are necessarily equal.
             Partitioning::UnknownPartitioning(right_partitioning.partition_count())
@@ -1922,14 +1954,16 @@ pub(crate) fn asymmetric_join_output_partitioning(
     left: &Arc<dyn ExecutionPlan>,
     right: &Arc<dyn ExecutionPlan>,
     join_type: &JoinType,
+    funding: &Funding,
 ) -> Result<Partitioning> {
     let result = match join_type {
         JoinType::Inner | JoinType::Right => adjust_right_output_partitioning(
             right.output_partitioning(),
             left.schema().fields().len(),
+            funding,
         )?,
         JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
-            right.output_partitioning().clone()
+            right.output_partitioning().funded_clone(funding)?
         }
         JoinType::Left
         | JoinType::LeftSemi
@@ -2037,55 +2071,66 @@ pub fn reorder_output_after_swap(
     plan: Arc<dyn ExecutionPlan>,
     left_schema: &Schema,
     right_schema: &Schema,
+    funding: &Funding,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let proj = ProjectionExec::try_new(
-        swap_reverting_projection(left_schema, right_schema),
+        swap_reverting_projection(left_schema, right_schema, funding)?,
         plan,
-        &Funding::default(),
+        funding,
     )?;
-    Ok(Arc::new(proj))
+    Ok(funding.arc(proj)?)
 }
 
 /// When the order of the join is changed, the output order of columns must
 /// remain the same.
 ///
 /// Returns the expressions that will allow to swap back the values from the
-/// original left as the first columns and those on the right next.
+/// original left as the first columns and those on the right next, charged to
+/// `funding` before they are allocated.
 fn swap_reverting_projection(
     left_schema: &Schema,
     right_schema: &Schema,
-) -> Vec<ProjectionExpr> {
-    let right_cols =
-        right_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, f)| ProjectionExpr {
-                expr: Arc::new(Column::new(f.name(), i)) as Arc<dyn PhysicalExpr>,
-                alias: f.name().to_owned(),
-            });
-    let right_len = right_cols.len();
-    let left_cols =
-        left_schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, f)| ProjectionExpr {
-                expr: Arc::new(Column::new(f.name(), right_len + i))
-                    as Arc<dyn PhysicalExpr>,
-                alias: f.name().to_owned(),
-            });
-
-    left_cols.chain(right_cols).collect()
+    funding: &Funding,
+) -> Result<Vec<ProjectionExpr>> {
+    let right_len = right_schema.fields().len();
+    let mut exprs = funding.held::<Vec<ProjectionExpr>>();
+    exprs.reserve_exact(left_schema.fields().len() + right_len)?;
+    let columns = left_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f, right_len + i))
+        .chain(
+            right_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f, i)),
+        );
+    for (field, index) in columns {
+        let expr: Arc<dyn PhysicalExpr> =
+            funding.arc(Column::new(funding.string(field.name())?, index))?;
+        exprs.push(ProjectionExpr {
+            expr,
+            alias: funding.string(field.name())?,
+        })?;
+    }
+    Ok(exprs.keep())
 }
 
-/// This function swaps the given join's projection.
+/// This function swaps the given join's projection, the indices it makes charged to
+/// `funding` first.
 pub fn swap_join_projection(
     left_schema_len: usize,
     right_schema_len: usize,
     projection: Option<&[usize]>,
     join_type: &JoinType,
-) -> Option<Vec<usize>> {
+    funding: &Funding,
+) -> Result<Option<Vec<usize>>> {
+    let Some(projection) = projection else {
+        return Ok(None);
+    };
+    let mut swapped = funding.vec_from_slice(projection)?;
     match join_type {
         // For Anti/Semi join types, projection should remain unmodified,
         // since these joins output schema remains the same after swap
@@ -2094,23 +2139,22 @@ pub fn swap_join_projection(
         | JoinType::RightAnti
         | JoinType::RightSemi
         | JoinType::LeftMark
-        | JoinType::RightMark => projection.map(|p| p.to_vec()),
-        _ => projection.map(|p| {
-            p.iter()
-                .map(|i| {
-                    // If the index is less than the left schema length, it is from
-                    // the left schema, so we add the right schema length to it.
-                    // Otherwise, it is from the right schema, so we subtract the left
-                    // schema length from it.
-                    if *i < left_schema_len {
-                        *i + right_schema_len
-                    } else {
-                        *i - left_schema_len
-                    }
-                })
-                .collect()
-        }),
+        | JoinType::RightMark => {}
+        _ => {
+            for i in &mut swapped {
+                // If the index is less than the left schema length, it is from
+                // the left schema, so we add the right schema length to it.
+                // Otherwise, it is from the right schema, so we subtract the left
+                // schema length from it.
+                *i = if *i < left_schema_len {
+                    *i + right_schema_len
+                } else {
+                    *i - left_schema_len
+                };
+            }
+        }
     }
+    Ok(Some(swapped))
 }
 
 /// Updates `hash_map` with new entries from `batch` evaluated against the expressions `on`
@@ -2852,7 +2896,9 @@ mod tests {
         ];
 
         for (left_in, right_in, join_type, left_out, right_out) in cases {
-            let (schema, _) = build_join_schema(left_in, right_in, &join_type);
+            let (schema, _) =
+                build_join_schema(left_in, right_in, &join_type, &Funding::default())
+                    .unwrap();
 
             let expected_fields = left_out
                 .fields()
@@ -4283,7 +4329,11 @@ mod tests {
             split_points.clone(),
         )?;
 
-        let adjusted = adjust_right_output_partitioning(&Partitioning::Range(range), 3)?;
+        let adjusted = adjust_right_output_partitioning(
+            &Partitioning::Range(range),
+            3,
+            &Funding::default(),
+        )?;
         let expected = Partitioning::Range(RangePartitioning::new(
             LexOrdering::new([
                 PhysicalSortExpr::new(
@@ -4347,6 +4397,7 @@ mod tests {
                     left_columns_len,
                     maintains_input_order,
                     probe_side,
+                    &Funding::default(),
                 )?,
                 expected[i]
             );
@@ -4409,7 +4460,9 @@ mod tests {
 
         let right_schema = Schema::new(vec![Field::new("c", DataType::Int32, false)]);
 
-        let proj = swap_reverting_projection(&left_schema, &right_schema);
+        let proj =
+            swap_reverting_projection(&left_schema, &right_schema, &Funding::default())
+                .unwrap();
 
         assert_eq!(proj.len(), 3);
 
@@ -4442,14 +4495,24 @@ mod tests {
         let right_schema = Schema::new(vec![Field::new("b", DataType::Int32, false)])
             .with_metadata(HashMap::from([("key".to_string(), "right".to_string())]));
 
-        let (join_schema, _) =
-            build_join_schema(&left_schema, &right_schema, &JoinType::Left);
+        let (join_schema, _) = build_join_schema(
+            &left_schema,
+            &right_schema,
+            &JoinType::Left,
+            &Funding::default(),
+        )
+        .unwrap();
         assert_eq!(
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "left".to_string())])
         );
-        let (join_schema, _) =
-            build_join_schema(&left_schema, &right_schema, &JoinType::Right);
+        let (join_schema, _) = build_join_schema(
+            &left_schema,
+            &right_schema,
+            &JoinType::Right,
+            &Funding::default(),
+        )
+        .unwrap();
         assert_eq!(
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "right".to_string())])

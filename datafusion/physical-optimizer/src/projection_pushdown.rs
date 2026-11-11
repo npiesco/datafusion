@@ -114,6 +114,7 @@ fn try_push_down_join_filter(
         JoinSide::Left,
         filter.clone(),
         alias_generator,
+        join.funding(),
     )?;
     let rhs_rewrite = try_push_down_projection(
         Arc::clone(&lhs_rewrite.data.0.schema()),
@@ -121,6 +122,7 @@ fn try_push_down_join_filter(
         JoinSide::Right,
         lhs_rewrite.data.1,
         alias_generator,
+        join.funding(),
     )?;
     if !lhs_rewrite.transformed && !rhs_rewrite.transformed {
         return Ok(Transformed::no(original_plan));
@@ -172,13 +174,17 @@ fn try_push_down_join_filter(
         }
     };
 
-    Ok(Transformed::yes(Arc::new(NestedLoopJoinExec::try_new(
-        lhs_rewrite.data.0,
-        rhs_rewrite.data.0,
-        Some(join_filter),
-        join.join_type(),
-        Some(projections),
-    )?)))
+    let funding = join.funding();
+    Ok(Transformed::yes(funding.arc(
+        NestedLoopJoinExec::try_new(
+            lhs_rewrite.data.0,
+            rhs_rewrite.data.0,
+            Some(join_filter),
+            join.join_type(),
+            Some(projections),
+            funding,
+        )?,
+    )?))
 }
 
 /// Tries to push down parts of `expr` into the `join_side`.
@@ -188,6 +194,7 @@ fn try_push_down_projection(
     join_side: JoinSide,
     join_filter: JoinFilter,
     alias_generator: &AliasGenerator,
+    funding: &Funding,
 ) -> Result<Transformed<(Arc<dyn ExecutionPlan>, JoinFilter)>> {
     let expr = Arc::clone(join_filter.expression());
     let original_plan_schema = plan.schema();
@@ -200,11 +207,8 @@ fn try_push_down_projection(
     let new_expr = rewriter.rewrite(expr)?;
 
     if new_expr.transformed {
-        let new_join_side = ProjectionExec::try_new(
-            rewriter.join_side_projections,
-            plan,
-            &Funding::default(),
-        )?;
+        let new_join_side =
+            ProjectionExec::try_new(rewriter.join_side_projections, plan, funding)?;
         let new_schema = Arc::clone(&new_join_side.schema());
 
         let (lhs_schema, rhs_schema) = match join_side {
@@ -227,7 +231,10 @@ fn try_push_down_projection(
             rewriter.intermediate_column_indices,
             Arc::new(Schema::new(intermediate_schema)),
         );
-        Ok(Transformed::yes((Arc::new(new_join_side), join_filter)))
+        Ok(Transformed::yes((
+            funding.arc(new_join_side)? as _,
+            join_filter,
+        )))
     } else {
         Ok(Transformed::no((plan, join_filter)))
     }
@@ -664,6 +671,7 @@ mod test {
             Some(join_filter),
             &join_type,
             existing_projections,
+            &Funding::default(),
         )?;
 
         let optimizer = ProjectionPushdown::new();

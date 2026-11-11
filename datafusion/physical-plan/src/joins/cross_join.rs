@@ -42,7 +42,8 @@ use crate::{
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{Fields, Schema, SchemaRef};
+use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use datafusion_common::funding::Funding;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
@@ -100,38 +101,62 @@ pub struct CrossJoinExec {
     metrics: ExecutionPlanMetricsSet,
     /// Properties such as schema, equivalence properties, ordering, partitioning, etc.
     cache: Arc<PlanProperties>,
+    /// The handle the node, and the nodes rebuilt from it, are charged to
+    funding: Funding,
 }
 
 impl CrossJoinExec {
-    /// Create a new [CrossJoinExec].
-    pub fn new(left: Arc<dyn ExecutionPlan>, right: Arc<dyn ExecutionPlan>) -> Self {
+    /// Create a new [CrossJoinExec], what it allocates charged to `funding` first.
+    pub fn new(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        funding: &Funding,
+    ) -> Result<Self> {
         // left then right
         let (all_columns, metadata) = {
             let left_schema = left.schema();
             let right_schema = right.schema();
-            let left_fields = left_schema.fields().iter();
-            let right_fields = right_schema.fields().iter();
+            let mut fields = funding.held::<Vec<FieldRef>>();
+            fields.reserve_exact(
+                left_schema.fields().len() + right_schema.fields().len(),
+            )?;
+            for field in left_schema
+                .fields()
+                .iter()
+                .chain(right_schema.fields().iter())
+            {
+                fields.push(Arc::clone(field))?;
+            }
 
             let mut metadata = left_schema.metadata().clone();
             metadata.extend(right_schema.metadata().clone());
 
-            (
-                left_fields.chain(right_fields).cloned().collect::<Fields>(),
-                metadata,
-            )
+            (funding.fields(&fields)?, metadata)
         };
 
-        let schema = Arc::new(Schema::new(all_columns).with_metadata(metadata));
-        let cache = Self::compute_properties(&left, &right, Arc::clone(&schema)).unwrap();
+        let schema = funding.arc(Schema::new(all_columns).with_metadata(metadata))?;
+        let cache = funding.arc(Self::compute_properties(
+            &left,
+            &right,
+            Arc::clone(&schema),
+            funding,
+        )?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
 
-        CrossJoinExec {
+        Ok(CrossJoinExec {
             left,
             right,
             schema,
             left_fut: Default::default(),
             metrics: ExecutionPlanMetricsSet::default(),
-            cache: Arc::new(cache),
-        }
+            cache,
+            funding: funding.clone(),
+        })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// left (build) side which gets loaded in memory
@@ -149,6 +174,7 @@ impl CrossJoinExec {
         left: &Arc<dyn ExecutionPlan>,
         right: &Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties
         // TODO: Check equivalence properties of cross join, it may preserve
@@ -161,6 +187,7 @@ impl CrossJoinExec {
             &[false, false],
             None,
             &[],
+            funding,
         )?;
 
         // Get output partitioning:
@@ -169,6 +196,7 @@ impl CrossJoinExec {
         let output_partitioning = adjust_right_output_partitioning(
             right.output_partitioning(),
             left.schema().fields.len(),
+            funding,
         )?;
 
         Ok(PlanProperties::new(
@@ -189,12 +217,14 @@ impl CrossJoinExec {
     /// operators on the join's children. Check [`super::HashJoinExec::swap_inputs`]
     /// for more details.
     pub fn swap_inputs(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        let funding = &self.funding;
         let new_join =
-            CrossJoinExec::new(Arc::clone(&self.right), Arc::clone(&self.left));
+            CrossJoinExec::new(Arc::clone(&self.right), Arc::clone(&self.left), funding)?;
         reorder_output_after_swap(
-            Arc::new(new_join),
+            funding.arc(new_join)?,
             &self.left.schema(),
             &self.right.schema(),
+            funding,
         )
     }
 }
@@ -287,20 +317,26 @@ impl ExecutionPlan for CrossJoinExec {
             ChildrenPropertiesMode::Keep => {
                 let left = children.swap_remove(0);
                 let right = children.swap_remove(0);
+                let funding = &self.funding;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
 
-                Ok(Arc::new(Self {
+                Ok(funding.arc(Self {
                     left,
                     right,
                     metrics: ExecutionPlanMetricsSet::new(),
                     left_fut: Default::default(),
                     cache: Arc::clone(&self.cache),
                     schema: Arc::clone(&self.schema),
-                }))
+                    funding: funding.clone(),
+                })?)
             }
-            ChildrenPropertiesMode::Recompute => Ok(Arc::new(CrossJoinExec::new(
-                Arc::clone(&children[0]),
-                Arc::clone(&children[1]),
-            ))),
+            ChildrenPropertiesMode::Recompute => {
+                Ok(self.funding.arc(CrossJoinExec::new(
+                    Arc::clone(&children[0]),
+                    Arc::clone(&children[1]),
+                    &self.funding,
+                )?)?)
+            }
         }
     }
 
@@ -332,6 +368,7 @@ impl ExecutionPlan for CrossJoinExec {
             left_fut: Default::default(), // reset the build side!
             metrics: ExecutionPlanMetricsSet::default(),
             cache: Arc::clone(&self.cache),
+            funding: self.funding.clone(),
         };
         Ok(Arc::new(new_exec))
     }
@@ -458,10 +495,12 @@ impl ExecutionPlan for CrossJoinExec {
             self.right(),
         )?;
 
-        Ok(Some(Arc::new(CrossJoinExec::new(
-            Arc::new(new_left),
-            Arc::new(new_right),
-        ))))
+        let funding = &self.funding;
+        Ok(Some(funding.arc(CrossJoinExec::new(
+            funding.arc(new_left)?,
+            funding.arc(new_right)?,
+            funding,
+        )?)?))
     }
     #[cfg(feature = "proto")]
     fn try_to_proto(
@@ -511,7 +550,11 @@ impl CrossJoinExec {
             "right",
         )?;
 
-        Ok(Arc::new(CrossJoinExec::new(left, right)))
+        Ok(Arc::new(CrossJoinExec::new(
+            left,
+            right,
+            &Funding::default(),
+        )?))
     }
 }
 
@@ -792,7 +835,7 @@ mod tests {
         right: Arc<dyn ExecutionPlan>,
         context: Arc<TaskContext>,
     ) -> Result<(Vec<String>, Vec<RecordBatch>, MetricsSet)> {
-        let join = CrossJoinExec::new(left, right);
+        let join = CrossJoinExec::new(left, right, &Funding::default())?;
         let columns_header = columns(&join.schema());
 
         let stream = join.execute(0, context)?;

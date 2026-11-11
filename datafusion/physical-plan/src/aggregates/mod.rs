@@ -590,16 +590,6 @@ impl PhysicalGroupBy {
         Ok(fields)
     }
 
-    /// Returns the output fields of the group by.
-    ///
-    /// This might be different from the `group_fields` that might contain internal expressions that
-    /// should not be part of the output schema.
-    fn output_fields(&self, input_schema: &Schema) -> Result<Vec<FieldRef>> {
-        let mut fields = self.group_fields(input_schema)?;
-        fields.truncate(self.num_output_exprs());
-        Ok(fields)
-    }
-
     /// Returns the `PhysicalGroupBy` for a final aggregation if `self` is used for a partial
     /// aggregation, what it makes charged to `funding` before it is allocated.
     pub fn as_final(&self, funding: &Funding) -> Result<PhysicalGroupBy> {
@@ -2345,6 +2335,8 @@ impl ExecutionPlan for AggregateExec {
             // Derived at construction by `Self::compute_properties`.
             cache: _,
             dynamic_filter,
+            // The planning handle; not part of the wire format.
+            funding: _,
         } = self;
 
         let input = ctx.encode_child(input)?;

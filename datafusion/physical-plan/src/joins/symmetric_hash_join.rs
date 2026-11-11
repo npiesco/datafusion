@@ -65,6 +65,7 @@ use arrow::array::{
 use arrow::compute::concat_batches;
 use arrow::datatypes::{ArrowNativeType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion_common::funding::Funding;
 use datafusion_common::hash_utils::create_hashes;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::bisect;
@@ -199,6 +200,8 @@ pub struct SymmetricHashJoinExec {
     mode: StreamJoinPartitionMode,
     /// Cache holding plan properties like equivalences, output partitioning etc.
     cache: Arc<PlanProperties>,
+    /// The handle the node, and the nodes rebuilt from it, are charged to
+    funding: Funding,
 }
 
 impl SymmetricHashJoinExec {
@@ -219,6 +222,7 @@ impl SymmetricHashJoinExec {
         left_sort_exprs: Option<LexOrdering>,
         right_sort_exprs: Option<LexOrdering>,
         mode: StreamJoinPartitionMode,
+        funding: &Funding,
     ) -> Result<Self> {
         let left_schema = left.schema();
         let right_schema = right.schema();
@@ -235,12 +239,15 @@ impl SymmetricHashJoinExec {
 
         // Build the join schema from the left and right schemas:
         let (schema, column_indices) =
-            build_join_schema(&left_schema, &right_schema, join_type);
+            build_join_schema(&left_schema, &right_schema, join_type, funding)?;
 
         // Initialize the random state for the join operation:
         let random_state = RandomState::with_seed(0);
-        let schema = Arc::new(schema);
-        let cache = Self::compute_properties(&left, &right, schema, *join_type, &on)?;
+        let schema = funding.arc(schema)?;
+        let cache = funding.arc(Self::compute_properties(
+            &left, &right, schema, *join_type, &on, funding,
+        )?)?;
+        funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(SymmetricHashJoinExec {
             left,
             right,
@@ -254,8 +261,14 @@ impl SymmetricHashJoinExec {
             left_sort_exprs,
             right_sort_exprs,
             mode,
-            cache: Arc::new(cache),
+            cache,
+            funding: funding.clone(),
         })
+    }
+
+    /// The handle this node charges the nodes rebuilt from it to
+    pub fn funding(&self) -> &Funding {
+        &self.funding
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
@@ -265,6 +278,7 @@ impl SymmetricHashJoinExec {
         schema: SchemaRef,
         join_type: JoinType,
         join_on: JoinOnRef,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let eq_properties = join_equivalence_properties(
@@ -276,10 +290,11 @@ impl SymmetricHashJoinExec {
             // Has alternating probe side
             None,
             join_on,
+            funding,
         )?;
 
         let output_partitioning =
-            symmetric_join_output_partitioning(left, right, &join_type)?;
+            symmetric_join_output_partitioning(left, right, &join_type, funding)?;
 
         Ok(PlanProperties::new(
             eq_properties,
@@ -472,25 +487,49 @@ impl ExecutionPlan for SymmetricHashJoinExec {
             ChildrenPropertiesMode::Keep => {
                 let left = children.swap_remove(0);
                 let right = children.swap_remove(0);
-                Ok(Arc::new(Self {
+                let funding = &self.funding;
+                let on = funding.vec_from_slice(&self.on)?;
+                let filter = self
+                    .filter
+                    .as_ref()
+                    .map(|filter| filter.funded_clone(funding))
+                    .transpose()?;
+                let column_indices = funding.vec_from_slice(&self.column_indices)?;
+                funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
+                Ok(funding.arc(Self {
                     left,
                     right,
+                    on,
+                    filter,
+                    join_type: self.join_type,
+                    random_state: self.random_state.clone(),
                     metrics: ExecutionPlanMetricsSet::new(),
-                    ..Self::clone(&*self)
-                }))
+                    column_indices,
+                    null_equality: self.null_equality,
+                    left_sort_exprs: self.left_sort_exprs.clone(),
+                    right_sort_exprs: self.right_sort_exprs.clone(),
+                    mode: self.mode,
+                    cache: Arc::clone(&self.cache),
+                    funding: funding.clone(),
+                })?)
             }
             ChildrenPropertiesMode::Recompute => {
-                Ok(Arc::new(SymmetricHashJoinExec::try_new(
+                let funding = &self.funding;
+                Ok(funding.arc(SymmetricHashJoinExec::try_new(
                     Arc::clone(&children[0]),
                     Arc::clone(&children[1]),
-                    self.on.clone(),
-                    self.filter.clone(),
+                    funding.vec_from_slice(&self.on)?,
+                    self.filter
+                        .as_ref()
+                        .map(|filter| filter.funded_clone(funding))
+                        .transpose()?,
                     &self.join_type,
                     self.null_equality,
                     self.left_sort_exprs.clone(),
                     self.right_sort_exprs.clone(),
                     self.mode,
-                )?))
+                    funding,
+                )?)?)
             }
         }
     }
@@ -642,9 +681,10 @@ impl ExecutionPlan for SymmetricHashJoinExec {
             self.filter(),
             self.column_indices.as_slice(),
         )? {
-            SymmetricHashJoinExec::try_new(
-                Arc::new(projected_left_child),
-                Arc::new(projected_right_child),
+            let funding = &self.funding;
+            let join = SymmetricHashJoinExec::try_new(
+                funding.arc(projected_left_child)?,
+                funding.arc(projected_right_child)?,
                 join_on,
                 join_filter,
                 self.join_type(),
@@ -652,8 +692,9 @@ impl ExecutionPlan for SymmetricHashJoinExec {
                 self.right().output_ordering().cloned(),
                 self.left().output_ordering().cloned(),
                 self.partition_mode(),
-            )
-            .map(|e| Some(Arc::new(e) as _))
+                funding,
+            )?;
+            Ok(Some(funding.arc(join)?))
         } else {
             Ok(None)
         }
@@ -924,6 +965,7 @@ impl SymmetricHashJoinExec {
             left_sort_exprs,
             right_sort_exprs,
             partition_mode,
+            &Funding::default(),
         )
         .map(|exec| Arc::new(exec) as _)
     }

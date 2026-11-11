@@ -79,7 +79,7 @@ impl PhysicalOptimizerRule for AggregateStatistics {
                         funding.arc(Literal::new(optimizable_statistic, funding)?)?;
                     projections.push(ProjectionExpr {
                         expr,
-                        alias: funding.string(name)?,
+                        alias: funding.string(&name)?,
                     })?;
                 } else {
                     // TODO: we need all aggr_expr to be resolved (cf TODO fullres)

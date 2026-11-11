@@ -2739,7 +2739,7 @@ impl TableProvider for DataFrameTableProvider {
             expr = expr.limit(0, Some(l))?
         }
         let plan = expr.build()?;
-        state.create_physical_plan(&plan).await
+        state.create_physical_plan(&plan)?.await
     }
 }
 

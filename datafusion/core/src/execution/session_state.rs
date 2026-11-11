@@ -30,7 +30,7 @@ use crate::datasource::file_format::FileFormatFactory;
 use crate::datasource::provider_as_source;
 use crate::execution::SessionStateDefaults;
 use crate::execution::context::{EmptySerializerRegistry, FunctionFactory, QueryPlanner};
-use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
+use crate::physical_planner::DefaultPhysicalPlanner;
 #[cfg(feature = "sql")]
 use arrow_schema::DataType;
 use arrow_schema::FieldRef;

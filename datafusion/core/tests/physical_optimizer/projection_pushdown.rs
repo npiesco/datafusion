@@ -990,6 +990,7 @@ fn test_join_after_projection() -> Result<()> {
         None,
         None,
         StreamJoinPartitionMode::SinglePartition,
+        &Funding::default(),
     )?);
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
@@ -1119,6 +1120,7 @@ fn test_join_after_required_projection() -> Result<()> {
         None,
         None,
         StreamJoinPartitionMode::SinglePartition,
+        &Funding::default(),
     )?);
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
@@ -1215,6 +1217,7 @@ fn test_nested_loop_join_after_projection() -> Result<()> {
         )),
         &JoinType::Inner,
         None,
+        &Funding::default(),
     )?) as _;
 
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
@@ -1313,6 +1316,7 @@ fn test_hash_join_after_projection() -> Result<()> {
         PartitionMode::Auto,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?);
     let projection: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
         vec![
@@ -1785,6 +1789,7 @@ fn test_hash_join_empty_projection_embeds() -> Result<()> {
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?);
 
     // Empty projection: no columns needed from the join output

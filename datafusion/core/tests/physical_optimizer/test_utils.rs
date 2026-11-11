@@ -205,6 +205,7 @@ pub fn sort_merge_join_exec(
             *join_type,
             vec![SortOptions::default(); join_on.len()],
             NullEquality::NullEqualsNothing,
+            &Funding::default(),
         )
         .unwrap(),
     )
@@ -262,6 +263,7 @@ pub fn hash_join_exec(
         PartitionMode::Partitioned,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?))
 }
 

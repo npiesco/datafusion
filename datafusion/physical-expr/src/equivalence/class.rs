@@ -27,6 +27,7 @@ use crate::physical_expr::add_offset_to_expr;
 use crate::projection::ProjectionTargets;
 use crate::{PhysicalExpr, PhysicalExprRef, PhysicalSortExpr, PhysicalSortRequirement};
 
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinType, Result, ScalarValue};
 use datafusion_physical_expr_common::physical_expr::format_physical_expr_list;
@@ -245,14 +246,15 @@ impl EquivalenceClass {
     }
 
     /// Adds the given offset to all columns in the expressions inside this
-    /// class. This is used when schemas are appended, e.g. in joins.
-    pub fn try_with_offset(&self, offset: isize) -> Result<Self> {
+    /// class. This is used when schemas are appended, e.g. in joins. The
+    /// rewritten columns are charged to `funding` before they are allocated.
+    pub fn try_with_offset(&self, offset: isize, funding: &Funding) -> Result<Self> {
         let mut cls = Self::default();
         for expr_result in self
             .exprs
             .iter()
             .cloned()
-            .map(|e| add_offset_to_expr(e, offset))
+            .map(|e| add_offset_to_expr(e, offset, funding))
         {
             cls.push(expr_result?);
         }
@@ -777,13 +779,16 @@ impl EquivalenceGroup {
         self.map.get(expr).map(|idx| &self.classes[*idx])
     }
 
-    /// Combine equivalence groups of the given join children.
+    /// Combine equivalence groups of the given join children. The right side's
+    /// columns, rewritten past the left side's, are charged to `funding` before
+    /// they are allocated.
     pub fn join(
         &self,
         right_equivalences: &Self,
         join_type: &JoinType,
         left_size: usize,
         on: &[(PhysicalExprRef, PhysicalExprRef)],
+        funding: &Funding,
     ) -> Result<Self> {
         let group = match join_type {
             JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right => {
@@ -791,7 +796,7 @@ impl EquivalenceGroup {
                     self.iter().cloned().chain(
                         right_equivalences
                             .iter()
-                            .map(|cls| cls.try_with_offset(left_size as _))
+                            .map(|cls| cls.try_with_offset(left_size as _, funding))
                             .collect::<Result<Vec<_>>>()?,
                     ),
                 );
@@ -802,7 +807,7 @@ impl EquivalenceGroup {
                         let new_lhs = Arc::clone(lhs);
                         // Rewrite rhs to point to the right side of the join:
                         let new_rhs =
-                            add_offset_to_expr(Arc::clone(rhs), left_size as _)?;
+                            add_offset_to_expr(Arc::clone(rhs), left_size as _, funding)?;
                         result.add_equal_conditions(new_lhs, new_rhs);
                     }
                 }
@@ -925,7 +930,6 @@ mod tests {
     use crate::equivalence::tests::create_test_params;
     use crate::expressions::{BinaryExpr, Column, binary, col, lit};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_common::funding::Funding;
 
     use datafusion_expr::Operator;
 

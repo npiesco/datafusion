@@ -229,6 +229,7 @@ async fn test_join_with_swap() {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -304,6 +305,7 @@ async fn test_join_with_swap_to_sort_preserving_merge_fetch_side() {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -368,6 +370,7 @@ async fn test_left_join_no_swap() {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -415,6 +418,7 @@ async fn test_join_with_swap_semi() {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -466,6 +470,7 @@ async fn test_join_with_swap_mark() {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap();
 
@@ -535,6 +540,7 @@ async fn test_nested_join_swap() {
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )
     .unwrap();
     let child_schema = child_join.schema();
@@ -553,6 +559,7 @@ async fn test_nested_join_swap() {
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )
     .unwrap();
 
@@ -594,6 +601,7 @@ async fn test_join_no_swap() {
             PartitionMode::CollectLeft,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -640,6 +648,7 @@ async fn test_nl_join_with_swap(join_type: JoinType) {
             nl_join_filter(),
             &join_type,
             None,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -714,6 +723,7 @@ async fn test_nl_join_with_swap_no_proj(join_type: JoinType) {
             nl_join_filter(),
             &join_type,
             None,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -812,6 +822,7 @@ async fn test_hash_join_swap_on_joins_with_projections(
         PartitionMode::Partitioned,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?);
 
     let swapped = join
@@ -975,6 +986,7 @@ fn check_join_partition_mode(
             PartitionMode::Auto,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )
         .unwrap(),
     );
@@ -1649,6 +1661,7 @@ fn test_join_with_maybe_swap_unbounded_case(t: TestCase) -> Result<()> {
         t.initial_mode,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )?) as _;
 
     let optimized_join_plan =

@@ -19,9 +19,13 @@ use super::EquivalenceProperties;
 use crate::{PhysicalExprRef, equivalence::OrderingEquivalenceClass};
 
 use arrow::datatypes::SchemaRef;
+use datafusion_common::funding::Funding;
 use datafusion_common::{JoinSide, JoinType, Result};
 
-/// Calculate ordering equivalence properties for the given join operation.
+/// Calculate ordering equivalence properties for the given join operation. The
+/// right side's columns, rewritten past the left side's, are charged to
+/// `funding` before they are allocated.
+#[expect(clippy::too_many_arguments)]
 pub fn join_equivalence_properties(
     left: EquivalenceProperties,
     right: EquivalenceProperties,
@@ -30,6 +34,7 @@ pub fn join_equivalence_properties(
     maintains_input_order: &[bool],
     probe_side: Option<JoinSide>,
     on: &[(PhysicalExprRef, PhysicalExprRef)],
+    funding: &Funding,
 ) -> Result<EquivalenceProperties> {
     let left_size = left.schema.fields.len();
     let mut result = EquivalenceProperties::new(join_schema);
@@ -38,6 +43,7 @@ pub fn join_equivalence_properties(
         join_type,
         left_size,
         on,
+        funding,
     )?)?;
 
     let EquivalenceProperties {
@@ -59,6 +65,7 @@ pub fn join_equivalence_properties(
                     &mut right_oeq_class,
                     join_type,
                     left_size,
+                    funding,
                 )?;
 
                 // Right side ordering equivalence properties should be prepended
@@ -80,6 +87,7 @@ pub fn join_equivalence_properties(
                 &mut right_oeq_class,
                 join_type,
                 left_size,
+                funding,
             )?;
             // In this special case, left side ordering can be prefixed with
             // the right side ordering.
@@ -113,17 +121,19 @@ pub fn join_equivalence_properties(
 /// To do so, we increment column indices by the size of the left table when
 /// join schema consists of a combination of the left and right schemas. This
 /// is the case for `Inner`, `Left`, `Full` and `Right` joins. For other cases,
-/// indices do not change.
+/// indices do not change. The rewritten expressions are charged to `funding`
+/// before they are allocated.
 pub fn updated_right_ordering_equivalence_class(
     right_oeq_class: &mut OrderingEquivalenceClass,
     join_type: &JoinType,
     left_size: usize,
+    funding: &Funding,
 ) -> Result<()> {
     if matches!(
         join_type,
         JoinType::Inner | JoinType::Left | JoinType::Full | JoinType::Right
     ) {
-        right_oeq_class.add_offset(left_size as _)?;
+        right_oeq_class.add_offset(left_size as _, funding)?;
     }
     Ok(())
 }
@@ -148,8 +158,8 @@ mod tests {
         let col_b = &col("b", &schema)?;
         let col_c = &col("c", &schema)?;
         let offset = schema.fields.len() as _;
-        let col_a2 = &add_offset_to_expr(Arc::clone(col_a), offset)?;
-        let col_b2 = &add_offset_to_expr(Arc::clone(col_b), offset)?;
+        let col_a2 = &add_offset_to_expr(Arc::clone(col_a), offset, &Funding::default())?;
+        let col_b2 = &add_offset_to_expr(Arc::clone(col_b), offset, &Funding::default())?;
         let option_asc = SortOptions {
             descending: false,
             nulls_first: false,
@@ -208,6 +218,7 @@ mod tests {
                 &[true, false],
                 Some(JoinSide::Left),
                 &[],
+                &Funding::default(),
             )?;
             let err_msg =
                 format!("expected: {:?}, actual:{:?}", expected, join_eq.oeq_class);
@@ -273,6 +284,7 @@ mod tests {
             &mut right_oeq_class,
             &join_type,
             left_columns_len,
+            &Funding::default(),
         )?;
         join_eq_properties.add_orderings(right_oeq_class);
         let result = join_eq_properties.oeq_class().clone();

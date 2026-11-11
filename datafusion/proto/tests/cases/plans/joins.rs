@@ -76,6 +76,7 @@ fn roundtrip_hash_join() -> Result<()> {
                 *partition_mode,
                 NullEquality::NullEqualsNothing,
                 false,
+                &Funding::default(),
             )?))?;
         }
     }
@@ -106,6 +107,7 @@ fn roundtrip_nested_loop_join() -> Result<()> {
             None,
             join_type,
             Some(vec![0]),
+            &Funding::default(),
         )?))?;
     }
     Ok(())
@@ -139,6 +141,7 @@ fn roundtrip_hash_join_projection_states() -> Result<()> {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?))?;
     }
     Ok(())
@@ -187,6 +190,7 @@ fn roundtrip_hash_join_fetch() -> Result<()> {
             PartitionMode::Partitioned,
             NullEquality::NullEqualsNothing,
             false,
+            &Funding::default(),
         )?;
 
         let plan: Arc<dyn ExecutionPlan> = match fetch {
@@ -227,6 +231,7 @@ fn roundtrip_nested_loop_join_projection_states() -> Result<()> {
             None,
             &JoinType::Inner,
             projection,
+            &Funding::default(),
         )?))?;
     }
     Ok(())
@@ -338,6 +343,7 @@ fn roundtrip_sym_hash_join() -> Result<()> {
                                 left_order.clone(),
                                 right_order.clone(),
                                 partition_mode,
+                                &Funding::default(),
                             )?),
                             &ctx,
                             &codec,
@@ -439,6 +445,7 @@ fn roundtrip_sort_merge_join() -> Result<()> {
                         join_type,
                         sort_options.clone(),
                         null_equality,
+                        &Funding::default(),
                     )?),
                     &ctx,
                     &codec,

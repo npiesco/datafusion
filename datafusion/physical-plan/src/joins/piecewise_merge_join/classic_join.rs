@@ -662,6 +662,7 @@ mod tests {
     };
     use arrow::array::{Date32Array, Date64Array};
     use arrow_schema::{DataType, Field};
+    use datafusion_common::funding::Funding;
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::TaskContext;
     use datafusion_physical_expr::{PhysicalExpr, expressions::Column};
@@ -739,7 +740,15 @@ mod tests {
         operator: Operator,
         join_type: JoinType,
     ) -> Result<PiecewiseMergeJoinExec> {
-        PiecewiseMergeJoinExec::try_new(left, right, on, operator, join_type, 1)
+        PiecewiseMergeJoinExec::try_new(
+            left,
+            right,
+            on,
+            operator,
+            join_type,
+            1,
+            &Funding::default(),
+        )
     }
 
     async fn join_collect(

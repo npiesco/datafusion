@@ -395,6 +395,7 @@ async fn sort_merge_join_yields(
         JoinType::Inner,
         vec![inf1.properties().eq_properties.output_ordering().unwrap()[0].options],
         NullEquality::NullEqualsNull,
+        &Funding::default(),
     )?);
 
     query_yields(join, session_ctx.task_ctx()).await
@@ -663,6 +664,7 @@ async fn join_yields(
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNull,
         false,
+        &Funding::default(),
     )?);
 
     query_yields(join, session_ctx.task_ctx()).await
@@ -715,6 +717,7 @@ async fn join_agg_yields(
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNull,
         false,
+        &Funding::default(),
     )?);
 
     // Project only one column (“value” from the left side) because we just want to sum that
@@ -786,6 +789,7 @@ async fn hash_join_yields(
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNull,
         false,
+        &Funding::default(),
     )?);
 
     query_yields(join, session_ctx.task_ctx()).await
@@ -821,6 +825,7 @@ async fn hash_join_without_repartition_and_no_agg(
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNull,
         false,
+        &Funding::default(),
     )?);
 
     query_yields(join, session_ctx.task_ctx()).await

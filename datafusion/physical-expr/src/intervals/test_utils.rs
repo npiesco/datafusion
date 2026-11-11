@@ -44,22 +44,22 @@ pub fn gen_conjunctive_numerical_expr(
     let left_and_1 = Arc::new(BinaryExpr::new(
         Arc::clone(&left_col),
         op_1,
-        Arc::new(Literal::new(a, &Funding::default())?),
+        Arc::new(Literal::new(a, &Funding::default()).expect("literal")),
     ));
     let left_and_2 = Arc::new(BinaryExpr::new(
         Arc::clone(&right_col),
         op_2,
-        Arc::new(Literal::new(b, &Funding::default())?),
+        Arc::new(Literal::new(b, &Funding::default()).expect("literal")),
     ));
     let right_and_1 = Arc::new(BinaryExpr::new(
         left_col,
         op_3,
-        Arc::new(Literal::new(c, &Funding::default())?),
+        Arc::new(Literal::new(c, &Funding::default()).expect("literal")),
     ));
     let right_and_2 = Arc::new(BinaryExpr::new(
         right_col,
         op_4,
-        Arc::new(Literal::new(d, &Funding::default())?),
+        Arc::new(Literal::new(d, &Funding::default()).expect("literal")),
     ));
     let (greater_op, less_op) = bounds;
 
