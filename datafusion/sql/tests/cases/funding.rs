@@ -165,7 +165,9 @@ fn assert_failure_freed(sql: &str) {
 #[test]
 fn a_failed_select_list_gives_back_the_items_planned_before() {
     assert_failure_freed("SELECT * REPLACE (age + 1 AS age), no_such_column FROM person");
-    assert_failure_freed("SELECT * REPLACE (age + 1 AS age, no_such_column AS id) FROM person");
+    assert_failure_freed(
+        "SELECT * REPLACE (age + 1 AS age, no_such_column AS id) FROM person",
+    );
 }
 
 #[test]
