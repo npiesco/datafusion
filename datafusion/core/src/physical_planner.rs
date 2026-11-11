@@ -1013,7 +1013,7 @@ impl DefaultPhysicalPlanner {
                     funding,
                 )?;
                 let merge_schema = target_schema.join(input.schema(), funding);
-                target_schema.released(funding);
+                target_schema.released_qualified(funding);
                 let merge_schema = Arc::new(merge_schema?);
                 provider
                     .merge_into(

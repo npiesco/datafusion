@@ -139,6 +139,27 @@ fn select_joins_are_funded() {
 }
 
 #[test]
+fn merge_into_is_funded() {
+    let (_, scan_kept, _) = plan_within(
+        "MERGE INTO j1 USING j2 ON false WHEN MATCHED THEN DELETE",
+        usize::MAX,
+    );
+    let (_, wider_target_kept, _) = plan_within(
+        "MERGE INTO person USING j2 ON false WHEN MATCHED THEN DELETE",
+        usize::MAX,
+    );
+    assert_eq!(
+        wider_target_kept, scan_kept,
+        "releasing MERGE target_schema must not over-discharge shared Arrow fields"
+    );
+    assert_funded("MERGE INTO person USING j2 ON person.id = j2_id WHEN MATCHED THEN DELETE");
+    assert_failure_freed(
+        "MERGE INTO person USING j2 ON no_such_column = j2_id WHEN MATCHED THEN DELETE",
+    );
+    assert_failure_freed("MERGE INTO j1 USING j1 ON true WHEN MATCHED THEN DELETE");
+}
+
+#[test]
 fn select_from_cte_is_funded() {
     assert_funded("WITH t AS (SELECT id FROM person) SELECT id FROM t");
 }

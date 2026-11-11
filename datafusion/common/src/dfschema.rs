@@ -205,15 +205,20 @@ impl DFSchema {
         funding: &Funding,
     ) -> Result<Self> {
         let qualifier = qualifier.into();
-        let mut field_qualifiers = funding.vec_with_capacity(schema.fields.len())?;
+        let mut field_qualifiers = funding.held::<Vec<Option<TableReference>>>();
+        field_qualifiers.reserve_exact(schema.fields.len())?;
         field_qualifiers
             .extend(std::iter::repeat_n(Some(qualifier), schema.fields.len()));
+        let inner = funding.arc(schema.clone())?;
         let schema = DFSchema {
-            inner: funding.arc(schema.clone())?,
-            field_qualifiers,
+            inner,
+            field_qualifiers: field_qualifiers.keep(),
             functional_dependencies: FunctionalDependencies::empty(),
         };
-        schema.check_names()?;
+        if let Err(err) = schema.check_names() {
+            schema.released_qualified(funding);
+            return Err(err);
+        }
         Ok(schema)
     }
 
@@ -422,6 +427,23 @@ impl DFSchema {
             if let Ok(fields) = arc_slice_bytes::<FieldRef>(schema.fields().len()) {
                 freed += fields;
             }
+        }
+        funding.discharge(freed);
+    }
+
+    /// Drop a schema built by [`Self::try_from_qualified_schema`], giving back to
+    /// `funding` the qualifier list, functional dependencies, and `Arc<Schema>` header
+    /// it charged without discharging the shared Arrow `Fields` slice.
+    pub fn released_qualified(self, funding: &Funding) {
+        let Self {
+            inner,
+            field_qualifiers,
+            functional_dependencies,
+        } = self;
+        let mut freed = functional_dependencies.clone_bytes();
+        funding.released(field_qualifiers);
+        if Arc::try_unwrap(inner).is_ok() {
+            freed += arc_bytes::<Schema>();
         }
         funding.discharge(freed);
     }
@@ -1839,6 +1861,93 @@ mod tests {
 
         // Duplicate field check failure releases all allocated schema buffers.
         let dup_err = left.join(&left, &funding).unwrap_err();
+        assert!(matches!(dup_err, DataFusionError::SchemaError(_, _)));
+        assert_eq!(*source.held.lock().unwrap(), 0);
+        assert_eq!(funding.outstanding(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn try_from_qualified_schema_is_charged_and_released_qualified() -> Result<()> {
+        use crate::funding::PlanningFunding;
+        use std::sync::Mutex;
+
+        struct Limited {
+            limit: usize,
+            held: Mutex<usize>,
+        }
+
+        impl PlanningFunding for Limited {
+            fn charge(&self, bytes: usize) -> bool {
+                let mut held = self.held.lock().unwrap();
+                match held.checked_add(bytes) {
+                    Some(total) if total <= self.limit => {
+                        *held = total;
+                        true
+                    }
+                    _ => false,
+                }
+            }
+
+            fn discharge(&self, bytes: usize) {
+                let mut held = self.held.lock().unwrap();
+                *held = held
+                    .checked_sub(bytes)
+                    .expect("discharged more than was charged");
+            }
+        }
+
+        let arrow_schema = test_schema_1();
+        let unlimited = Funding::default();
+        let baseline =
+            DFSchema::try_from_qualified_schema("t1", &arrow_schema, &unlimited)?;
+        let retained = unlimited.outstanding();
+        assert!(retained > 0);
+        baseline.released_qualified(&unlimited);
+        assert_eq!(unlimited.outstanding(), 0);
+
+        for limit in 0..retained {
+            let source = Arc::new(Limited {
+                limit,
+                held: Mutex::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+            let err =
+                DFSchema::try_from_qualified_schema("t1", &arrow_schema, &funding)
+                    .unwrap_err();
+            assert!(
+                matches!(err, DataFusionError::Refused { .. }),
+                "expected Refused at limit {limit}, got {err:?}"
+            );
+            assert_eq!(
+                *source.held.lock().unwrap(),
+                0,
+                "refusal at limit {limit} leaked held bytes"
+            );
+            assert_eq!(funding.outstanding(), 0);
+        }
+
+        let source = Arc::new(Limited {
+            limit: retained,
+            held: Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+        let qualified =
+            DFSchema::try_from_qualified_schema("t1", &arrow_schema, &funding)?;
+        assert_eq!(*source.held.lock().unwrap(), retained);
+        assert_eq!(funding.outstanding(), retained);
+        qualified.released_qualified(&funding);
+        assert_eq!(*source.held.lock().unwrap(), 0);
+        assert_eq!(funding.outstanding(), 0);
+
+        // Duplicate field check failure releases all allocated schema buffers.
+        let dup_arrow_schema = Schema::new(vec![
+            Field::new("c0", DataType::Boolean, true),
+            Field::new("c0", DataType::Boolean, true),
+        ]);
+        let dup_err =
+            DFSchema::try_from_qualified_schema("t1", &dup_arrow_schema, &funding)
+                .unwrap_err();
         assert!(matches!(dup_err, DataFusionError::SchemaError(_, _)));
         assert_eq!(*source.held.lock().unwrap(), 0);
         assert_eq!(funding.outstanding(), 0);

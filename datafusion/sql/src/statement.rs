@@ -2534,7 +2534,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             match target_schema.join(source_plan.schema(), self.funding()) {
                 Ok(schema) => schema,
                 Err(err) => {
-                    target_schema.released(self.funding());
+                    target_schema.released_qualified(self.funding());
                     return Err(err);
                 }
             };
@@ -2560,7 +2560,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             Ok((on_expr, df_clauses))
         })();
         combined_schema.released(self.funding());
-        target_schema.released(self.funding());
+        target_schema.released_qualified(self.funding());
         let (on_expr, df_clauses) = on_and_clauses?;
 
         // 6. Build the MERGE operation. Column references to the target may be
