@@ -1973,7 +1973,11 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>();
             let expected = convert_to_orderings(&expected);
 
-            let projected_eq = eq_properties.project(&projection_mapping, output_schema);
+            let projected_eq = eq_properties.try_project(
+                &projection_mapping,
+                output_schema,
+                &Funding::default(),
+            )?;
             let orderings = projected_eq.oeq_class();
 
             let err_msg = format!(
@@ -2161,8 +2165,11 @@ pub(crate) mod tests {
 
             let expected = convert_to_orderings(expected);
 
-            let projected_eq =
-                eq_properties.project(&projection_mapping, Arc::clone(&output_schema));
+            let projected_eq = eq_properties.try_project(
+                &projection_mapping,
+                Arc::clone(&output_schema),
+                &Funding::default(),
+            )?;
             let orderings = projected_eq.oeq_class();
 
             let err_msg = format!(
@@ -2289,8 +2296,11 @@ pub(crate) mod tests {
 
             let expected = convert_to_orderings(&expected);
 
-            let projected_eq =
-                eq_properties.project(&projection_mapping, Arc::clone(&output_schema));
+            let projected_eq = eq_properties.try_project(
+                &projection_mapping,
+                Arc::clone(&output_schema),
+                &Funding::default(),
+            )?;
             let orderings = projected_eq.oeq_class();
 
             let err_msg = format!(

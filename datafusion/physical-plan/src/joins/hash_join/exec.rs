@@ -1155,7 +1155,8 @@ impl HashJoinExec {
             let out_schema = project_schema(schema, Some(&projection))?;
             output_partitioning =
                 output_partitioning.project(&projection_mapping, &eq_properties);
-            eq_properties = eq_properties.project(&projection_mapping, out_schema);
+            eq_properties =
+                eq_properties.try_project(&projection_mapping, out_schema, funding)?;
         }
 
         Ok(PlanProperties::new(

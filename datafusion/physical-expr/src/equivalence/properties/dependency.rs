@@ -442,7 +442,11 @@ mod tests {
         let col_a2 = &col("a2", &out_schema)?;
         let col_a3 = &col("a3", &out_schema)?;
         let col_a4 = &col("a4", &out_schema)?;
-        let out_properties = input_properties.project(&projection_mapping, out_schema);
+        let out_properties = input_properties.try_project(
+            &projection_mapping,
+            out_schema,
+            &Funding::default(),
+        )?;
 
         // At the output a1=a2=a3=a4
         assert_eq!(out_properties.eq_group().len(), 1);
@@ -492,7 +496,11 @@ mod tests {
         ];
         let projection_mapping =
             ProjectionMapping::try_new(proj_exprs, &input_schema, &Funding::default())?;
-        let out_properties = input_properties.project(&projection_mapping, input_schema);
+        let out_properties = input_properties.try_project(
+            &projection_mapping,
+            input_schema,
+            &Funding::default(),
+        )?;
 
         assert_eq!(
             out_properties.to_string(),
@@ -1547,7 +1555,11 @@ mod tests {
 
         // Project through the named_struct
         let out_schema = output_schema(&projection_mapping, &input_schema)?;
-        let out_properties = input_properties.project(&projection_mapping, out_schema);
+        let out_properties = input_properties.try_project(
+            &projection_mapping,
+            out_schema,
+            &Funding::default(),
+        )?;
 
         // Build the sort expression: get_field(col("s"), "a")
         // This is what the framework would generate for ORDER BY s.a

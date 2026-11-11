@@ -45,6 +45,7 @@ use arrow::datatypes::{DataType, Int64Type, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ord::cmp::lt;
 use async_trait::async_trait;
+use datafusion_common::funding::Funding;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Constraints, HashMap, HashSet, Result, UnnestOptions, exec_datafusion_err, exec_err,
@@ -163,7 +164,7 @@ impl UnnestExec {
         // the unnest operation invalidates any global uniqueness or primary-key constraints.
         let input_eq_properties = input.equivalence_properties();
         let eq_properties = input_eq_properties
-            .project(&projection_mapping, Arc::clone(schema))
+            .try_project(&projection_mapping, Arc::clone(schema), &Funding::default())?
             .with_constraints(Constraints::default());
 
         // Output partitioning must use the projection mapping

@@ -225,6 +225,7 @@ impl ProjectionExec {
             &input,
             &projection_mapping,
             Arc::clone(projector.output_schema()),
+            funding,
         )?;
         funding.charge(ExecutionPlanMetricsSet::BLOCK)?;
         Ok(Self {
@@ -262,10 +263,12 @@ impl ProjectionExec {
         input: &Arc<dyn ExecutionPlan>,
         projection_mapping: &ProjectionMapping,
         schema: SchemaRef,
+        funding: &Funding,
     ) -> Result<PlanProperties> {
         // Calculate equivalence properties:
         let input_eq_properties = input.equivalence_properties();
-        let eq_properties = input_eq_properties.project(projection_mapping, schema);
+        let eq_properties =
+            input_eq_properties.try_project(projection_mapping, schema, funding)?;
         // Calculate output partitioning, which needs to respect aliases:
         let output_partitioning = input
             .output_partitioning()

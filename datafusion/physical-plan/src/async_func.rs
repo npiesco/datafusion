@@ -100,9 +100,11 @@ impl AsyncFuncExec {
         async_expr_mapping: &ProjectionMapping,
     ) -> Result<PlanProperties> {
         Ok(PlanProperties::new(
-            input
-                .equivalence_properties()
-                .project(async_expr_mapping, schema),
+            input.equivalence_properties().try_project(
+                async_expr_mapping,
+                schema,
+                &Funding::default(),
+            )?,
             input.output_partitioning().clone(),
             input.pipeline_behavior(),
             input.boundedness(),
