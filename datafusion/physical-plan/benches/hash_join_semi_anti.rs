@@ -45,6 +45,7 @@ use std::sync::Arc;
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use datafusion_common::funding::Funding;
 use datafusion_common::{JoinType, NullEquality};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::expressions::col;
@@ -127,6 +128,7 @@ fn do_hash_join(
         PartitionMode::CollectLeft,
         NullEquality::NullEqualsNothing,
         false,
+        &Funding::default(),
     )
     .unwrap();
 

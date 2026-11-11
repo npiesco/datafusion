@@ -40,7 +40,7 @@ use crate::{
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{Funding, arc_bytes};
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
 use datafusion_execution::TaskContext;
@@ -337,13 +337,28 @@ impl ExecutionPlan for CoalescePartitionsExec {
         &self,
         preserve_order: bool,
     ) -> Option<Arc<dyn ExecutionPlan>> {
-        self.input
-            .with_preserve_order(preserve_order)
-            .and_then(|new_input| {
-                let this = self.funding.arc(self.clone()).ok()?;
-                let children = self.funding.vec_of([new_input]).ok()?;
-                replace_children_if_necessary(this, children).ok()
-            })
+        let funding = &self.funding;
+        let before = funding.outstanding();
+        let rewritten =
+            self.input
+                .with_preserve_order(preserve_order)
+                .and_then(|new_input| {
+                    let same_input = Arc::ptr_eq(&self.input, &new_input);
+                    let this = funding.arc(self.clone()).ok()?;
+                    let children = funding.vec_of([new_input]).ok()?;
+                    let bytes = children.capacity() * size_of::<Arc<dyn ExecutionPlan>>();
+                    let result = replace_children_if_necessary(this, children);
+                    // Only an unchanged child keeps the temporary parent Arc.
+                    funding.discharge(bytes);
+                    if !same_input {
+                        funding.discharge(arc_bytes::<Self>());
+                    }
+                    result.ok()
+                });
+        if rewritten.is_none() {
+            funding.unwound(before);
+        }
+        rewritten
     }
 
     fn gather_filters_for_pushdown(
@@ -455,6 +470,266 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
 
     use futures::FutureExt;
+
+    struct Ceiling {
+        limit: std::sync::Mutex<usize>,
+        held: std::sync::Mutex<usize>,
+    }
+
+    impl datafusion_common::funding::PlanningFunding for Ceiling {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if *held + bytes > *self.limit.lock().unwrap() {
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct OrderAwareInput {
+        input: Arc<dyn ExecutionPlan>,
+        funding: Funding,
+    }
+
+    impl DisplayAs for OrderAwareInput {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            f.write_str(self.name())
+        }
+    }
+
+    impl ExecutionPlan for OrderAwareInput {
+        fn name(&self) -> &'static str {
+            "OrderAwareInput"
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.input.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.input.execute(partition, context)
+        }
+
+        fn with_preserve_order(
+            &self,
+            _preserve_order: bool,
+        ) -> Option<Arc<dyn ExecutionPlan>> {
+            self.funding.arc(self.clone()).ok().map(|plan| plan as _)
+        }
+    }
+
+    fn assert_preserve_order_funding(
+        build: impl FnOnce(Arc<dyn ExecutionPlan>, &Funding) -> Result<Arc<dyn ExecutionPlan>>,
+    ) -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: std::sync::Mutex::new(usize::MAX),
+            held: std::sync::Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(OrderAwareInput {
+            input: Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+                schema,
+                &Funding::default(),
+            )?),
+            funding: funding.clone(),
+        });
+        let plan = build(Arc::clone(&input), &funding)?;
+
+        let before = funding.outstanding();
+        let rebuilt = plan
+            .with_preserve_order(true)
+            .expect("order-aware child can be rebuilt");
+        let kept = funding.outstanding() - before;
+        assert!(kept > 1);
+        drop(rebuilt);
+        funding.unwound(before);
+
+        *source.limit.lock().unwrap() = before + kept - 1;
+        assert!(plan.with_preserve_order(true).is_none());
+        assert_eq!(funding.outstanding(), before);
+        assert_eq!(*source.held.lock().unwrap(), before);
+
+        *source.limit.lock().unwrap() = usize::MAX;
+        let before = funding.outstanding();
+        let child = input.with_preserve_order(true).unwrap();
+        let expected = replace_children_if_necessary(Arc::clone(&plan), vec![child])?;
+        let retained = funding.outstanding() - before;
+        drop(expected);
+        funding.unwound(before);
+
+        let rebuilt = plan.with_preserve_order(true).unwrap();
+        assert_eq!(funding.outstanding() - before, retained);
+        assert_eq!(rebuilt.schema(), plan.schema());
+        drop(rebuilt);
+        Ok(())
+    }
+
+    #[test]
+    fn coalesce_preserve_order_funding() -> Result<()> {
+        assert_preserve_order_funding(|input, funding| {
+            Ok(Arc::new(CoalescePartitionsExec::new(input, funding)?))
+        })
+    }
+
+    #[test]
+    fn filter_preserve_order_funding() -> Result<()> {
+        assert_preserve_order_funding(|input, funding| {
+            Ok(Arc::new(crate::filter::FilterExec::try_new(
+                datafusion_physical_expr::expressions::lit(true),
+                input,
+                funding,
+            )?))
+        })
+    }
+
+    #[test]
+    fn projection_preserve_order_funding() -> Result<()> {
+        assert_preserve_order_funding(|input, funding| {
+            Ok(Arc::new(ProjectionExec::try_new(
+                vec![(
+                    Arc::new(datafusion_physical_expr::expressions::Column::new("a", 0))
+                        as _,
+                    "a".to_string(),
+                )],
+                input,
+                funding,
+            )?))
+        })
+    }
+
+    #[test]
+    fn merge_preserve_order_funding() -> Result<()> {
+        assert_preserve_order_funding(|input, funding| {
+            let ordering = datafusion_physical_expr::LexOrdering::new([
+                PhysicalSortExpr::new_default(Arc::new(
+                    datafusion_physical_expr::expressions::Column::new("a", 0),
+                )),
+            ])
+            .unwrap();
+            Ok(Arc::new(
+                crate::sorts::sort_preserving_merge::SortPreservingMergeExec::new(
+                    ordering, input, funding,
+                )?,
+            ))
+        })
+    }
+
+    fn assert_declined_embedding_funding(
+        build: impl FnOnce(Arc<dyn ExecutionPlan>, &Funding) -> Result<Arc<dyn ExecutionPlan>>,
+    ) -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: std::sync::Mutex::new(usize::MAX),
+            held: std::sync::Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+            &Funding::default(),
+        )?);
+        let plan = build(input, &funding)?;
+        let exprs = plan
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                (
+                    Arc::new(datafusion_physical_expr::expressions::Column::new(
+                        field.name(),
+                        index,
+                    )) as _,
+                    format!("renamed_{index}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let projection =
+            ProjectionExec::try_new(exprs, Arc::clone(&plan), &Funding::default())?;
+        let before = funding.outstanding();
+        assert!(plan.try_swapping_with_projection(&projection)?.is_none());
+        assert_eq!(funding.outstanding(), before);
+        assert_eq!(*source.held.lock().unwrap(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn filter_declined_projection_funding() -> Result<()> {
+        assert_declined_embedding_funding(|input, funding| {
+            Ok(Arc::new(crate::filter::FilterExec::try_new(
+                datafusion_physical_expr::expressions::lit(true),
+                input,
+                funding,
+            )?))
+        })
+    }
+
+    #[test]
+    fn hash_join_declined_projection_funding() -> Result<()> {
+        assert_declined_embedding_funding(|input, funding| {
+            use crate::joins::{HashJoinExec, PartitionMode};
+            use datafusion_common::{JoinType, NullEquality};
+            use datafusion_physical_expr::expressions::Column;
+
+            Ok(Arc::new(HashJoinExec::try_new(
+                Arc::clone(&input),
+                input,
+                vec![(Arc::new(Column::new("a", 0)), Arc::new(Column::new("a", 0)))],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+                funding,
+            )?))
+        })
+    }
+
+    #[test]
+    fn nested_loop_declined_projection_funding() -> Result<()> {
+        assert_declined_embedding_funding(|input, funding| {
+            Ok(Arc::new(crate::joins::NestedLoopJoinExec::try_new(
+                Arc::clone(&input),
+                input,
+                None,
+                &datafusion_common::JoinType::Inner,
+                None,
+                funding,
+            )?))
+        })
+    }
 
     #[tokio::test]
     async fn merge() -> Result<()> {

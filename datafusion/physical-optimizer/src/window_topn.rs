@@ -125,11 +125,13 @@ impl WindowTopN {
 
     /// Attempt to transform a single plan node.
     ///
-    /// Returns `Some(new_plan)` if the node matches the
+    /// Returns `Some(Ok(new_plan))` if the node matches the
     /// `FilterExec → [ProjectionExec] → BoundedWindowAggExec`
     /// pattern and can be rewritten, or `None` if the node should be
-    /// left unchanged.
-    fn try_transform(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    /// left unchanged. Rebuilding errors are returned to the caller.
+    fn try_transform(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Option<Result<Arc<dyn ExecutionPlan>>> {
         // Step 1: Match FilterExec at the top
         let filter = plan.downcast_ref::<FilterExec>()?;
 
@@ -183,26 +185,28 @@ impl WindowTopN {
             .chain(order_by.iter().cloned());
         let expr = LexOrdering::new(expr_iterator)?;
 
-        let partitioned_topk = PartitionedTopKExec::try_new(
-            Arc::clone(window_exec_typed.input()),
-            expr,
-            partition_prefix_len,
-            limit_n,
-            fn_kind,
-        )
-        .ok()?;
+        let input = Arc::clone(window_exec_typed.input());
+        Some((|| {
+            let partitioned_topk = PartitionedTopKExec::try_new(
+                input,
+                expr,
+                partition_prefix_len,
+                limit_n,
+                fn_kind,
+            )?;
 
-        // Step 7: Rebuild window with PartitionedTopKExec as its child
-        let mut result =
-            replace_children_if_necessary(window_exec, vec![Arc::new(partitioned_topk)])
-                .ok()?;
+            // Step 7: Rebuild window with PartitionedTopKExec as its child
+            let mut result = replace_children_if_necessary(
+                window_exec,
+                vec![Arc::new(partitioned_topk)],
+            )?;
 
-        // Step 8: Rebuild intermediate nodes (ProjectionExec/RepartitionExec)
-        for node in intermediates.into_iter().rev() {
-            result = replace_children_if_necessary(node, vec![result]).ok()?;
-        }
-
-        Some(result)
+            // Step 8: Rebuild intermediate nodes (ProjectionExec/RepartitionExec)
+            for node in intermediates.into_iter().rev() {
+                result = replace_children_if_necessary(node, vec![result])?;
+            }
+            Ok(result)
+        })())
     }
 }
 
@@ -217,13 +221,16 @@ impl PhysicalOptimizerRule for WindowTopN {
         }
 
         plan.transform_down(|node| {
-            Ok(
-                if let Some(transformed) = WindowTopN::try_transform(&node) {
-                    Transformed::yes(transformed)
-                } else {
-                    Transformed::no(node)
-                },
-            )
+            let before = config.funding.outstanding();
+            match WindowTopN::try_transform(&node) {
+                Some(Ok(transformed)) => Ok(Transformed::yes(transformed)),
+                Some(Err(error)) if error.refused().is_some() => Err(error),
+                Some(Err(_)) => {
+                    config.funding.unwound(before);
+                    Ok(Transformed::no(node))
+                }
+                None => Ok(Transformed::no(node)),
+            }
         })
         .data()
     }
@@ -357,5 +364,122 @@ fn find_window_below(plan: &Arc<dyn ExecutionPlan>) -> Option<PlanAndIntermediat
         } else {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{Field, Schema};
+    use datafusion_common::funding::{Funding, PlanningFunding};
+    use datafusion_expr::{WindowFrame, WindowFrameBound, WindowFrameUnits};
+    use datafusion_functions_window::row_number::row_number_udwf;
+    use datafusion_physical_expr::expressions::{col, lit};
+    use datafusion_physical_plan::InputOrderMode;
+    use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+    use datafusion_physical_plan::windows::create_udwf_window_expr;
+
+    struct Ceiling {
+        limit: std::sync::Mutex<usize>,
+        held: std::sync::Mutex<usize>,
+    }
+
+    impl PlanningFunding for Ceiling {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if *held + bytes > *self.limit.lock().unwrap() {
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    fn assert_refused_rebuild(with_projection: bool) -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: std::sync::Mutex::new(usize::MAX),
+            held: std::sync::Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        let input = Arc::new(PlaceholderRowExec::new(Arc::clone(&schema), &funding)?);
+        let window_expr = Arc::new(StandardWindowExpr::new(
+            create_udwf_window_expr(
+                &row_number_udwf(),
+                &[],
+                &schema,
+                "rn".to_string(),
+                false,
+            )?,
+            &[col("pk", &schema)?],
+            &[PhysicalSortExpr::new_default(col("val", &schema)?)],
+            Arc::new(WindowFrame::new_bounds(
+                WindowFrameUnits::Rows,
+                WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                WindowFrameBound::CurrentRow,
+            )),
+        ));
+        let mut window: Arc<dyn ExecutionPlan> = Arc::new(BoundedWindowAggExec::try_new(
+            vec![window_expr],
+            input,
+            InputOrderMode::Sorted,
+            true,
+            &funding,
+        )?);
+        if with_projection {
+            window = Arc::new(ProjectionExec::try_new(
+                vec![
+                    (col("pk", &window.schema())?, "pk".to_string()),
+                    (col("val", &window.schema())?, "val".to_string()),
+                    (col("rn", &window.schema())?, "rn".to_string()),
+                ],
+                window,
+                &funding,
+            )?);
+        }
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FilterExec::try_new(
+            Arc::new(BinaryExpr::new(
+                col("rn", &window.schema())?,
+                Operator::LtEq,
+                lit(ScalarValue::UInt64(Some(3))),
+            )),
+            window,
+            &funding,
+        )?);
+        let mut config = ConfigOptions::new();
+        config.funding = funding.clone();
+        config.optimizer.enable_window_topn = true;
+        let before = funding.outstanding();
+        let optimized = WindowTopN::new().optimize(Arc::clone(&plan), &config)?;
+        assert!(!Arc::ptr_eq(&optimized, &plan));
+        let kept = funding.outstanding() - before;
+        assert!(kept > 1);
+        drop(optimized);
+        funding.unwound(before);
+
+        *source.limit.lock().unwrap() = before + kept - 1;
+        let error = WindowTopN::new().optimize(plan, &config).unwrap_err();
+        assert!(error.refused().is_some());
+        assert!(funding.outstanding() > before);
+        funding.unwound(before);
+        assert_eq!(*source.held.lock().unwrap(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn refused_window_topn_rebuild_funding_is_not_swallowed() -> Result<()> {
+        assert_refused_rebuild(false)
+    }
+
+    #[test]
+    fn refused_window_topn_projection_rebuild_funding_is_not_swallowed() -> Result<()> {
+        assert_refused_rebuild(true)
     }
 }

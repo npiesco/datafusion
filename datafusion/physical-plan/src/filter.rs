@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion_common::funding::Funding;
+use datafusion_common::funding::{Funding, arc_bytes};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -702,7 +702,12 @@ impl ExecutionPlan for FilterExec {
                 return Ok(Some(self.funding.arc(swapped)? as _));
             }
         }
-        try_embed_projection(projection, self)
+        let before = self.funding.outstanding();
+        let embedded = try_embed_projection(projection, self)?;
+        if embedded.is_none() {
+            self.funding.unwound(before);
+        }
+        Ok(embedded)
     }
 
     fn gather_filters_for_pushdown(
@@ -870,14 +875,27 @@ impl ExecutionPlan for FilterExec {
         &self,
         preserve_order: bool,
     ) -> Option<Arc<dyn ExecutionPlan>> {
-        self.input
-            .with_preserve_order(preserve_order)
-            .and_then(|new_input| {
-                let funding = &self.funding;
-                let this = funding.arc(self.clone()).ok()?;
-                let children = funding.vec_of([new_input]).ok()?;
-                replace_children_if_necessary(this, children).ok()
-            })
+        let funding = &self.funding;
+        let before = funding.outstanding();
+        let rewritten =
+            self.input
+                .with_preserve_order(preserve_order)
+                .and_then(|new_input| {
+                    let same_input = Arc::ptr_eq(&self.input, &new_input);
+                    let this = funding.arc(self.clone()).ok()?;
+                    let children = funding.vec_of([new_input]).ok()?;
+                    let bytes = children.capacity() * size_of::<Arc<dyn ExecutionPlan>>();
+                    let result = replace_children_if_necessary(this, children);
+                    funding.discharge(bytes);
+                    if !same_input {
+                        funding.discharge(arc_bytes::<Self>());
+                    }
+                    result.ok()
+                });
+        if rewritten.is_none() {
+            funding.unwound(before);
+        }
+        rewritten
     }
 
     #[cfg(feature = "proto")]

@@ -1089,6 +1089,7 @@ impl HashJoinExec {
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
+    #[expect(clippy::too_many_arguments)]
     fn compute_properties(
         left: &Arc<dyn ExecutionPlan>,
         right: &Arc<dyn ExecutionPlan>,
@@ -1726,7 +1727,12 @@ impl ExecutionPlan for HashJoinExec {
                 .build_exec()
                 .map(Some)
         } else {
-            try_embed_projection(projection, self)
+            let before = self.funding.outstanding();
+            let embedded = try_embed_projection(projection, self)?;
+            if embedded.is_none() {
+                self.funding.unwound(before);
+            }
+            Ok(embedded)
         }
     }
 
