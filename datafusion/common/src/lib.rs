@@ -36,6 +36,7 @@ pub mod extensions;
 pub mod file_options;
 pub mod float_semantics;
 pub mod format;
+pub mod funded_arrow;
 pub mod funding;
 pub mod hash_utils;
 pub mod heap_size;
@@ -60,6 +61,7 @@ pub use arrow;
 pub use column::Column;
 pub use dfschema::{
     DFSchema, DFSchemaRef, ExprSchema, SchemaExt, ToDFSchema, qualified_name,
+    qualified_name_is, qualified_names_equal,
 };
 pub use diagnostic::Diagnostic;
 pub use display::human_readable::{
@@ -79,7 +81,8 @@ pub use functional_dependencies::{
     Constraint, Constraints, Dependency, FunctionalDependence, FunctionalDependencies,
     aggregate_functional_dependencies_with_computed_inputs,
     get_required_group_by_exprs_indices, get_required_sort_exprs_indices,
-    get_target_functional_dependencies,
+    get_required_sort_exprs_indices_by_name_funded,
+    get_required_sort_exprs_indices_funded, get_target_functional_dependencies,
 };
 use hashbrown::DefaultHashBuilder;
 pub use join_type::{JoinConstraint, JoinSide, JoinType};

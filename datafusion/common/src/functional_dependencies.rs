@@ -10,8 +10,11 @@ use std::ops::Deref;
 use std::vec::IntoIter;
 
 use crate::cloned::CloneBytes;
+use crate::dfschema::qualified_name_bytes;
+use crate::error::Result;
+use crate::funding::{Funding, Held};
 use crate::utils::{merge_and_order_indices, set_difference};
-use crate::{DFSchema, HashSet, JoinType, NullEquality};
+use crate::{DFSchema, HashSet, JoinType, NullEquality, TableReference};
 
 /// This object defines a constraint on a table.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
@@ -193,6 +196,18 @@ impl FunctionalDependence {
                 .iter()
                 .all(|&source_idx| !schema.field(source_idx).is_nullable())
     }
+
+    /// Drop this functional dependence, giving back to `funding` the source and target
+    /// index buffers it holds.
+    pub fn released(self, funding: &Funding) {
+        let Self {
+            source_indices,
+            target_indices,
+            ..
+        } = self;
+        funding.released(source_indices);
+        funding.released(target_indices);
+    }
 }
 
 /// This object encapsulates all functional dependencies in a given relation.
@@ -213,40 +228,69 @@ impl FunctionalDependencies {
         Self { deps: dependencies }
     }
 
-    /// Creates a new `FunctionalDependencies` object from the given constraints.
+    /// Drop these functional dependencies, giving back to `funding` every dependence's
+    /// index buffers and the outer `deps` buffer.
+    pub fn released(mut self, funding: &Funding) {
+        for dep in self.deps.drain(..) {
+            dep.released(funding);
+        }
+        funding.released(self.deps);
+    }
+
+    /// Creates a new `FunctionalDependencies` object from a vector of
+    /// `Constraint` objects.
     pub fn new_from_constraints(
         constraints: Option<&Constraints>,
         n_field: usize,
     ) -> Self {
-        if let Some(Constraints { inner: constraints }) = constraints {
-            // Construct dependency objects based on each individual constraint:
-            let dependencies = constraints
-                .iter()
-                .map(|constraint| {
-                    // All the field indices are associated with the whole table
-                    // since we are dealing with table level constraints:
-                    let dependency = match constraint {
-                        Constraint::PrimaryKey(indices) => FunctionalDependence::new(
-                            indices.to_vec(),
-                            (0..n_field).collect::<Vec<_>>(),
-                            false,
-                        ),
-                        Constraint::Unique(indices) => FunctionalDependence::new(
-                            indices.to_vec(),
-                            (0..n_field).collect::<Vec<_>>(),
-                            true,
-                        ),
-                    };
-                    // As primary keys are guaranteed to be unique, set the
-                    // functional dependency mode to `Dependency::Single`:
-                    dependency.with_mode(Dependency::Single)
-                })
-                .collect::<Vec<_>>();
-            Self::new(dependencies)
-        } else {
+        Self::new_from_constraints_funded(constraints, n_field, &Funding::default())
+            .expect("default funding is unlimited")
+    }
+
+    /// Creates a new `FunctionalDependencies` object from the given constraints, every list
+    /// it makes charged to `funding` before it is made.
+    pub fn new_from_constraints_funded(
+        constraints: Option<&Constraints>,
+        n_field: usize,
+        funding: &Funding,
+    ) -> Result<Self> {
+        let Some(Constraints { inner: constraints }) = constraints else {
             // There is no constraint, return an empty object:
-            Self::empty()
+            return Ok(Self::empty());
+        };
+        // Construct dependency objects based on each individual constraint:
+        let mut result = Self::new(funding.vec_with_capacity(constraints.len())?);
+        for constraint in constraints {
+            let (indices, nullable) = match constraint {
+                Constraint::PrimaryKey(indices) => (indices, false),
+                Constraint::Unique(indices) => (indices, true),
+            };
+            // All the field indices are associated with the whole table
+            // since we are dealing with table level constraints:
+            let mut targets = match funding.vec_with_capacity(n_field) {
+                Ok(targets) => targets,
+                Err(err) => {
+                    result.released(funding);
+                    return Err(err);
+                }
+            };
+            targets.extend(0..n_field);
+            let sources = match funding.vec_from_slice(indices) {
+                Ok(sources) => sources,
+                Err(err) => {
+                    funding.released(targets);
+                    result.released(funding);
+                    return Err(err);
+                }
+            };
+            // As primary keys are guaranteed to be unique, set the
+            // functional dependency mode to `Dependency::Single`:
+            result.deps.push(
+                FunctionalDependence::new(sources, targets, nullable)
+                    .with_mode(Dependency::Single),
+            );
         }
+        Ok(result)
     }
 
     pub fn with_dependency(mut self, mode: Dependency) -> Self {
@@ -312,7 +356,26 @@ impl FunctionalDependencies {
         // to correctly associate a `Single`-mode dependence with the whole table.
         n_out: usize,
     ) -> FunctionalDependencies {
-        let mut projected_func_dependencies = Vec::with_capacity(self.deps.len());
+        self.project_functional_dependencies_funded(
+            proj_indices,
+            n_out,
+            &Funding::default(),
+        )
+        .expect("default funding is unlimited")
+    }
+
+    /// Updates `source_indices` and `target_indices` of each functional
+    /// dependence using the index mapping given in `proj_indices`, charging
+    /// every index buffer and dependency list allocation to `funding`.
+    pub fn project_functional_dependencies_funded(
+        &self,
+        proj_indices: &[usize],
+        // The argument `n_out` denotes the schema field length, which is needed
+        // to correctly associate a `Single`-mode dependence with the whole table.
+        n_out: usize,
+        funding: &Funding,
+    ) -> Result<FunctionalDependencies> {
+        let mut projected_func_dependencies = Self::empty();
         for FunctionalDependence {
             source_indices,
             target_indices,
@@ -322,28 +385,58 @@ impl FunctionalDependencies {
         } in &self.deps
         {
             let new_source_indices =
-                update_elements_with_matching_indices(source_indices, proj_indices);
-            let new_target_indices = if *mode == Dependency::Single {
-                // Associate with all of the fields in the schema:
-                (0..n_out).collect()
-            } else {
-                // Update associations according to projection:
-                update_elements_with_matching_indices(target_indices, proj_indices)
-            };
+                match matching_indices(source_indices, proj_indices, funding) {
+                    Ok(indices) => indices,
+                    Err(err) => {
+                        projected_func_dependencies.released(funding);
+                        return Err(err);
+                    }
+                };
             // All of the composite indices should still be valid after projection;
             // otherwise, functional dependency cannot be propagated.
-            if new_source_indices.len() == source_indices.len() {
-                let new_func_dependence = FunctionalDependence::new(
-                    new_source_indices,
-                    new_target_indices,
-                    *nullable,
-                )
-                .with_mode(*mode)
-                .with_null_equality(*null_equality);
-                projected_func_dependencies.push(new_func_dependence);
+            if new_source_indices.len() != source_indices.len() {
+                funding.released(new_source_indices);
+                continue;
             }
+            let new_target_indices = if *mode == Dependency::Single {
+                // Associate with all of the fields in the schema:
+                let mut all = match funding.vec_with_capacity(n_out) {
+                    Ok(all) => all,
+                    Err(err) => {
+                        funding.released(new_source_indices);
+                        projected_func_dependencies.released(funding);
+                        return Err(err);
+                    }
+                };
+                all.extend(0..n_out);
+                all
+            } else {
+                // Update associations according to projection:
+                match matching_indices(target_indices, proj_indices, funding) {
+                    Ok(indices) => indices,
+                    Err(err) => {
+                        funding.released(new_source_indices);
+                        projected_func_dependencies.released(funding);
+                        return Err(err);
+                    }
+                }
+            };
+            if let Err(err) = funding.reserve(&mut projected_func_dependencies.deps, 1) {
+                funding.released(new_source_indices);
+                funding.released(new_target_indices);
+                projected_func_dependencies.released(funding);
+                return Err(err);
+            }
+            let new_func_dependence = FunctionalDependence::new(
+                new_source_indices,
+                new_target_indices,
+                *nullable,
+            )
+            .with_mode(*mode)
+            .with_null_equality(*null_equality);
+            projected_func_dependencies.deps.push(new_func_dependence);
         }
-        FunctionalDependencies::new(projected_func_dependencies)
+        Ok(projected_func_dependencies)
     }
 
     /// This function joins this set of functional dependencies with the `other`
@@ -354,64 +447,117 @@ impl FunctionalDependencies {
         join_type: &JoinType,
         left_cols_len: usize,
     ) -> FunctionalDependencies {
-        // Get mutable copies of left and right side dependencies:
-        let mut right_func_dependencies = other.clone();
-        let mut left_func_dependencies = self.clone();
+        self.join_funded(other, join_type, left_cols_len, &Funding::default())
+            .expect("default funding is unlimited")
+    }
 
+    /// This function joins this set of functional dependencies with the `other`
+    /// according to the given `join_type`, charging allocations to `funding`.
+    pub fn join_funded(
+        &self,
+        other: &FunctionalDependencies,
+        join_type: &JoinType,
+        left_cols_len: usize,
+        funding: &Funding,
+    ) -> Result<FunctionalDependencies> {
         match join_type {
             JoinType::Inner | JoinType::Left | JoinType::Right => {
-                // Add offset to right schema:
-                right_func_dependencies.add_offset(left_cols_len);
-
-                // Result may have multiple values, update the dependency mode:
-                left_func_dependencies =
-                    left_func_dependencies.with_dependency(Dependency::Multi);
-                right_func_dependencies =
-                    right_func_dependencies.with_dependency(Dependency::Multi);
-
-                if *join_type == JoinType::Left {
-                    // Downgrade the right side, since it may have additional NULL values:
-                    right_func_dependencies.downgrade_dependencies();
-                } else if *join_type == JoinType::Right {
-                    // Downgrade the left side, since it may have additional NULL values:
-                    left_func_dependencies.downgrade_dependencies();
+                // The result may have multiple values for a key, and the side that may
+                // gain NULL values is downgraded: a new NULL invalidates a UNIQUE
+                // (nullable) dependency, and turns a PRIMARY KEY into a UNIQUE one.
+                let left_kept = |dep: &&FunctionalDependence| {
+                    *join_type != JoinType::Right || !dep.nullable
+                };
+                let right_kept = |dep: &&FunctionalDependence| {
+                    *join_type != JoinType::Left || !dep.nullable
+                };
+                let mut result =
+                    Self::new(
+                        funding.vec_with_capacity(
+                            self.deps.iter().filter(left_kept).count().saturating_add(
+                                other.deps.iter().filter(right_kept).count(),
+                            ),
+                        )?,
+                    );
+                for dep in self.deps.iter().filter(left_kept) {
+                    let source_indices =
+                        match offset_indices(&dep.source_indices, 0, funding) {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    let target_indices =
+                        match offset_indices(&dep.target_indices, 0, funding) {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                funding.released(source_indices);
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    result.deps.push(FunctionalDependence {
+                        source_indices,
+                        target_indices,
+                        nullable: dep.nullable || *join_type == JoinType::Right,
+                        null_equality: if *join_type == JoinType::Right {
+                            NullEquality::NullEqualsNull
+                        } else {
+                            dep.null_equality
+                        },
+                        mode: Dependency::Multi,
+                    });
                 }
-                // Combine left and right functional dependencies:
-                left_func_dependencies.extend(right_func_dependencies);
-                left_func_dependencies
+                // The right side's indices are offset past the left side's columns.
+                for dep in other.deps.iter().filter(right_kept) {
+                    let source_indices =
+                        match offset_indices(&dep.source_indices, left_cols_len, funding)
+                        {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    let target_indices =
+                        match offset_indices(&dep.target_indices, left_cols_len, funding)
+                        {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                funding.released(source_indices);
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    result.deps.push(FunctionalDependence {
+                        source_indices,
+                        target_indices,
+                        nullable: dep.nullable || *join_type == JoinType::Left,
+                        null_equality: if *join_type == JoinType::Left {
+                            NullEquality::NullEqualsNull
+                        } else {
+                            dep.null_equality
+                        },
+                        mode: Dependency::Multi,
+                    });
+                }
+                Ok(result)
             }
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
                 // These joins preserve functional dependencies of the left side:
-                left_func_dependencies
+                funding.cloned(self)
             }
             JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark => {
                 // These joins preserve functional dependencies of the right side:
-                right_func_dependencies
+                funding.cloned(other)
             }
             JoinType::Full => {
                 // All of the functional dependencies are lost in a FULL join:
-                FunctionalDependencies::empty()
+                Ok(FunctionalDependencies::empty())
             }
         }
     }
-
-    /// This function downgrades a functional dependency when nullability becomes
-    /// a possibility:
-    /// - If the dependency in question is UNIQUE (i.e. nullable), a new null value
-    ///   invalidates the dependency.
-    /// - If the dependency in question is PRIMARY KEY (i.e. not nullable), a new
-    ///   null value turns it into UNIQUE mode.
-    fn downgrade_dependencies(&mut self) {
-        // Delete nullable dependencies, since they are no longer valid:
-        self.deps.retain(|item| !item.nullable);
-        // Survivors had a non-null determinant, so every new NULL comes from a
-        // padded row whose targets are all NULL too:
-        self.deps.iter_mut().for_each(|item| {
-            item.nullable = true;
-            item.null_equality = NullEquality::NullEqualsNull;
-        });
-    }
-
     /// This function ensures that functional dependencies involving uniquely
     /// occurring determinant keys cover their entire table in terms of
     /// dependent columns.
@@ -801,17 +947,85 @@ pub fn get_required_sort_exprs_indices(
     schema: &DFSchema,
     sort_input_indices: &[Option<usize>],
 ) -> Vec<usize> {
+    get_required_sort_exprs_indices_funded(
+        schema,
+        sort_input_indices,
+        &Funding::default(),
+    )
+    .expect("default funding is unlimited")
+    .keep()
+}
+
+/// Returns indices for the minimal subset of ORDER BY expressions that are
+/// functionally equivalent to the original set of ORDER BY expressions, charging
+/// the working and result buffers to `funding`.
+pub fn get_required_sort_exprs_indices_funded<'a>(
+    schema: &DFSchema,
+    sort_input_indices: &[Option<usize>],
+    funding: &'a Funding,
+) -> Result<Held<'a, Vec<usize>>> {
     let dependencies = schema.functional_dependencies();
 
-    let mut known_field_indices = HashSet::with_capacity(sort_input_indices.len());
-    let mut required_sort_expr_indices = Vec::with_capacity(sort_input_indices.len());
+    let mut known_fields = funding.held::<Vec<bool>>();
+    known_fields.reserve_exact(schema.fields().len())?;
+    known_fields.resize(schema.fields().len(), false);
+    let mut required_sort_expr_indices = funding.held::<Vec<usize>>();
+    required_sort_expr_indices.reserve_exact(sort_input_indices.len())?;
 
     for (sort_expr_idx, field_idx) in sort_input_indices.iter().enumerate() {
-        // If the sort expression doesn't reference a schema field (e.g. a
-        // computed expression), we can't reason about it via functional
-        // dependencies, so conservatively keep it.
         let Some(field_idx) = *field_idx else {
-            required_sort_expr_indices.push(sort_expr_idx);
+            required_sort_expr_indices.push(sort_expr_idx)?;
+            continue;
+        };
+
+        let removable = dependencies.deps.iter().any(|dependency| {
+            dependency.target_indices.contains(&field_idx)
+                && dependency
+                    .source_indices
+                    .iter()
+                    .all(|source_idx| known_fields.get(*source_idx) == Some(&true))
+                && dependency.is_valid_across_nulls(schema)
+        });
+
+        if removable {
+            continue;
+        }
+
+        if let Some(slot) = known_fields.get_mut(field_idx) {
+            *slot = true;
+        }
+        required_sort_expr_indices.push(sort_expr_idx)?;
+    }
+
+    Ok(required_sort_expr_indices)
+}
+
+/// Returns indices for the minimal subset of ORDER BY expressions that are
+/// functionally equivalent to the original set of ORDER BY expressions, each named as
+/// `sort_expr_names` display. The list and the fields marked on the way are charged to
+/// `funding`; names are compared as they are written, nothing allocated for them.
+pub fn get_required_sort_exprs_indices_by_name_funded<'a, N: Display>(
+    schema: &DFSchema,
+    sort_expr_names: impl ExactSizeIterator<Item = N>,
+    funding: &'a Funding,
+) -> Result<Held<'a, Vec<usize>>> {
+    let dependencies = schema.functional_dependencies();
+
+    let mut known_fields = funding.held::<Vec<bool>>();
+    known_fields.reserve_exact(schema.fields().len())?;
+    // Room for each is charged: filling it allocates nothing.
+    known_fields.resize(schema.fields().len(), false);
+    let mut required_sort_expr_indices = funding.held::<Vec<usize>>();
+    required_sort_expr_indices.reserve_exact(sort_expr_names.len())?;
+
+    for (sort_expr_idx, sort_expr_name) in sort_expr_names.enumerate() {
+        // If the sort expression doesn't correspond to a known schema field
+        // (e.g. a computed expression), we can't reason about it via functional
+        // dependencies, so conservatively keep it.
+        let Some(field_idx) = schema.iter().position(|(qualifier, field)| {
+            displays_qualified_name(qualifier, field.name(), &sort_expr_name)
+        }) else {
+            required_sort_expr_indices.push(sort_expr_idx)?;
             continue;
         };
 
@@ -823,7 +1037,7 @@ pub fn get_required_sort_exprs_indices(
                 && dependency
                     .source_indices
                     .iter()
-                    .all(|source_idx| known_field_indices.contains(source_idx))
+                    .all(|source_idx| known_fields.get(*source_idx) == Some(&true))
                 && dependency.is_valid_across_nulls(schema)
         });
 
@@ -831,11 +1045,35 @@ pub fn get_required_sort_exprs_indices(
             continue;
         }
 
-        known_field_indices.insert(field_idx);
-        required_sort_expr_indices.push(sort_expr_idx);
+        known_fields[field_idx] = true;
+        required_sort_expr_indices.push(sort_expr_idx)?;
     }
 
-    required_sort_expr_indices
+    Ok(required_sort_expr_indices)
+}
+
+/// Whether `value` displays as the [`qualified_name`] of `qualifier` and `name`, compared
+/// as it is written, nothing allocated.
+///
+/// [`qualified_name`]: crate::qualified_name
+fn displays_qualified_name(
+    qualifier: Option<&TableReference>,
+    name: &str,
+    value: &impl Display,
+) -> bool {
+    struct Rest<I>(I);
+    impl<I: Iterator<Item = u8>> std::fmt::Write for Rest<I> {
+        fn write_str(&mut self, part: &str) -> std::fmt::Result {
+            if part.bytes().all(|byte| self.0.next() == Some(byte)) {
+                Ok(())
+            } else {
+                Err(std::fmt::Error)
+            }
+        }
+    }
+    let mut rest = Rest(qualified_name_bytes(qualifier, name));
+    std::fmt::Write::write_fmt(&mut rest, format_args!("{value}")).is_ok()
+        && rest.0.next().is_none()
 }
 
 /// Updates entries inside the `entries` vector with their corresponding
@@ -850,7 +1088,37 @@ fn update_elements_with_matching_indices(
         .collect()
 }
 
+/// The positions in `proj_indices` of the `entries` it holds, listed through `funding`.
+fn matching_indices(
+    entries: &[usize],
+    proj_indices: &[usize],
+    funding: &Funding,
+) -> Result<Vec<usize>> {
+    let matching = entries
+        .iter()
+        .filter(|val| proj_indices.contains(val))
+        .count();
+    let mut indices = funding.vec_with_capacity(matching)?;
+    indices.extend(
+        entries
+            .iter()
+            .filter_map(|val| proj_indices.iter().position(|proj_idx| proj_idx == val)),
+    );
+    Ok(indices)
+}
+
 /// Adds `offset` value to each entry inside `in_data`.
+/// `indices` each offset by `offset`, in a list charged to `funding` before it is made.
+fn offset_indices(
+    indices: &[usize],
+    offset: usize,
+    funding: &Funding,
+) -> Result<Vec<usize>> {
+    let mut offset_indices = funding.vec_with_capacity(indices.len())?;
+    offset_indices.extend(indices.iter().map(|&index| index + offset));
+    Ok(offset_indices)
+}
+
 fn add_offset_to_vec<T: Copy + std::ops::Add<Output = T>>(
     in_data: &[T],
     offset: T,
@@ -930,7 +1198,9 @@ mod tests {
                 vec![0, 1, 2],
                 true,
             )]);
-        let res = fund_dependencies.project_functional_dependencies(&[1, 2], 2);
+        let res = fund_dependencies
+            .project_functional_dependencies_funded(&[1, 2], 2, &Funding::default())
+            .unwrap();
         let expected = FunctionalDependencies::new(vec![FunctionalDependence::new(
             vec![0],
             vec![0, 1],
