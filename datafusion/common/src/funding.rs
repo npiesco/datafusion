@@ -533,11 +533,22 @@ impl<B: Buffer> Held<B> {
 
     /// Its room charged to `next` instead: charged there first, then given back here.
     pub fn rebind(&mut self, next: &Funding) -> Result<()> {
-        let bytes = self.buffer.block_bytes();
-        next.charge(bytes)?;
-        self.funding.discharge(bytes);
-        self.funding = next.clone();
+        next.charge(self.charged_bytes())?;
+        self.charged_to(next);
         Ok(())
+    }
+
+    /// The bytes its room holds charged.
+    pub fn charged_bytes(&self) -> usize {
+        self.buffer.block_bytes()
+    }
+
+    /// Its room, which the caller has already charged to `next`, given back here and bound
+    /// there. Nothing is charged, so nothing can refuse: a caller moving several buffers
+    /// charges `next` for all of them first.
+    pub fn charged_to(&mut self, next: &Funding) {
+        self.funding.discharge(self.charged_bytes());
+        self.funding = next.clone();
     }
 }
 
@@ -731,12 +742,16 @@ impl<K, V, S> FundedMap<K, V, S> {
     /// `next`, charging `next` first so a refusal leaves the map and its existing funding
     /// unchanged.
     pub fn rebind(&mut self, next: &Funding) -> Result<()> {
-        if self.charged > 0 {
-            next.charge(self.charged)?;
-            self.funding.discharge(self.charged);
-        }
-        self.funding = next.clone();
+        next.charge(self.charged)?;
+        self.charged_to(next);
         Ok(())
+    }
+
+    /// Moves this map's standing charge, which the caller has already charged to `next`, off
+    /// its current handle. Nothing is charged, so nothing can refuse.
+    pub fn charged_to(&mut self, next: &Funding) {
+        self.funding.discharge(self.charged);
+        self.funding = next.clone();
     }
 
     /// Detaches this map's standing charge from its [`Funding`] handle without discharging
@@ -1655,6 +1670,12 @@ impl<T, S> FundedSet<T, S> {
     /// discharging the previous handle.
     pub fn rebind(&mut self, next: &Funding) -> Result<()> {
         self.map.rebind(next)
+    }
+
+    /// Moves this set's standing charge, which the caller has already charged to `next`, off
+    /// its current handle. Nothing is charged, so nothing can refuse.
+    pub fn charged_to(&mut self, next: &Funding) {
+        self.map.charged_to(next)
     }
 
     /// Detaches this set's standing charge from its [`Funding`] handle without discharging

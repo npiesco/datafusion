@@ -30,7 +30,7 @@ use arrow::compute::kernels::sort::{SortColumn, SortOptions};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::cloned::{CloneBytes, slice_clone_bytes};
-use datafusion_common::funding::{FundedSet, Funding, Held};
+use datafusion_common::funding::{FundedSet, Funding, Held, refused};
 use datafusion_common::{HashSet, Result};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 /// Represents Sort operation for a column in a RecordBatch
@@ -546,16 +546,18 @@ impl LexOrdering {
         })
     }
 
-    /// Its storage charged to `funding` instead.
+    /// Its storage charged to `funding` instead. Both buffers are charged there in one
+    /// charge before either moves, so a refusal leaves both where they were and the previous
+    /// funding is never asked to grant again.
     pub fn rebind(&mut self, funding: &Funding) -> Result<()> {
-        let before = self.exprs.funding().clone();
-        self.exprs.rebind(funding)?;
-        if let Err(error) = self.set.rebind(funding) {
-            self.exprs
-                .rebind(&before)
-                .expect("the previous funding had this charge");
-            return Err(error);
-        }
+        let bytes = self
+            .exprs
+            .charged_bytes()
+            .checked_add(self.set.charged_bytes())
+            .ok_or_else(|| refused(usize::MAX))?;
+        funding.charge(bytes)?;
+        self.exprs.charged_to(funding);
+        self.set.charged_to(funding);
         Ok(())
     }
 
