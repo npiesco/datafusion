@@ -23,7 +23,6 @@ use std::fmt::{Display, Formatter};
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock};
 
-use crate::cloned::CloneBytes;
 use crate::error::{_plan_err, _schema_err, DataFusionError, Result};
 use crate::funding::{Funding, arc_bytes, arc_slice_bytes};
 use crate::{
@@ -157,22 +156,36 @@ impl DFSchema {
         metadata: HashMap<String, String>,
         funding: &Funding,
     ) -> Result<Self> {
-        let mut qualifiers = funding.vec_with_capacity(qualified_fields.len())?;
+        let count = qualified_fields.len();
+        let mut qualifiers = funding.held::<Vec<Option<TableReference>>>();
+        qualifiers.reserve_exact(count)?;
         qualifiers.extend(
             qualified_fields
                 .iter()
                 .map(|(qualifier, _)| qualifier.clone()),
         );
-        let mut fields = funding.held::<Vec<FieldRef>>();
-        fields.reserve_exact(qualified_fields.len())?;
-        fields.extend(qualified_fields.iter().map(|(_, field)| Arc::clone(field)));
-        let fields = funding.fields(&fields)?;
+        let fields = {
+            let mut fields = funding.held::<Vec<FieldRef>>();
+            fields.reserve_exact(count)?;
+            fields.extend(qualified_fields.iter().map(|(_, field)| Arc::clone(field)));
+            funding.fields(&fields)?
+        };
+        let inner = match funding.arc(Schema::new_with_metadata(fields, metadata)) {
+            Ok(inner) => inner,
+            Err(err) => {
+                funding.discharge(arc_slice_bytes::<FieldRef>(count)?);
+                return Err(err);
+            }
+        };
         let dfschema = Self {
-            inner: funding.arc(Schema::new_with_metadata(fields, metadata))?,
-            field_qualifiers: qualifiers,
+            inner,
+            field_qualifiers: qualifiers.keep(),
             functional_dependencies: FunctionalDependencies::empty(),
         };
-        dfschema.check_names()?;
+        if let Err(err) = dfschema.check_names() {
+            dfschema.released(funding);
+            return Err(err);
+        }
         Ok(dfschema)
     }
 
@@ -389,22 +402,45 @@ impl DFSchema {
         };
         let count = self.field_qualifiers.len() + added().count();
 
-        let mut qualifiers = funding.vec_with_capacity(count)?;
+        let mut qualifiers = funding.held::<Vec<Option<TableReference>>>();
+        qualifiers.reserve_exact(count)?;
         qualifiers.extend(self.field_qualifiers.iter().cloned());
         qualifiers.extend(added().map(|(qualifier, _)| qualifier.cloned()));
-        let mut fields = funding.held::<Vec<FieldRef>>();
-        fields.reserve_exact(count)?;
-        fields.extend(self.inner.fields.iter().cloned());
-        fields.extend(added().map(|(_, field)| Arc::clone(field)));
-        let fields = funding.fields(&fields)?;
+        let fields = {
+            let mut fields = funding.held::<Vec<FieldRef>>();
+            fields.reserve_exact(count)?;
+            fields.extend(self.inner.fields.iter().cloned());
+            fields.extend(added().map(|(_, field)| Arc::clone(field)));
+            funding.fields(&fields)?
+        };
 
         let mut metadata = self.inner.metadata.clone();
         metadata.extend(other_schema.inner.metadata.clone());
 
+        let inner = match funding.arc(Schema::new_with_metadata(fields, metadata)) {
+            Ok(inner) => inner,
+            Err(err) => {
+                funding.discharge(arc_slice_bytes::<FieldRef>(count)?);
+                return Err(err);
+            }
+        };
+        let functional_dependencies = match funding.cloned(&self.functional_dependencies)
+        {
+            Ok(deps) => deps,
+            Err(err) => {
+                drop(inner);
+                funding.discharge(
+                    arc_bytes::<Schema>()
+                        .saturating_add(arc_slice_bytes::<FieldRef>(count)?),
+                );
+                return Err(err);
+            }
+        };
+
         Ok(Self {
-            inner: funding.arc(Schema::new_with_metadata(fields, metadata))?,
-            field_qualifiers: qualifiers,
-            functional_dependencies: funding.cloned(&self.functional_dependencies)?,
+            inner,
+            field_qualifiers: qualifiers.keep(),
+            functional_dependencies,
         })
     }
 
@@ -419,9 +455,9 @@ impl DFSchema {
             field_qualifiers,
             functional_dependencies,
         } = self;
-        let mut freed = functional_dependencies.clone_bytes();
-        drop(functional_dependencies);
+        functional_dependencies.released(funding);
         funding.released(field_qualifiers);
+        let mut freed = 0;
         if let Ok(schema) = Arc::try_unwrap(inner) {
             freed += arc_bytes::<Schema>();
             if let Ok(fields) = arc_slice_bytes::<FieldRef>(schema.fields().len()) {
@@ -440,12 +476,11 @@ impl DFSchema {
             field_qualifiers,
             functional_dependencies,
         } = self;
-        let mut freed = functional_dependencies.clone_bytes();
+        functional_dependencies.released(funding);
         funding.released(field_qualifiers);
         if Arc::try_unwrap(inner).is_ok() {
-            freed += arc_bytes::<Schema>();
+            funding.discharge(arc_bytes::<Schema>());
         }
-        funding.discharge(freed);
     }
 
     /// Get a list of fields for this schema
@@ -1898,13 +1933,19 @@ mod tests {
         }
 
         let arrow_schema = test_schema_1();
-        let unlimited = Funding::default();
+        let unlimited_source = Arc::new(Limited {
+            limit: usize::MAX,
+            held: Mutex::new(0),
+        });
+        let unlimited =
+            Funding::new(Arc::clone(&unlimited_source) as Arc<dyn PlanningFunding>);
         let baseline =
             DFSchema::try_from_qualified_schema("t1", &arrow_schema, &unlimited)?;
         let retained = unlimited.outstanding();
         assert!(retained > 0);
         baseline.released_qualified(&unlimited);
         assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
 
         for limit in 0..retained {
             let source = Arc::new(Limited {
@@ -1912,9 +1953,8 @@ mod tests {
                 held: Mutex::new(0),
             });
             let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
-            let err =
-                DFSchema::try_from_qualified_schema("t1", &arrow_schema, &funding)
-                    .unwrap_err();
+            let err = DFSchema::try_from_qualified_schema("t1", &arrow_schema, &funding)
+                .unwrap_err();
             assert!(
                 matches!(err, DataFusionError::Refused { .. }),
                 "expected Refused at limit {limit}, got {err:?}"
@@ -1951,6 +1991,163 @@ mod tests {
         assert!(matches!(dup_err, DataFusionError::SchemaError(_, _)));
         assert_eq!(*source.held.lock().unwrap(), 0);
         assert_eq!(funding.outstanding(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn new_with_metadata_merge_and_functional_deps_are_charged_and_released() -> Result<()>
+    {
+        use crate::Constraint;
+        use crate::Constraints;
+        use crate::funding::PlanningFunding;
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct Limited {
+            limit: usize,
+            held: Mutex<usize>,
+            peak: AtomicUsize,
+        }
+
+        impl PlanningFunding for Limited {
+            fn charge(&self, bytes: usize) -> bool {
+                let mut held = self.held.lock().unwrap();
+                match held.checked_add(bytes) {
+                    Some(total) if total <= self.limit => {
+                        *held = total;
+                        self.peak.fetch_max(total, Ordering::Relaxed);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+
+            fn discharge(&self, bytes: usize) {
+                let mut held = self.held.lock().unwrap();
+                *held = held
+                    .checked_sub(bytes)
+                    .expect("discharged more than was charged");
+            }
+        }
+
+        let qualified_fields = vec![
+            (
+                Some(TableReference::bare("t1")),
+                Arc::new(Field::new("c0", DataType::Int32, false)),
+            ),
+            (
+                Some(TableReference::bare("t1")),
+                Arc::new(Field::new("c1", DataType::Int32, true)),
+            ),
+        ];
+        let unlimited_source = Arc::new(Limited {
+            limit: usize::MAX,
+            held: Mutex::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let unlimited =
+            Funding::new(Arc::clone(&unlimited_source) as Arc<dyn PlanningFunding>);
+        let baseline =
+            DFSchema::new_with_metadata(&qualified_fields, HashMap::new(), &unlimited)?;
+        let peak_new = unlimited_source.peak.load(Ordering::Relaxed);
+        baseline.released(&unlimited);
+        assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
+
+        for limit in 0..peak_new {
+            let source = Arc::new(Limited {
+                limit,
+                held: Mutex::new(0),
+                peak: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+            let err =
+                DFSchema::new_with_metadata(&qualified_fields, HashMap::new(), &funding)
+                    .unwrap_err();
+            assert!(matches!(err, DataFusionError::Refused { .. }));
+            assert_eq!(*source.held.lock().unwrap(), 0, "leaked at limit {limit}");
+            assert_eq!(funding.outstanding(), 0);
+        }
+
+        // Duplicate field check in new_with_metadata discharges everything.
+        let dup_fields = vec![
+            (
+                Some(TableReference::bare("t1")),
+                Arc::new(Field::new("c0", DataType::Int32, false)),
+            ),
+            (
+                Some(TableReference::bare("t1")),
+                Arc::new(Field::new("c0", DataType::Int32, false)),
+            ),
+        ];
+        let dup_err =
+            DFSchema::new_with_metadata(&dup_fields, HashMap::new(), &unlimited)
+                .unwrap_err();
+        assert!(matches!(dup_err, DataFusionError::SchemaError(_, _)));
+        assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
+
+        // FunctionalDependencies::project_functional_dependencies grows via reserve (capacity >= 4 > len = 1);
+        // released() must discharge exact capacity, not len.
+        let constraints = Constraints::new_unverified(vec![
+            Constraint::PrimaryKey(vec![0]),
+            Constraint::Unique(vec![1]),
+        ]);
+        let deps = FunctionalDependencies::new_from_constraints(
+            Some(&constraints),
+            2,
+            &unlimited,
+        )?;
+        let projected = deps.project_functional_dependencies(&[0, 1], 2, &unlimited)?;
+        deps.released(&unlimited);
+        projected.released(&unlimited);
+        assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
+
+        let left_deps = FunctionalDependencies::new_from_constraints(
+            Some(&constraints),
+            2,
+            &Funding::default(),
+        )?
+        .project_functional_dependencies(&[0, 1], 2, &Funding::default())?;
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?
+        .with_functional_dependencies(left_deps)?;
+        let right = DFSchema::try_from_qualified_schema(
+            "t2",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+
+        unlimited_source.peak.store(0, Ordering::Relaxed);
+        let merged = left.merge(&right, &unlimited)?;
+        let peak_merge = unlimited_source.peak.load(Ordering::Relaxed);
+        merged.released(&unlimited);
+        assert_eq!(unlimited.outstanding(), 0);
+        assert_eq!(*unlimited_source.held.lock().unwrap(), 0);
+
+        for limit in 0..peak_merge {
+            let source = Arc::new(Limited {
+                limit,
+                held: Mutex::new(0),
+                peak: AtomicUsize::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+            let err = left.merge(&right, &funding).unwrap_err();
+            assert!(matches!(err, DataFusionError::Refused { .. }));
+            assert_eq!(
+                *source.held.lock().unwrap(),
+                0,
+                "merge refusal at limit {limit} leaked held bytes"
+            );
+            assert_eq!(funding.outstanding(), 0);
+        }
+
         Ok(())
     }
 

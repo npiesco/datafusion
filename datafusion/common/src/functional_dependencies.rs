@@ -181,6 +181,18 @@ impl FunctionalDependence {
         self.mode = mode;
         self
     }
+
+    /// Drop this functional dependence, giving back to `funding` the source and target
+    /// index buffers it holds.
+    pub fn released(self, funding: &Funding) {
+        let Self {
+            source_indices,
+            target_indices,
+            ..
+        } = self;
+        funding.released(source_indices);
+        funding.released(target_indices);
+    }
 }
 
 /// This object encapsulates all functional dependencies in a given relation.
@@ -201,6 +213,15 @@ impl FunctionalDependencies {
         Self { deps: dependencies }
     }
 
+    /// Drop these functional dependencies, giving back to `funding` every dependence's
+    /// index buffers and the outer `deps` buffer.
+    pub fn released(mut self, funding: &Funding) {
+        for dep in self.deps.drain(..) {
+            dep.released(funding);
+        }
+        funding.released(self.deps);
+    }
+
     /// Creates a new `FunctionalDependencies` object from the given constraints, every list
     /// it makes charged to `funding` before it is made.
     pub fn new_from_constraints(
@@ -213,7 +234,7 @@ impl FunctionalDependencies {
             return Ok(Self::empty());
         };
         // Construct dependency objects based on each individual constraint:
-        let mut dependencies = funding.vec_with_capacity(constraints.len())?;
+        let mut result = Self::new(funding.vec_with_capacity(constraints.len())?);
         for constraint in constraints {
             let (indices, nullable) = match constraint {
                 Constraint::PrimaryKey(indices) => (indices, false),
@@ -221,20 +242,30 @@ impl FunctionalDependencies {
             };
             // All the field indices are associated with the whole table
             // since we are dealing with table level constraints:
-            let mut targets = funding.vec_with_capacity(n_field)?;
+            let mut targets = match funding.vec_with_capacity(n_field) {
+                Ok(targets) => targets,
+                Err(err) => {
+                    result.released(funding);
+                    return Err(err);
+                }
+            };
             targets.extend(0..n_field);
+            let sources = match funding.vec_from_slice(indices) {
+                Ok(sources) => sources,
+                Err(err) => {
+                    funding.released(targets);
+                    result.released(funding);
+                    return Err(err);
+                }
+            };
             // As primary keys are guaranteed to be unique, set the
             // functional dependency mode to `Dependency::Single`:
-            dependencies.push(
-                FunctionalDependence::new(
-                    funding.vec_from_slice(indices)?,
-                    targets,
-                    nullable,
-                )
-                .with_mode(Dependency::Single),
+            result.deps.push(
+                FunctionalDependence::new(sources, targets, nullable)
+                    .with_mode(Dependency::Single),
             );
         }
-        Ok(Self::new(dependencies))
+        Ok(result)
     }
 
     pub fn with_dependency(mut self, mode: Dependency) -> Self {
@@ -301,7 +332,7 @@ impl FunctionalDependencies {
         n_out: usize,
         funding: &Funding,
     ) -> Result<FunctionalDependencies> {
-        let mut projected_func_dependencies = Vec::new();
+        let mut projected_func_dependencies = Self::empty();
         for FunctionalDependence {
             source_indices,
             target_indices,
@@ -310,7 +341,13 @@ impl FunctionalDependencies {
         } in &self.deps
         {
             let new_source_indices =
-                matching_indices(source_indices, proj_indices, funding)?;
+                match matching_indices(source_indices, proj_indices, funding) {
+                    Ok(indices) => indices,
+                    Err(err) => {
+                        projected_func_dependencies.released(funding);
+                        return Err(err);
+                    }
+                };
             // All of the composite indices should still be valid after projection;
             // otherwise, functional dependency cannot be propagated.
             if new_source_indices.len() != source_indices.len() {
@@ -319,22 +356,42 @@ impl FunctionalDependencies {
             }
             let new_target_indices = if *mode == Dependency::Single {
                 // Associate with all of the fields in the schema:
-                let mut all = funding.vec_with_capacity(n_out)?;
+                let mut all = match funding.vec_with_capacity(n_out) {
+                    Ok(all) => all,
+                    Err(err) => {
+                        funding.released(new_source_indices);
+                        projected_func_dependencies.released(funding);
+                        return Err(err);
+                    }
+                };
                 all.extend(0..n_out);
                 all
             } else {
                 // Update associations according to projection:
-                matching_indices(target_indices, proj_indices, funding)?
+                match matching_indices(target_indices, proj_indices, funding) {
+                    Ok(indices) => indices,
+                    Err(err) => {
+                        funding.released(new_source_indices);
+                        projected_func_dependencies.released(funding);
+                        return Err(err);
+                    }
+                }
             };
+            if let Err(err) = funding.reserve(&mut projected_func_dependencies.deps, 1) {
+                funding.released(new_source_indices);
+                funding.released(new_target_indices);
+                projected_func_dependencies.released(funding);
+                return Err(err);
+            }
             let new_func_dependence = FunctionalDependence::new(
                 new_source_indices,
                 new_target_indices,
                 *nullable,
             )
             .with_mode(*mode);
-            funding.push(&mut projected_func_dependencies, new_func_dependence)?;
+            projected_func_dependencies.deps.push(new_func_dependence);
         }
-        Ok(FunctionalDependencies::new(projected_func_dependencies))
+        Ok(projected_func_dependencies)
     }
 
     /// This function joins this set of functional dependencies with the `other`
@@ -357,39 +414,68 @@ impl FunctionalDependencies {
                 let right_kept = |dep: &&FunctionalDependence| {
                     *join_type != JoinType::Left || !dep.nullable
                 };
-                let mut deps = funding.vec_with_capacity(
-                    self.deps
-                        .iter()
-                        .filter(left_kept)
-                        .count()
-                        .saturating_add(other.deps.iter().filter(right_kept).count()),
-                )?;
+                let mut result =
+                    Self::new(
+                        funding.vec_with_capacity(
+                            self.deps.iter().filter(left_kept).count().saturating_add(
+                                other.deps.iter().filter(right_kept).count(),
+                            ),
+                        )?,
+                    );
                 for dep in self.deps.iter().filter(left_kept) {
-                    deps.push(FunctionalDependence {
-                        source_indices: offset_indices(&dep.source_indices, 0, funding)?,
-                        target_indices: offset_indices(&dep.target_indices, 0, funding)?,
+                    let source_indices =
+                        match offset_indices(&dep.source_indices, 0, funding) {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    let target_indices =
+                        match offset_indices(&dep.target_indices, 0, funding) {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                funding.released(source_indices);
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    result.deps.push(FunctionalDependence {
+                        source_indices,
+                        target_indices,
                         nullable: dep.nullable || *join_type == JoinType::Right,
                         mode: Dependency::Multi,
                     });
                 }
                 // The right side's indices are offset past the left side's columns.
                 for dep in other.deps.iter().filter(right_kept) {
-                    deps.push(FunctionalDependence {
-                        source_indices: offset_indices(
-                            &dep.source_indices,
-                            left_cols_len,
-                            funding,
-                        )?,
-                        target_indices: offset_indices(
-                            &dep.target_indices,
-                            left_cols_len,
-                            funding,
-                        )?,
+                    let source_indices =
+                        match offset_indices(&dep.source_indices, left_cols_len, funding)
+                        {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    let target_indices =
+                        match offset_indices(&dep.target_indices, left_cols_len, funding)
+                        {
+                            Ok(indices) => indices,
+                            Err(err) => {
+                                funding.released(source_indices);
+                                result.released(funding);
+                                return Err(err);
+                            }
+                        };
+                    result.deps.push(FunctionalDependence {
+                        source_indices,
+                        target_indices,
                         nullable: dep.nullable || *join_type == JoinType::Left,
                         mode: Dependency::Multi,
                     });
                 }
-                Ok(Self::new(deps))
+                Ok(result)
             }
             JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
                 // These joins preserve functional dependencies of the left side:
