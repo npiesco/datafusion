@@ -1006,12 +1006,15 @@ impl DefaultPhysicalPlanner {
                     e.context(format!("MERGE INTO operation on table '{table_name}'"))
                 })?;
                 let input_exec = children.one()?;
+                let funding = &session_state.config_options().funding;
                 let target_schema = DFSchema::try_from_qualified_schema(
                     table_name.clone(),
                     &target.schema(),
-                    &Funding::default(),
+                    funding,
                 )?;
-                let merge_schema = Arc::new(target_schema.join(input.schema())?);
+                let merge_schema = target_schema.join(input.schema(), funding);
+                target_schema.released(funding);
+                let merge_schema = Arc::new(merge_schema?);
                 provider
                     .merge_into(
                         session_state,

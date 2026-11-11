@@ -6314,7 +6314,7 @@ mod tests {
                 filter,
                 join_type: JoinType::Inner,
                 join_constraint: JoinConstraint::On,
-                schema: Arc::new(left_schema.join(&right_schema)?),
+                schema: Arc::new(left_schema.join(&right_schema, &Funding::default())?),
                 null_equality: NullEquality::NullEqualsNothing,
                 null_aware: false,
             }))

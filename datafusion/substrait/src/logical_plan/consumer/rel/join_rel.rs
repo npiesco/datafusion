@@ -44,7 +44,10 @@ pub async fn from_join_rel(
     let join_type = from_substrait_jointype(join.r#type)?;
     // The join condition expression needs full input schema and not the output schema from join since we lose columns from
     // certain join types such as semi and anti joins
-    let in_join_schema = left.schema().join(right.schema())?;
+    let in_join_schema = left.schema().join(
+        right.schema(),
+        &datafusion::common::funding::Funding::default(),
+    )?;
 
     // If join expression exists, parse the `on` condition expression, build join and return
     // Otherwise, build join with only the filter, without join keys

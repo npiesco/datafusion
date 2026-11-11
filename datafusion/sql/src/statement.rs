@@ -2514,12 +2514,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 TableReference::bare(self.ident_normalizer.normalize(a.name.clone()))
             })
             .unwrap_or_else(|| target_table_ref.clone());
-        let target_schema = Arc::new(DFSchema::try_from_qualified_schema(
-            target_qualifier.clone(),
-            &target_table_source.schema(),
-            &Funding::default(),
-        )?);
-
         // 2. Plan the source (USING clause) as a LogicalPlan
         let mut planner_context = PlannerContext::new();
         let source_table_with_joins = TableWithJoins {
@@ -2529,26 +2523,45 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         let source_plan =
             self.plan_from_tables(vec![source_table_with_joins], &mut planner_context)?;
 
+        let target_schema = DFSchema::try_from_qualified_schema(
+            target_qualifier.clone(),
+            &target_table_source.schema(),
+            self.funding(),
+        )?;
+
         // 3. Build a combined schema for resolving expressions in ON and WHEN clauses
         let combined_schema =
-            Arc::new(target_schema.as_ref().join(source_plan.schema())?);
+            match target_schema.join(source_plan.schema(), self.funding()) {
+                Ok(schema) => schema,
+                Err(err) => {
+                    target_schema.released(self.funding());
+                    return Err(err);
+                }
+            };
 
         // 4. Convert the ON condition from sqlparser Expr to datafusion Expr
-        let on_expr = self.sql_to_expr(*on, &combined_schema, &mut planner_context)?;
+        let on_and_clauses: Result<_> = (|| {
+            let on_expr =
+                self.sql_to_expr(*on, &combined_schema, &mut planner_context)?;
 
-        // 5. Convert each WHEN clause
-        let df_clauses = clauses
-            .into_iter()
-            .map(|clause| {
-                self.merge_clause_to_plan(
-                    clause,
-                    &combined_schema,
-                    &target_schema,
-                    &target_qualifier,
-                    &mut planner_context,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+            // 5. Convert each WHEN clause
+            let df_clauses = clauses
+                .into_iter()
+                .map(|clause| {
+                    self.merge_clause_to_plan(
+                        clause,
+                        &combined_schema,
+                        &target_schema,
+                        &target_qualifier,
+                        &mut planner_context,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((on_expr, df_clauses))
+        })();
+        combined_schema.released(self.funding());
+        target_schema.released(self.funding());
+        let (on_expr, df_clauses) = on_and_clauses?;
 
         // 6. Build the MERGE operation. Column references to the target may be
         // qualified with the SQL alias (`MERGE INTO target AS t ... t.col`).

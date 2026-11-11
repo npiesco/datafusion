@@ -132,6 +132,10 @@ fn select_joins_are_funded() {
     assert_funded("SELECT j1_id, j2_string FROM j1 JOIN j2 ON j1_id = j2_id");
     assert_funded("SELECT j1_id FROM j1 LEFT JOIN j2 ON j1_id = j2_id AND j2_id > 1");
     assert_funded("SELECT j1_id, j2_id FROM j1, j2");
+    assert_failure_freed(
+        "SELECT j1_id FROM j1 JOIN j2 ON no_such_column = j2_id",
+    );
+    assert_failure_freed("SELECT j1_id FROM j1 JOIN j1 ON true");
 }
 
 #[test]

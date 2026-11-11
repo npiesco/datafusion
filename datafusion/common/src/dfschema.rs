@@ -32,9 +32,7 @@ use crate::{
 };
 
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{
-    DataType, Field, FieldRef, Fields, Schema, SchemaBuilder, SchemaRef,
-};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 
 /// A reference-counted reference to a [DFSchema].
 pub type DFSchemaRef = Arc<DFSchema>;
@@ -307,26 +305,44 @@ impl DFSchema {
     }
 
     /// Create a new schema that contains the fields from this schema followed by the fields
-    /// from the supplied schema. An error will be returned if there are duplicate field names.
-    pub fn join(&self, schema: &DFSchema) -> Result<Self> {
-        let mut schema_builder = SchemaBuilder::new();
-        schema_builder.extend(self.inner.fields().iter().cloned());
-        schema_builder.extend(schema.fields().iter().cloned());
-        let new_schema = schema_builder.finish();
+    /// from the supplied schema, what it makes charged to `funding`. An error will be returned
+    /// if there are duplicate field names.
+    pub fn join(&self, schema: &DFSchema, funding: &Funding) -> Result<Self> {
+        let count = self.field_qualifiers.len() + schema.field_qualifiers.len();
+
+        let mut qualifiers = funding.held::<Vec<Option<TableReference>>>();
+        qualifiers.reserve_exact(count)?;
+        qualifiers.extend(self.field_qualifiers.iter().cloned());
+        qualifiers.extend_from_slice(schema.field_qualifiers.as_slice());
+
+        let fields = {
+            let mut fields = funding.held::<Vec<FieldRef>>();
+            fields.reserve_exact(count)?;
+            fields.extend(self.inner.fields().iter().cloned());
+            fields.extend(schema.fields().iter().cloned());
+            funding.fields(&fields)?
+        };
 
         let mut new_metadata = self.inner.metadata.clone();
         new_metadata.extend(schema.inner.metadata.clone());
-        let new_schema_with_metadata = new_schema.with_metadata(new_metadata);
 
-        let mut new_qualifiers = self.field_qualifiers.clone();
-        new_qualifiers.extend_from_slice(schema.field_qualifiers.as_slice());
+        let inner = match funding.arc(Schema::new_with_metadata(fields, new_metadata)) {
+            Ok(inner) => inner,
+            Err(err) => {
+                funding.discharge(arc_slice_bytes::<FieldRef>(count)?);
+                return Err(err);
+            }
+        };
 
         let new_self = Self {
-            inner: Arc::new(new_schema_with_metadata),
-            field_qualifiers: new_qualifiers,
+            inner,
+            field_qualifiers: qualifiers.keep(),
             functional_dependencies: FunctionalDependencies::empty(),
         };
-        new_self.check_names()?;
+        if let Err(err) = new_self.check_names() {
+            new_self.released(funding);
+            return Err(err);
+        }
         Ok(new_self)
     }
 
@@ -387,11 +403,11 @@ impl DFSchema {
         })
     }
 
-    /// `self`, a schema [`DFSchema::merge`] made through `funding`, freed: what merging
-    /// allocated for it is given back. Its qualifier list and dependencies are its own; its
-    /// Arrow schema and field list are freed, and given back, only if no other handle to the
-    /// Arrow schema remains: one taken from the schema it was merged from (merging an empty
-    /// schema) or from the merged schema itself keeps them.
+    /// `self`, a schema [`DFSchema::merge`] or [`DFSchema::join`] made through `funding`, freed:
+    /// what merging or joining allocated for it is given back. Its qualifier list and
+    /// dependencies are its own; its Arrow schema and field list are freed, and given back,
+    /// only if no other handle to the Arrow schema remains: one taken from the schema it was
+    /// merged from (merging an empty schema) or from the merged/joined schema itself keeps them.
     pub fn released(self, funding: &Funding) {
         let DFSchema {
             inner,
@@ -1649,7 +1665,7 @@ mod tests {
             &test_schema_1(),
             &Funding::default(),
         )?;
-        let join = left.join(&right)?;
+        let join = left.join(&right, &Funding::default())?;
         assert_eq!(
             "fields:[t1.c0, t1.c1, t2.c0, t2.c1], metadata:{}",
             join.to_string()
@@ -1682,7 +1698,7 @@ mod tests {
             &test_schema_1(),
             &Funding::default(),
         )?;
-        let join = left.join(&right);
+        let join = left.join(&right, &Funding::default());
         assert_eq!(
             join.unwrap_err().strip_backtrace(),
             "Schema error: Schema contains duplicate qualified field name t1.c0",
@@ -1694,7 +1710,7 @@ mod tests {
     fn join_unqualified_duplicate() -> Result<()> {
         let left = DFSchema::try_from(test_schema_1())?;
         let right = DFSchema::try_from(test_schema_1())?;
-        let join = left.join(&right);
+        let join = left.join(&right, &Funding::default());
         assert_eq!(
             join.unwrap_err().strip_backtrace(),
             "Schema error: Schema contains duplicate unqualified field name c0"
@@ -1710,7 +1726,7 @@ mod tests {
             &Funding::default(),
         )?;
         let right = DFSchema::try_from(test_schema_2())?;
-        let join = left.join(&right)?;
+        let join = left.join(&right, &Funding::default())?;
         assert_eq!(
             "fields:[t1.c0, t1.c1, c100, c101], metadata:{}",
             join.to_string()
@@ -1741,12 +1757,91 @@ mod tests {
             &Funding::default(),
         )?;
         let right = DFSchema::try_from(test_schema_1())?;
-        let join = left.join(&right);
+        let join = left.join(&right, &Funding::default());
         assert_contains!(
             join.unwrap_err().to_string(),
             "Schema error: Schema contains qualified \
                           field name t1.c0 and unqualified field name c0 which would be ambiguous"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn join_is_charged_and_released() -> Result<()> {
+        use crate::funding::PlanningFunding;
+        use std::sync::Mutex;
+
+        struct Limited {
+            limit: usize,
+            held: Mutex<usize>,
+        }
+
+        impl PlanningFunding for Limited {
+            fn charge(&self, bytes: usize) -> bool {
+                let mut held = self.held.lock().unwrap();
+                if *held + bytes > self.limit {
+                    return false;
+                }
+                *held += bytes;
+                true
+            }
+
+            fn discharge(&self, bytes: usize) {
+                *self.held.lock().unwrap() -= bytes;
+            }
+        }
+
+        let left = DFSchema::try_from_qualified_schema(
+            "t1",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+        let right = DFSchema::try_from_qualified_schema(
+            "t2",
+            &test_schema_1(),
+            &Funding::default(),
+        )?;
+        let count = left.fields().len() + right.fields().len();
+        let qualifiers_bytes = count * size_of::<Option<TableReference>>();
+        let temp_fields_bytes = count * size_of::<FieldRef>();
+        let fields_slice_bytes = arc_slice_bytes::<FieldRef>(count)?;
+        let schema_arc_bytes = arc_bytes::<Schema>();
+        let retained = qualifiers_bytes + fields_slice_bytes + schema_arc_bytes;
+        let peak =
+            retained.max(qualifiers_bytes + temp_fields_bytes + fields_slice_bytes);
+
+        for limit in 0..peak {
+            let source = Arc::new(Limited {
+                limit,
+                held: Mutex::new(0),
+            });
+            let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+            let err = left.join(&right, &funding).unwrap_err();
+            assert!(
+                matches!(err, DataFusionError::Refused { .. }),
+                "expected Refused at limit {limit}, got {err:?}"
+            );
+            assert_eq!(*source.held.lock().unwrap(), 0, "leak at limit {limit}");
+            assert_eq!(funding.outstanding(), 0, "outstanding at limit {limit}");
+        }
+
+        let source = Arc::new(Limited {
+            limit: peak,
+            held: Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as Arc<dyn PlanningFunding>);
+        let joined = left.join(&right, &funding)?;
+        assert_eq!(*source.held.lock().unwrap(), retained);
+        assert_eq!(funding.outstanding(), retained);
+        joined.released(&funding);
+        assert_eq!(*source.held.lock().unwrap(), 0);
+        assert_eq!(funding.outstanding(), 0);
+
+        // Duplicate field check failure releases all allocated schema buffers.
+        let dup_err = left.join(&left, &funding).unwrap_err();
+        assert!(matches!(dup_err, DataFusionError::SchemaError(_, _)));
+        assert_eq!(*source.held.lock().unwrap(), 0);
+        assert_eq!(funding.outstanding(), 0);
         Ok(())
     }
 

@@ -42,7 +42,10 @@ pub fn from_join(
         to_substrait_join_expr(join.on.clone(), join.null_equality, join.filter.clone());
     let join_expression = match join_expr {
         Some(expr) => {
-            let in_join_schema = Arc::new(join.left.schema().join(join.right.schema())?);
+            let in_join_schema = Arc::new(join.left.schema().join(
+                join.right.schema(),
+                &datafusion::common::funding::Funding::default(),
+            )?);
             let expression = producer.handle_expr(&expr, &in_join_schema)?;
             Some(Box::new(expression))
         }
@@ -134,7 +137,10 @@ mod tests {
         )?;
         let join_expr = producer.handle_join(&join)?;
 
-        let in_join_schema = Arc::new(join.left.schema().join(join.right.schema())?);
+        let in_join_schema = Arc::new(join.left.schema().join(
+            join.right.schema(),
+            &datafusion::common::funding::Funding::default(),
+        )?);
         let expected_join_expr = conjunction(vec![
             // Join on
             col("t1.a").eq(col("t2.a")),
