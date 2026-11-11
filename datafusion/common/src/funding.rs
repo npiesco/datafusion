@@ -562,7 +562,7 @@ impl<T> Held<Vec<T>> {
 impl<T: Clone> Held<Vec<T>> {
     /// A copy whose exact room is charged to `funding` before it is allocated.
     pub fn clone_funded(&self, funding: &Funding) -> Result<Self> {
-        let mut copy = funding.held();
+        let mut copy: Self = funding.held();
         copy.reserve_exact(self.buffer.len())?;
         copy.buffer.extend_from_slice(&self.buffer);
         Ok(copy)
@@ -1899,6 +1899,7 @@ impl<T: fmt::Debug, S> fmt::Debug for FundedSet<T, S> {
 impl<T, S1, S2> PartialEq<FundedSet<T, S2>> for FundedSet<T, S1>
 where
     T: Hash + Eq,
+    S1: BuildHasher,
     S2: BuildHasher,
 {
     fn eq(&self, other: &FundedSet<T, S2>) -> bool {
