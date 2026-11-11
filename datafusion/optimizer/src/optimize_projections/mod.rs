@@ -1897,7 +1897,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                &vec![
+                &[
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -1953,7 +1953,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                &vec![
+                &[
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))
@@ -2007,7 +2007,7 @@ mod tests {
         assert_eq!(
             **optimized_join.schema(),
             DFSchema::new_with_metadata(
-                &vec![
+                &[
                     (
                         Some("test".into()),
                         Arc::new(Field::new("a", DataType::UInt32, false))

@@ -671,8 +671,9 @@ impl ExprSchemable for Expr {
                     (left_field.data_type(), left_field.is_nullable());
                 let (rhs_type, rhs_nullable) =
                     (right_field.data_type(), right_field.is_nullable());
-                let lhs_spans = funding.cloned(left.spans().unwrap_or(&Spans::new()))?;
-                let rhs_spans = funding.cloned(right.spans().unwrap_or(&Spans::new()))?;
+                let empty_spans = Spans::new();
+                let lhs_spans = funding.cloned(left.spans().unwrap_or(&empty_spans))?;
+                let rhs_spans = funding.cloned(right.spans().unwrap_or(&empty_spans))?;
                 let spans_bytes = lhs_spans
                     .clone_bytes()
                     .saturating_add(rhs_spans.clone_bytes());

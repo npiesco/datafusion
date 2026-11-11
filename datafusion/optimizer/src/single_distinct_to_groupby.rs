@@ -25,8 +25,8 @@ use crate::{OptimizerConfig, OptimizerRule};
 
 use datafusion_common::funding::Held;
 use datafusion_common::{
-    Column, DataFusionError, Result, ScalarValue, TableReference,
-    assert_eq_or_internal_err, tree_node::Transformed,
+    Column, DataFusionError, Result, ScalarValue, assert_eq_or_internal_err,
+    tree_node::Transformed,
 };
 use datafusion_expr::builder::project;
 use datafusion_expr::expr::AggregateFunctionParams;
@@ -153,9 +153,7 @@ impl OptimizerRule for SingleDistinctToGroupBy {
                 let group_size = group_expr.len();
                 // alias all original group_by exprs
                 let mut inner_group_exprs = funding.vec_with_capacity(group_size)?;
-                let mut out_group_expr_with_alias: Held<
-                    Vec<(Expr, Option<(Option<&TableReference>, &str)>)>,
-                > = funding.held();
+                let mut out_group_expr_with_alias: Held<Vec<_>> = funding.held();
                 out_group_expr_with_alias.reserve_exact(group_size)?;
                 for (i, group_expr) in group_expr.drain(..).enumerate() {
                     // Room for each is charged: pushing allocates nothing.

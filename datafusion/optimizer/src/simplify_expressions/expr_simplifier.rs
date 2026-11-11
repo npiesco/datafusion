@@ -1947,8 +1947,8 @@ impl TreeNodeRewriter for Simplifier<'_> {
                 let mut list = lhs.list;
                 let mut rhs_list = rhs.list;
                 f.reserve(&mut list, rhs_list.len())?;
-                // Within the room charged for it: extending allocates nothing.
-                list.extend(rhs_list.drain(..));
+                // Within the room charged for it: appending allocates nothing.
+                list.append(&mut rhs_list);
                 f.released(rhs_list);
                 deduplicated(f, &mut list)?;
 
@@ -2463,8 +2463,8 @@ fn inlist_union(f: &Funding, mut l1: InList, l2: InList, negated: bool) -> Resul
     }
 
     f.reserve(&mut l1.list, keep_l2.len())?;
-    // Within the room charged for it: extending allocates nothing.
-    l1.list.extend(keep_l2.drain(..));
+    // Within the room charged for it: appending allocates nothing.
+    l1.list.append(&mut keep_l2);
     f.released(keep_l2);
     l1.negated = negated;
     Ok(Expr::InList(l1))

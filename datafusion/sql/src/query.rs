@@ -155,7 +155,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let funding = self.funding();
                 let mut all_exprs = funding.vec_with_capacity(1 + extend_exprs.len())?;
                 all_exprs.push(SelectExpr::Wildcard(WildcardOptions::default()));
-                all_exprs.extend(extend_exprs.drain(..));
+                all_exprs.append(&mut extend_exprs);
                 funding.released(extend_exprs);
                 self.project(plan, all_exprs, None)
             }

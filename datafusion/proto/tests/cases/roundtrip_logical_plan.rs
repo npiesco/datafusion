@@ -2551,7 +2551,7 @@ fn roundtrip_schema() {
 #[test]
 fn roundtrip_dfschema() {
     let dfschema = DFSchema::new_with_metadata(
-        &vec![
+        &[
             (None, Arc::new(Field::new("a", DataType::Int64, false))),
             (
                 Some("t".into()),

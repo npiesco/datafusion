@@ -157,6 +157,10 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<Expr> {
+        #[expect(
+            clippy::large_enum_variant,
+            reason = "The funded stack moves AST nodes inline without a per-node allocation."
+        )]
         enum StackEntry {
             SQLExpr(SQLExpr),
             Operator(BinaryOperator),

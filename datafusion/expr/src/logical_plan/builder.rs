@@ -3222,12 +3222,12 @@ mod tests {
     #[test]
     fn test_join_metadata() -> Result<()> {
         let left_schema = DFSchema::new_with_metadata(
-            &vec![(None, Arc::new(Field::new("a", DataType::Int32, false)))],
+            &[(None, Arc::new(Field::new("a", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "left".to_string())]),
             &Funding::default(),
         )?;
         let right_schema = DFSchema::new_with_metadata(
-            &vec![(None, Arc::new(Field::new("b", DataType::Int32, false)))],
+            &[(None, Arc::new(Field::new("b", DataType::Int32, false)))],
             HashMap::from([("key".to_string(), "right".to_string())]),
             &Funding::default(),
         )?;

@@ -443,7 +443,7 @@ fn exclude_using_columns(plan: &LogicalPlan, funding: &Funding) -> Result<Vec<Co
                 on.iter()
                     .flat_map(|(l, r)| [l, r])
                     .filter_map(Expr::get_as_join_column)
-                    .filter(|c| in_output(*c))
+                    .filter(|c| in_output(c))
             };
             // Of the columns of one name the least is kept, regardless of the order the
             // keys are listed in; any other is excluded.
