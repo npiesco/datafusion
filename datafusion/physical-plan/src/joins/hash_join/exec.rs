@@ -1892,7 +1892,15 @@ impl ExecutionPlan for HashJoinExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        self.builder().ok()?.with_fetch(limit).build_exec().ok()
+        // A refusal is only a `None` here, so nothing outside unwinds what was charged.
+        let before = self.funding.outstanding();
+        let fetched = self
+            .builder()
+            .and_then(|builder| builder.with_fetch(limit).build_exec());
+        if fetched.is_err() {
+            self.funding.unwound(before);
+        }
+        fetched.ok()
     }
     #[cfg(feature = "proto")]
     fn try_to_proto(
@@ -2824,6 +2832,68 @@ mod tests {
             .build_exec()?;
         assert_eq!(funding.outstanding() - before, kept);
         drop((rebuilt, replaced));
+        Ok(())
+    }
+
+    /// Refuses whatever would take it past `limit`.
+    struct Ceiling {
+        limit: std::sync::Mutex<usize>,
+        held: std::sync::Mutex<usize>,
+    }
+
+    impl datafusion_common::funding::PlanningFunding for Ceiling {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if *held + bytes > *self.limit.lock().unwrap() {
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    /// A fetch refused part way through gives back what it charged before the refusal:
+    /// the refusal is not an error anyone unwinds, only a `None`.
+    #[test]
+    fn a_refused_fetch_gives_back_what_it_charged() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: std::sync::Mutex::new(usize::MAX),
+            held: std::sync::Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let left = build_table(("a1", &vec![1]), ("b1", &vec![4]), ("c1", &vec![7]));
+        let right = build_table(("a2", &vec![1]), ("b1", &vec![4]), ("c2", &vec![7]));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("b1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("b1", &right.schema())?) as _,
+        )];
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+            &funding,
+        )?;
+
+        let before = funding.outstanding();
+        let fetched = join.with_fetch(Some(1)).expect("fetch within funding");
+        let kept = funding.outstanding() - before;
+        assert!(kept > 1);
+
+        let before = funding.outstanding();
+        *source.limit.lock().unwrap() = *source.held.lock().unwrap() + kept - 1;
+        assert!(join.with_fetch(Some(1)).is_none());
+        assert_eq!(funding.outstanding(), before);
+        drop(fetched);
         Ok(())
     }
 

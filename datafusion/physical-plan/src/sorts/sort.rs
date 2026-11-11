@@ -1508,8 +1508,14 @@ impl ExecutionPlan for SortExec {
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
-        let new_sort = SortExec::with_fetch(self, limit).ok()?;
-        Some(self.funding.arc(new_sort).ok()?)
+        // A refusal is only a `None` here, so nothing outside unwinds what was charged.
+        let before = self.funding.outstanding();
+        let fetched = SortExec::with_fetch(self, limit)
+            .and_then(|new_sort| Ok(self.funding.arc(new_sort)? as _));
+        if fetched.is_err() {
+            self.funding.unwound(before);
+        }
+        fetched.ok()
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -3334,6 +3340,62 @@ mod tests {
         // The reserved memory for the sliced batch should be less than that of the full batch
         assert!(reserved > sliced_reserved);
 
+        Ok(())
+    }
+
+    /// Refuses whatever would take it past `limit`.
+    struct Ceiling {
+        limit: std::sync::Mutex<usize>,
+        held: std::sync::Mutex<usize>,
+    }
+
+    impl datafusion_common::funding::PlanningFunding for Ceiling {
+        fn charge(&self, bytes: usize) -> bool {
+            let mut held = self.held.lock().unwrap();
+            if *held + bytes > *self.limit.lock().unwrap() {
+                return false;
+            }
+            *held += bytes;
+            true
+        }
+
+        fn discharge(&self, bytes: usize) {
+            *self.held.lock().unwrap() -= bytes;
+        }
+    }
+
+    /// A fetch refused part way through gives back what it charged before the refusal:
+    /// the refusal is not an error anyone unwinds, only a `None`.
+    #[test]
+    fn a_refused_fetch_gives_back_what_it_charged() -> Result<()> {
+        let source = Arc::new(Ceiling {
+            limit: std::sync::Mutex::new(usize::MAX),
+            held: std::sync::Mutex::new(0),
+        });
+        let funding = Funding::new(Arc::clone(&source) as _);
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let child = Arc::new(EmptyExec::new(Arc::clone(&schema), &funding)?);
+        let sort = SortExec::new(
+            LexOrdering::new(vec![PhysicalSortExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                options: SortOptions::default(),
+            }])
+            .unwrap(),
+            child,
+            &funding,
+        )?;
+
+        let before = funding.outstanding();
+        let fetched =
+            ExecutionPlan::with_fetch(&sort, Some(1)).expect("fetch within funding");
+        let kept = funding.outstanding() - before;
+        assert!(kept > 1);
+
+        let before = funding.outstanding();
+        *source.limit.lock().unwrap() = *source.held.lock().unwrap() + kept - 1;
+        assert!(ExecutionPlan::with_fetch(&sort, Some(1)).is_none());
+        assert_eq!(funding.outstanding(), before);
+        drop(fetched);
         Ok(())
     }
 
